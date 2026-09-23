@@ -11,6 +11,13 @@
 
 find_package(PkgConfig REQUIRED)
 
+if (WIN32)
+    add_library(jf-os STATIC platform/os_windows.c)
+    target_link_libraries(jf-os PUBLIC ws2_32)
+else ()
+    add_library(jf-os STATIC platform/os_posix.c)
+endif ()
+
 # The backend-agnostic pieces: the Starfish payloads, the A/V sync arithmetic, the clock,
 # the packer and the layout geometry. The tests cover exactly this set.
 add_library(jf-portable STATIC
@@ -23,7 +30,7 @@ add_library(jf-portable STATIC
         ui/loom.c
         platform/luna_json.c)
 target_include_directories(jf-portable PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(jf-portable PUBLIC m pthread)
+target_link_libraries(jf-portable PUBLIC jf-os m pthread)
 
 # demux.c needs nothing but FFmpeg, so the host tests link it wherever
 # `tools/build-ffmpeg.sh --host` has put one. On the TV it is part of `jellyfin` itself,
@@ -80,11 +87,6 @@ endif ()
 if (HAVE_PLATFORM)
     # Window, GL context, input and the webOS lifecycle. Off the TV the webOS-only halves
     # compile out and SDL picks an ordinary desktop backend, so the probes run either way.
-    if (WIN32)
-        set(OS_IMPL platform/os_windows.c)
-    else ()
-        set(OS_IMPL platform/os_posix.c)
-    endif ()
     # Only the TV has switches to read from a file; see platform/env.h.
     if (TARGET_WEBOS)
         set(ENV_IMPL platform/env_webos.c)
@@ -92,12 +94,12 @@ if (HAVE_PLATFORM)
         set(ENV_IMPL platform/env_null.c)
     endif ()
     add_library(jf-platform STATIC platform/window.c platform/luna.c platform/luna_json.c
-            platform/env.c ${OS_IMPL} ${ENV_IMPL})
+            platform/env.c ${ENV_IMPL})
     target_include_directories(jf-platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(jf-platform SYSTEM PUBLIC ${SDL2_INCLUDE_DIRS}
             ${GLIB_INCLUDE_DIRS} ${GLESV2_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS})
     target_link_directories(jf-platform PUBLIC ${SDL2_LIBRARY_DIRS})
-    target_link_libraries(jf-platform PUBLIC ${SDL2_LIBRARIES} ${GL_LIBRARIES}
+    target_link_libraries(jf-platform PUBLIC jf-os ${SDL2_LIBRARIES} ${GL_LIBRARIES}
             ${PLATFORM_EXTRA} pthread)
     if (TARGET_WEBOS)
         target_compile_definitions(jf-platform PUBLIC JF_WEBOS=1)
@@ -226,10 +228,7 @@ target_include_directories(jellyfin SYSTEM PRIVATE
         ${LIBCURL_INCLUDE_DIRS} ${LIBPNG_INCLUDE_DIRS} ${JSONC_INCLUDE_DIRS})
 target_link_directories(jellyfin PRIVATE ${LIBCURL_LIBRARY_DIRS} ${LIBPNG_LIBRARY_DIRS}
         ${JSONC_LIBRARY_DIRS})
-if (WIN32)
-    # No libdl here; the discovery probe's sockets live in ws2_32 instead.
-    set(PLATFORM_SYSTEM_LIBS ws2_32)
-else ()
+if (NOT WIN32)
     set(PLATFORM_SYSTEM_LIBS dl)
 endif ()
 target_link_libraries(jellyfin PRIVATE jf-ui

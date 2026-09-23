@@ -78,7 +78,7 @@ void jf_session_authorization(const jf_session *session, char *out, size_t out_l
 void jf_session_device_id(jf_session *session)
 {
     char host[64] = "webos";
-    gethostname(host, sizeof(host) - 1);
+    jf_os_hostname(host, sizeof(host));
     /* FNV-1a over the host name and the client name: stable across launches, and not a
      * value anyone needs to reverse. */
     uint64_t hash = 1469598103934665603ull;
@@ -115,13 +115,11 @@ bool jf_session_load(jf_session *session)
     return session->token[0] != '\0';
 }
 
-void jf_api_init(void)
-{
-    jf_os_net_init(); /* before any socket call, and gethostname above is one */
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    jf_image_report_version();
-    jf_store_init();
-    jf_store_prune();
+void jf_api_init(void) {
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  jf_image_report_version();
+  jf_store_init();
+  jf_store_prune();
 }
 
 /* `base` without a trailing slash, so every URL below is "{base}/Path". */
@@ -455,55 +453,43 @@ void jf_stream_url(const jf_session *session, const char *id, char *out, size_t 
 /* --------------------------------------------------------------- discovery */
 
 /* Jellyfin answers a UDP broadcast on 7359 with one JSON datagram per server. */
-static bool discover(jf_arena *arena, jf_discovered **out, size_t *out_count)
-{
-    const jf_os_socket socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (!jf_os_socket_valid(socket_fd))
-        return false;
-    jf_os_socket_broadcast(socket_fd);
-    jf_os_socket_recv_timeout(socket_fd, 1000);
+static bool discover(jf_arena *arena, jf_discovered **out, size_t *out_count) {
+  static const char probe[] = "who is JellyfinServer?";
+  const jf_os_socket socket_fd =
+      jf_os_udp_broadcast(7359, probe, sizeof(probe) - 1, 1000);
+  if (socket_fd < 0)
+    return false;
 
-    struct sockaddr_in address;
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_port = htons(7359);
-    address.sin_addr.s_addr = INADDR_BROADCAST;
-    static const char probe[] = "who is JellyfinServer?";
-    if (sendto(socket_fd, probe, sizeof(probe) - 1, 0, (struct sockaddr *)&address,
-               sizeof(address)) < 0) {
-        jf_os_socket_close(socket_fd);
-        return false;
+  /* Three timeouts, not one: a second server answering late is worth three
+   * seconds of a worker thread, and a lone reply usually lands in the first 20
+   * ms. */
+  jf_discovered *found = jf_arena_alloc(arena, 16 * sizeof(*found));
+  size_t count = 0;
+  char datagram[2048];
+  for (int quiet = 0; quiet < 3 && count < 16;) {
+    const ssize_t n = jf_os_udp_recv(socket_fd, datagram, sizeof(datagram) - 1);
+    if (n <= 0) {
+      quiet++;
+      continue;
     }
-
-    /* Three timeouts, not one: a second server answering late is worth three seconds of a
-     * worker thread, and a lone reply usually lands in the first 20 ms. */
-    jf_discovered *found = jf_arena_alloc(arena, 16 * sizeof(*found));
-    size_t count = 0;
-    char datagram[2048];
-    for (int quiet = 0; quiet < 3 && count < 16;) {
-        const ssize_t n = recv(socket_fd, datagram, sizeof(datagram) - 1, 0);
-        if (n <= 0) {
-            quiet++;
-            continue;
-        }
-        datagram[n] = '\0';
-        json_object *root = json_tokener_parse(datagram);
-        if (root == NULL)
-            continue;
-        jf_discovered server = {json_string(arena, root, "Address"),
-                                json_string(arena, root, "Name"),
-                                json_string(arena, root, "Id")};
-        json_object_put(root);
-        bool seen = false;
-        for (size_t i = 0; i < count && !seen; i++)
-            seen = same(found[i].id, server.id != NULL ? server.id : "");
-        if (!seen && found != NULL)
-            found[count++] = server;
-    }
-    jf_os_socket_close(socket_fd);
-    *out = found;
-    *out_count = count;
-    return true;
+    datagram[n] = '\0';
+    json_object *root = json_tokener_parse(datagram);
+    if (root == NULL)
+      continue;
+    jf_discovered server = {json_string(arena, root, "Address"),
+                            json_string(arena, root, "Name"),
+                            json_string(arena, root, "Id")};
+    json_object_put(root);
+    bool seen = false;
+    for (size_t i = 0; i < count && !seen; i++)
+      seen = same(found[i].id, server.id != NULL ? server.id : "");
+    if (!seen && found != NULL)
+      found[count++] = server;
+  }
+  jf_os_udp_close(socket_fd);
+  *out = found;
+  *out_count = count;
+  return true;
 }
 
 /* ------------------------------------------------------------------- calls */
