@@ -1,20 +1,11 @@
 #include "cfg.h"
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <strings.h>
 
 #include "../platform/os.h"
-
-struct cfg_entry {
-  cfg_entry *next;
-  char *section;
-  char *key;
-  char *value;
-};
 
 static char *trim(char *text) {
   while (*text == ' ' || *text == '\t')
@@ -25,194 +16,158 @@ static char *trim(char *text) {
   return text;
 }
 
-static cfg_entry *append(cfg *document, char *section, char *key, char *value) {
-  cfg_entry *entry = jf_arena_alloc(document->arena, sizeof(*entry));
-  if (entry == NULL)
-    return NULL;
-  entry->next = NULL;
-  entry->section = section;
-  entry->key = key;
-  entry->value = value;
-  if (document->tail != NULL)
-    document->tail->next = entry;
-  else
-    document->entries = entry;
-  document->tail = entry;
-  return entry;
+void cfg_init(cfg_reader *reader, char *text) {
+  reader->cursor = text;
+  reader->section = "";
+  reader->key = NULL;
+  reader->value = NULL;
 }
 
-bool cfg_load(cfg *document, jf_arena *arena, const char *path) {
-  memset(document, 0, sizeof(*document));
-  document->arena = arena;
-  document->path = jf_arena_strdup(arena, path);
-  if (document->path == NULL)
-    return false;
-  const int file = open(path, O_RDONLY);
-  if (file < 0)
+bool cfg_open(cfg_reader *reader, jf_arena *arena, const char *path) {
+  cfg_init(reader, NULL);
+  FILE *file = fopen(path, "rb");
+  if (file == NULL)
     return true;
-  struct stat info;
-  if (fstat(file, &info) != 0 || info.st_size < 0 ||
-      info.st_size > 1024 * 1024) {
-    close(file);
-    return false;
-  }
-  char *contents = jf_arena_alloc(arena, (size_t)info.st_size + 1);
-  if (contents == NULL) {
-    close(file);
-    return false;
-  }
-  size_t filled = 0;
-  while (filled < (size_t)info.st_size) {
-    const ssize_t read_size =
-        read(file, contents + filled, (size_t)info.st_size - filled);
-    if (read_size <= 0)
-      break;
-    filled += (size_t)read_size;
-  }
-  close(file);
-  contents[filled] = '\0';
+  char *text = NULL;
+  long size = -1;
+  if (fseek(file, 0, SEEK_END) == 0)
+    size = ftell(file);
+  if (size >= 0 && size <= 1024 * 1024 && fseek(file, 0, SEEK_SET) == 0)
+    text = jf_arena_alloc(arena, (size_t)size + 1);
+  if (text != NULL)
+    text[fread(text, 1, (size_t)size, file)] = '\0';
+  fclose(file);
+  reader->cursor = text;
+  return text != NULL;
+}
 
-  char *section = "";
-  for (char *line = contents; line != NULL;) {
+cfg_event cfg_next(cfg_reader *reader) {
+  while (reader->cursor != NULL && *reader->cursor != '\0') {
+    char *line = reader->cursor;
     char *next = strchr(line, '\n');
     if (next != NULL)
       *next++ = '\0';
+    reader->cursor = next;
     char *text = trim(line);
     if (text[0] == '[') {
       char *end = strchr(text + 1, ']');
-      if (end != NULL) {
-        *end = '\0';
-        section = trim(text + 1);
-      }
-    } else if (text[0] != '\0' && text[0] != ';' && text[0] != '#') {
-      char *equals = strchr(text, '=');
-      if (equals != NULL) {
-        *equals = '\0';
-        if (append(document, section, trim(text), trim(equals + 1)) == NULL)
-          return false;
-      }
+      if (end == NULL)
+        continue;
+      *end = '\0';
+      reader->section = trim(text + 1);
+      reader->key = NULL;
+      reader->value = NULL;
+      return CFG_SECTION;
     }
-    line = next;
-  }
-  return true;
-}
-
-void cfg_section(cfg *document, const char *name) {
-  document->section = name;
-  document->array_key = NULL;
-  document->array_index = 0;
-}
-
-static cfg_entry *find(const cfg *document, const char *key,
-                       unsigned occurrence) {
-  unsigned found = 0;
-  for (cfg_entry *entry = document->entries; entry != NULL;
-       entry = entry->next) {
-    if (strcmp(entry->section, document->section) != 0 ||
-        strcmp(entry->key, key) != 0)
+    if (text[0] == ';' || text[0] == '#')
       continue;
-    if (found++ == occurrence)
-      return entry;
+    char *equals = strchr(text, '=');
+    if (equals == NULL)
+      continue;
+    *equals = '\0';
+    reader->key = trim(text);
+    reader->value = trim(equals + 1);
+    return CFG_VALUE;
   }
-  return NULL;
+  reader->cursor = NULL;
+  return CFG_END;
 }
 
-static cfg_entry *add(cfg *document, const char *key, const char *value) {
-  char *section_copy = jf_arena_strdup(document->arena, document->section);
-  char *key_copy = jf_arena_strdup(document->arena, key);
-  char *value_copy = jf_arena_strdup(document->arena, value);
-  if (section_copy == NULL || key_copy == NULL || value_copy == NULL)
-    return NULL;
-  return append(document, section_copy, key_copy, value_copy);
+const char *cfg_text(const cfg_reader *reader) { return reader->value; }
+
+int cfg_int(const cfg_reader *reader, int fallback) {
+  char *end;
+  const long value = strtol(reader->value, &end, 10);
+  return *reader->value != '\0' && *end == '\0' ? (int)value : fallback;
 }
 
-const char *cfg_text(cfg *document, const char *key, const char *fallback) {
-  cfg_entry *entry = find(document, key, 0);
-  if (entry == NULL)
-    entry = add(document, key, fallback);
-  return entry != NULL ? entry->value : fallback;
+float cfg_float(const cfg_reader *reader, float fallback) {
+  char *end;
+  const float value = strtof(reader->value, &end);
+  return *reader->value != '\0' && *end == '\0' ? value : fallback;
 }
 
-int cfg_int(cfg *document, const char *key, int fallback) {
-  cfg_entry *entry = find(document, key, 0);
-  if (entry == NULL) {
-    char value[32];
-    snprintf(value, sizeof(value), "%d", fallback);
-    entry = add(document, key, value);
+bool cfg_bool(const cfg_reader *reader, bool fallback) {
+  static const char *const yes[] = {"true", "yes", "on", "1"};
+  static const char *const no[] = {"false", "no", "off", "0"};
+  for (size_t i = 0; i < sizeof(yes) / sizeof(*yes); i++) {
+    if (strcasecmp(reader->value, yes[i]) == 0)
+      return true;
+    if (strcasecmp(reader->value, no[i]) == 0)
+      return false;
   }
-  return entry != NULL ? (int)strtol(entry->value, NULL, 10) : fallback;
+  return fallback;
 }
 
-float cfg_float(cfg *document, const char *key, float fallback) {
-  cfg_entry *entry = find(document, key, 0);
-  if (entry == NULL) {
-    char value[48];
-    snprintf(value, sizeof(value), "%g", fallback);
-    entry = add(document, key, value);
+void cfg_writer_init(cfg_writer *writer, jf_arena *arena) {
+  *writer = (cfg_writer){.arena = arena, .ok = true};
+}
+
+static void emit(cfg_writer *writer, const char *format, const char *first,
+                 const char *second) {
+  const int needed = snprintf(NULL, 0, format, first, second);
+  if (!writer->ok || needed < 0)
+    return;
+  if (writer->length + (size_t)needed + 1 > writer->capacity) {
+    size_t capacity = writer->capacity != 0 ? writer->capacity * 2 : 256;
+    while (capacity < writer->length + (size_t)needed + 1)
+      capacity *= 2;
+    char *text = jf_arena_alloc(writer->arena, capacity);
+    if (text == NULL) {
+      writer->ok = false;
+      return;
+    }
+    if (writer->length != 0)
+      memcpy(text, writer->text, writer->length);
+    writer->text = text;
+    writer->capacity = capacity;
   }
-  return entry != NULL ? strtof(entry->value, NULL) : fallback;
+  snprintf(writer->text + writer->length, (size_t)needed + 1, format, first,
+           second);
+  writer->length += (size_t)needed;
 }
 
-void cfg_array(cfg *document, const char *key) {
-  document->array_key = key;
-  document->array_index = 0;
+void cfg_comment(cfg_writer *writer, const char *text) {
+  emit(writer, "%s%s\n", "# ", text);
 }
 
-const char *cfg_array_text(cfg *document, const char *fallback) {
-  if (document->array_key == NULL)
-    return fallback;
-  cfg_entry *entry =
-      find(document, document->array_key, document->array_index++);
-  if (entry == NULL)
-    entry = add(document, document->array_key, fallback);
-  return entry != NULL ? entry->value : fallback;
+void cfg_section(cfg_writer *writer, const char *name) {
+  emit(writer, "%s[%s]\n", writer->length != 0 ? "\n" : "", name);
 }
 
-void cfg_set_int(cfg *document, const char *key, int value) {
-  cfg_entry *entry = find(document, key, 0);
-  if (entry == NULL) {
-    (void)cfg_int(document, key, value);
-    entry = find(document, key, 0);
-  }
-  if (entry != NULL) {
-    char formatted[32];
-    snprintf(formatted, sizeof(formatted), "%d", value);
-    entry->value = jf_arena_strdup(document->arena, formatted);
-  }
+void cfg_write_text(cfg_writer *writer, const char *key, const char *value) {
+  emit(writer, "%s=%s\n", key, value);
 }
 
-bool cfg_save(const cfg *document) {
+void cfg_write_int(cfg_writer *writer, const char *key, int value) {
+  char text[16];
+  snprintf(text, sizeof(text), "%d", value);
+  cfg_write_text(writer, key, text);
+}
+
+void cfg_write_float(cfg_writer *writer, const char *key, float value) {
+  char text[32];
+  snprintf(text, sizeof(text), "%.9g", value);
+  cfg_write_text(writer, key, text);
+}
+
+void cfg_write_bool(cfg_writer *writer, const char *key, bool value) {
+  cfg_write_text(writer, key, value ? "true" : "false");
+}
+
+bool cfg_flush(const cfg_writer *writer, const char *path) {
   char temporary[600];
-  const int length =
-      snprintf(temporary, sizeof(temporary), "%s.tmp", document->path);
-  if (length <= 0 || (size_t)length >= sizeof(temporary))
+  const int length = snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+  if (!writer->ok || length <= 0 || (size_t)length >= sizeof(temporary))
     return false;
-  const int file = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (file < 0)
+  FILE *file = fopen(temporary, "wb");
+  if (file == NULL)
     return false;
-  const char *section = NULL;
-  bool ok = true;
-  for (const cfg_entry *entry = document->entries; entry != NULL;
-       entry = entry->next) {
-    if (section == NULL || strcmp(section, entry->section) != 0) {
-      if (jf_os_write_fmt(file, "%s[%s]\n", section != NULL ? "\n" : "",
-                          entry->section) < 0) {
-        ok = false;
-        break;
-      }
-      section = entry->section;
-    }
-    if (jf_os_write_fmt(file, "%s=%s\n", entry->key, entry->value) < 0) {
-      ok = false;
-      break;
-    }
-  }
-  if (ok && jf_os_fsync(file) != 0)
-    ok = false;
-  close(file);
-  if (!ok || rename(temporary, document->path) != 0) {
-    unlink(temporary);
-    return false;
-  }
-  return true;
+  bool ok = fwrite(writer->text, 1, writer->length, file) == writer->length &&
+            fflush(file) == 0 && jf_os_fsync(fileno(file)) == 0;
+  ok = fclose(file) == 0 && ok;
+  if (ok && rename(temporary, path) == 0)
+    return true;
+  remove(temporary);
+  return false;
 }

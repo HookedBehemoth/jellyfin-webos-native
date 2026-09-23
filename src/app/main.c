@@ -70,9 +70,33 @@ typedef struct {
 #define SIDEBAR_ANIMATION_NS 280000000ull
 
 static bool animations_enabled = true;
-static int animations_preference = 1;
-static jf_arena preferences_arena;
-static cfg preferences;
+static char preferences_path[576];
+
+static void load_preferences(void) {
+  jf_arena arena = {0};
+  cfg_reader reader;
+  if (!cfg_open(&reader, &arena, preferences_path))
+    fprintf(stderr, "could not load preferences: %s\n", preferences_path);
+  bool ui = false;
+  for (cfg_event event; (event = cfg_next(&reader)) != CFG_END;) {
+    if (event == CFG_SECTION)
+      ui = strcmp(reader.section, "ui") == 0;
+    else if (ui && strcmp(reader.key, "animations") == 0)
+      animations_enabled = cfg_bool(&reader, animations_enabled);
+  }
+  jf_arena_destroy(&arena);
+}
+
+static void save_preferences(void) {
+  jf_arena arena = {0};
+  cfg_writer writer;
+  cfg_writer_init(&writer, &arena);
+  cfg_section(&writer, "ui");
+  cfg_write_bool(&writer, "animations", animations_enabled);
+  if (!cfg_flush(&writer, preferences_path))
+    fprintf(stderr, "could not save preferences: %s\n", preferences_path);
+  jf_arena_destroy(&arena);
+}
 
 static bool animated_float_running(const animated_float *value) {
   return value->started_at != 0;
@@ -1811,10 +1835,7 @@ static void activate(void)
     case SCREEN_SETTINGS:
       if (focus == 0) {
         animations_enabled = !animations_enabled;
-        animations_preference = animations_enabled ? 1 : 0;
-        cfg_section(&preferences, "ui");
-        cfg_set_int(&preferences, "animations", animations_preference);
-        (void)cfg_save(&preferences);
+        save_preferences();
         if (!animations_enabled) {
           animated_float_snap(&sidebar_slide, sidebar_open ? 1.0f : 0.0f);
           animated_float_snap(&home_scroll_motion, home_scroll);
@@ -3487,15 +3508,9 @@ int main(void)
 
     jf_session_device_id(&session);
     jf_api_init();
-    char preferences_path[576];
     snprintf(preferences_path, sizeof(preferences_path),
              "%s/conf/preferences.ini", jf_store_root());
-    if (!cfg_load(&preferences, &preferences_arena, preferences_path))
-      fprintf(stderr, "could not load preferences: %s\n", preferences_path);
-    cfg_section(&preferences, "ui");
-    animations_preference =
-        cfg_int(&preferences, "animations", animations_preference);
-    animations_enabled = animations_preference != 0;
+    load_preferences();
     log_to_file();
     /* After the redirect, so the confirmation lands in the log rather than on a stdout
      * nobody is reading. */
@@ -3631,7 +3646,6 @@ int main(void)
     jf_fetcher_deinit(&fetcher);
     loom_destroy(&ctx);
     jf_renderer_destroy(renderer);
-    jf_arena_destroy(&preferences_arena);
     jf_luna_deinit();
     jf_window_deinit();
     return 0;

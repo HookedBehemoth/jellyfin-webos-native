@@ -16,6 +16,7 @@ find_package(PkgConfig REQUIRED)
 add_library(jf-portable STATIC
         jf/smp_payload.c
         jf/arena.c
+        jf/cfg.c
         jf/packet_queue.c
         jf/clock.c
         ui/skyline.c

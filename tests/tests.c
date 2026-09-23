@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "jf/audio_sync.h"
+#include "jf/cfg.h"
 #include "jf/clock.h"
 #include "jf/smp_payload.h"
 #include "platform/luna.h"
@@ -274,15 +275,98 @@ static void test_subtitles(void) {
 }
 #endif
 
+static void test_cfg_round_trip(void) {
+  jf_arena arena = {0};
+  cfg_writer writer;
+  cfg_writer_init(&writer, &arena);
+  cfg_comment(&writer, "written by the tests");
+  cfg_write_text(&writer, "top", "before any section");
+  cfg_section(&writer, "ui");
+  cfg_write_bool(&writer, "animations", false);
+  cfg_write_int(&writer, "scale", -42);
+  cfg_write_float(&writer, "gamma", 2.2f);
+  cfg_comment(&writer, "a comment between values");
+  cfg_section(&writer, "server");
+  cfg_write_text(&writer, "url", "http://host:8096/?a=b");
+  cfg_write_text(&writer, "empty", "");
+  CHECK(writer.ok);
+  CHECK(strcmp(writer.text, "# written by the tests\n"
+                            "top=before any section\n"
+                            "\n[ui]\n"
+                            "animations=false\n"
+                            "scale=-42\n"
+                            "gamma=2.20000005\n"
+                            "# a comment between values\n"
+                            "\n[server]\n"
+                            "url=http://host:8096/?a=b\n"
+                            "empty=\n") == 0);
+
+  const char *path = "cfg-test.ini";
+  CHECK(cfg_flush(&writer, path));
+  cfg_reader reader;
+  CHECK(cfg_open(&reader, &arena, path));
+  remove(path);
+
+  CHECK(cfg_next(&reader) == CFG_VALUE);
+  CHECK(strcmp(reader.section, "") == 0 && strcmp(reader.key, "top") == 0);
+  CHECK(strcmp(cfg_text(&reader), "before any section") == 0);
+  CHECK(cfg_next(&reader) == CFG_SECTION && strcmp(reader.section, "ui") == 0);
+  CHECK(cfg_next(&reader) == CFG_VALUE &&
+        strcmp(reader.key, "animations") == 0);
+  CHECK(cfg_bool(&reader, true) == false);
+  CHECK(cfg_next(&reader) == CFG_VALUE && strcmp(reader.key, "scale") == 0);
+  CHECK(cfg_int(&reader, 0) == -42);
+  CHECK(cfg_next(&reader) == CFG_VALUE && strcmp(reader.key, "gamma") == 0);
+  CHECK(cfg_float(&reader, 0) == 2.2f);
+  CHECK(cfg_int(&reader, 7) == 7);
+  CHECK(cfg_next(&reader) == CFG_SECTION &&
+        strcmp(reader.section, "server") == 0);
+  CHECK(cfg_next(&reader) == CFG_VALUE && strcmp(reader.key, "url") == 0);
+  CHECK(strcmp(cfg_text(&reader), "http://host:8096/?a=b") == 0);
+  CHECK(cfg_next(&reader) == CFG_VALUE && strcmp(reader.key, "empty") == 0);
+  CHECK(strcmp(cfg_text(&reader), "") == 0);
+  CHECK(cfg_int(&reader, 3) == 3 && cfg_bool(&reader, true) == true);
+  CHECK(cfg_next(&reader) == CFG_END);
+  CHECK(cfg_next(&reader) == CFG_END);
+
+  CHECK(cfg_open(&reader, &arena, "cfg-test-missing.ini"));
+  CHECK(cfg_next(&reader) == CFG_END);
+  jf_arena_destroy(&arena);
+}
+
+static void test_cfg_reader_tolerance(void) {
+  char text[] = "\r\n  ; comment\r\n# another\r\n[ ui ]\r\n"
+                "  animations =  On \r\nno equals sign\r\n[broken\r\n"
+                "flag=maybe\r\ncount = 12x\r\n\r\nlast=1";
+  cfg_reader reader;
+  cfg_init(&reader, text);
+  CHECK(cfg_next(&reader) == CFG_SECTION && strcmp(reader.section, "ui") == 0);
+  CHECK(cfg_next(&reader) == CFG_VALUE &&
+        strcmp(reader.key, "animations") == 0);
+  CHECK(strcmp(cfg_text(&reader), "On") == 0 &&
+        cfg_bool(&reader, false) == true);
+  CHECK(cfg_next(&reader) == CFG_VALUE && strcmp(reader.key, "flag") == 0);
+  /* "[broken" did not start a section */
+  CHECK(strcmp(reader.section, "ui") == 0);
+  CHECK(cfg_bool(&reader, true) == true && cfg_bool(&reader, false) == false);
+  CHECK(cfg_next(&reader) == CFG_VALUE && strcmp(reader.key, "count") == 0);
+  CHECK(cfg_int(&reader, -1) == -1);
+  CHECK(cfg_next(&reader) == CFG_VALUE && strcmp(reader.key, "last") == 0);
+  CHECK(cfg_int(&reader, 0) == 1 && cfg_bool(&reader, false) == true);
+  CHECK(cfg_next(&reader) == CFG_END);
+}
+
 int main(void)
 {
-    test_load_payload();
-    test_feed_and_control_payloads();
-    test_audio_placement();
-    test_clock();
-    test_luna_event();
-    test_virtual_list();
-    test_skyline();
+  test_cfg_round_trip();
+  test_cfg_reader_tolerance();
+  test_load_payload();
+  test_feed_and_control_payloads();
+  test_audio_placement();
+  test_clock();
+  test_luna_event();
+  test_virtual_list();
+  test_skyline();
 #ifdef JF_HAVE_DEMUX
     test_demux_open_failure();
 #endif

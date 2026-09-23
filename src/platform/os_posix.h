@@ -16,15 +16,6 @@ static inline int jf_os_mkdir(const char *path) { return mkdir(path, 0755); }
 
 static inline int jf_os_fsync(int file) { return fsync(file); }
 
-static inline int jf_os_write_fmt(int file, const char *format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    const int written = vdprintf(file, format, args);
-    va_end(args);
-    return written;
-}
-
 typedef int jf_os_socket;
 
 static inline bool jf_os_net_init(void) { return true; }
