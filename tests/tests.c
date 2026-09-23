@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "jf/audio_sync.h"
+#include "jf/blurhash.h"
 #include "jf/cfg.h"
 #include "jf/clock.h"
 #include "jf/smp_payload.h"
@@ -379,9 +380,26 @@ static void test_credentials(void) {
   rmdir("store-test");
 }
 
+static void test_blurhash(void) {
+  /* 1x1 components with a pure red DC term: every pixel is that colour. */
+  uint8_t rgb[4 * 3 * 3];
+  CHECK(jf_blurhash_decode("00TI:j", 4, 3, rgb));
+  for (size_t i = 0; i < 12; i++)
+    CHECK(rgb[i * 3] == 255 && rgb[i * 3 + 1] == 0 && rgb[i * 3 + 2] == 0);
+  /* The reference hash: 4x3 components, a varied image. */
+  CHECK(jf_blurhash_decode("LEHV6nWB2yk8pyo0adR*.7kCMdnj", 4, 3, rgb));
+  CHECK(memcmp(rgb, rgb + 3, 3) != 0 || memcmp(rgb, rgb + 33, 3) != 0);
+  memset(rgb, 7, sizeof(rgb));
+  CHECK(!jf_blurhash_decode("LEHV6nWB2yk8pyo0adR*.7kCMdn", 4, 3, rgb));
+  CHECK(!jf_blurhash_decode("00TI:\"", 4, 3, rgb));
+  CHECK(!jf_blurhash_decode("", 4, 3, rgb));
+  CHECK(rgb[0] == 7);
+}
+
 int main(void)
 {
   test_cfg_round_trip();
+  test_blurhash();
   test_cfg_reader_tolerance();
   test_credentials();
   test_load_payload();

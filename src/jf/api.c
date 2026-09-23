@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "../platform/os.h"
+#include "blurhash.h"
 
 /* ------------------------------------------------------------------ model */
 
@@ -34,6 +35,12 @@ const char *jf_item_poster_tag(const jf_item *item)
     if (uses_series_poster(item) && item->series_id != NULL)
         return item->series_primary_image_tag != NULL ? item->series_primary_image_tag : "";
     return item->primary_image_tag != NULL ? item->primary_image_tag : "";
+}
+
+const char *jf_item_poster_blurhash(const jf_item *item) {
+  if (uses_series_poster(item) && item->series_id != NULL)
+    return item->series_primary_blurhash;
+  return item->primary_blurhash;
 }
 
 bool jf_item_is_folder(const jf_item *item)
@@ -332,6 +339,18 @@ static const char *json_first_tag(jf_arena *arena, json_object *object, const ch
     return jf_arena_strdup(arena, json_object_get_string(first));
 }
 
+/* ImageBlurHashes is {type: {tag: hash}}, and carries the series' and parent's
+ * tags too. */
+static const char *json_blurhash(jf_arena *arena, json_object *object,
+                                 const char *type, const char *tag) {
+  json_object *hashes = NULL, *of_type = NULL;
+  if (tag == NULL ||
+      !json_object_object_get_ex(object, "ImageBlurHashes", &hashes) ||
+      !json_object_object_get_ex(hashes, type, &of_type))
+    return NULL;
+  return json_string(arena, of_type, tag);
+}
+
 static void parse_item(jf_arena *arena, json_object *object, jf_item *out)
 {
     memset(out, 0, sizeof(*out));
@@ -368,6 +387,10 @@ static void parse_item(jf_arena *arena, json_object *object, jf_item *out)
     json_object *tags = NULL;
     if (json_object_object_get_ex(object, "ImageTags", &tags))
         out->primary_image_tag = json_string(arena, tags, "Primary");
+    out->primary_blurhash =
+        json_blurhash(arena, object, "Primary", out->primary_image_tag);
+    out->series_primary_blurhash =
+        json_blurhash(arena, object, "Primary", out->series_primary_image_tag);
 
     json_object *user_data = NULL;
     if (json_object_object_get_ex(object, "UserData", &user_data)) {
@@ -622,6 +645,41 @@ static http_result artwork(CURL *curl, jf_arena *arena, const jf_session *sessio
     return jf_image_decode(body, size, out) ? HTTP_OK : HTTP_STATUS;
 }
 
+/* Decodes the page's blurhashes on this worker, into rows the UI uploads as one
+ * piece. The episode list shows 16:9 stills; everything else is a 2:3 poster.
+ */
+static void decode_blurs(jf_task *task) {
+  const bool still = task->job == JF_JOB_EPISODES || task->job == JF_JOB_VIEWS;
+  const uint8_t width = still ? JF_BLUR_CELL : JF_BLUR_CELL * 2 / 3;
+  const uint8_t height = still ? JF_BLUR_CELL * 9 / 16 : JF_BLUR_CELL;
+  const size_t row_bytes =
+      (size_t)JF_BLUR_COLUMNS * JF_BLUR_CELL * JF_BLUR_CELL * 3;
+  const size_t stride = (size_t)JF_BLUR_COLUMNS * JF_BLUR_CELL * 3;
+  uint8_t cell[JF_BLUR_CELL * JF_BLUR_CELL * 3];
+  for (size_t i = 0; i < task->list.count; i++) {
+    jf_item *item = &task->list.items[i];
+    const char *hash =
+        still ? item->primary_blurhash : jf_item_poster_blurhash(item);
+    if (!jf_blurhash_decode(hash, width, height, cell))
+      continue;
+    if (task->blur == NULL) {
+      task->blur_rows = (uint32_t)((task->list.count + JF_BLUR_COLUMNS - 1) /
+                                   JF_BLUR_COLUMNS);
+      task->blur = jf_arena_alloc(&task->arena, task->blur_rows * row_bytes);
+      if (task->blur == NULL)
+        return;
+    }
+    uint8_t *origin = task->blur + i / JF_BLUR_COLUMNS * row_bytes +
+                      i % JF_BLUR_COLUMNS * JF_BLUR_CELL * 3;
+    for (uint8_t y = 0; y < height; y++)
+      memcpy(origin + y * stride, cell + (size_t)y * width * 3,
+             (size_t)width * 3);
+    item->blur_cell = (uint32_t)i;
+    item->blur_width = width;
+    item->blur_height = height;
+  }
+}
+
 static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
 {
     jf_arena *arena = &task->arena;
@@ -795,6 +853,8 @@ static void *worker(void *user)
         pthread_mutex_unlock(&fetcher->mutex);
 
         const http_result result = curl != NULL ? execute(curl, &session, task) : HTTP_REQUEST_FAILED;
+        if (result == HTTP_OK)
+          decode_blurs(task);
 
         pthread_mutex_lock(&fetcher->mutex);
         if (result == HTTP_OK) {

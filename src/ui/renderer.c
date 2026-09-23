@@ -243,6 +243,17 @@ uint32_t jf_renderer_create_rgba_texture(jf_renderer *r, uint32_t width,
   return id;
 }
 
+void jf_renderer_update_texture(jf_renderer *r, uint32_t id, uint32_t x,
+                                uint32_t y, uint32_t width, uint32_t height,
+                                const uint8_t *rgb) {
+  glActiveTexture(ATLAS_UNIT);
+  glBindTexture(GL_TEXTURE_2D, id);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)x, (GLint)y, (GLsizei)width,
+                  (GLsizei)height, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+  r->have_state = false;
+}
+
 void jf_renderer_destroy_texture(jf_renderer *r, uint32_t id)
 {
     if (id == 0)

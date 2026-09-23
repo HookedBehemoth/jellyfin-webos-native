@@ -45,6 +45,13 @@ typedef struct {
     const char *backdrop_image_tag;      /* BackdropImageTags[0] */
     const char *parent_backdrop_item_id;
     const char *parent_backdrop_image_tag;
+    /* ImageBlurHashes for the two Primary tags above, or NULL. */
+    const char *series_primary_blurhash;
+    const char *primary_blurhash;
+    /* Its blurhash decoded into cell blur_cell of the task's blur rows; width 0
+     * if none. */
+    uint32_t blur_cell;
+    uint8_t blur_width, blur_height;
 
     uint32_t production_year;
     double community_rating;
@@ -72,6 +79,7 @@ const char *jf_item_poster_id(const jf_item *item);
 /* The image tag for whatever poster_id points at. Jellyfin's tags are content hashes, so
  * this doubles as the cache key - see store.h. */
 const char *jf_item_poster_tag(const jf_item *item);
+const char *jf_item_poster_blurhash(const jf_item *item);
 bool jf_item_is_folder(const jf_item *item);
 uint32_t jf_item_minutes(const jf_item *item);
 bool jf_item_finished(const jf_item *item);
@@ -196,8 +204,17 @@ typedef struct {
     jf_discovered server;
     jf_image image;
     bool has_image;
+    /* Every item's blurhash, JF_BLUR_COLUMNS cells to a row, ready to go into
+     * the UI's atlas in one upload. NULL when no item has one. */
+    uint8_t *blur;
+    uint32_t blur_rows;
     char error[128];
 } jf_task;
+
+/* Blurhash cells, in texels. A blurhash is smooth, so this is plenty when
+ * upscaled. */
+#define JF_BLUR_CELL 32
+#define JF_BLUR_COLUMNS 32
 
 /* Deep enough for a screen of posters plus the page request that named them; a full pool
  * makes submit return NULL and the UI retry next frame. */

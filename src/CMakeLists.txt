@@ -23,6 +23,7 @@ endif ()
 add_library(jf-portable STATIC
         jf/smp_payload.c
         jf/arena.c
+        jf/blurhash.c
         jf/cfg.c
         jf/packet_queue.c
         jf/clock.c
@@ -181,6 +182,7 @@ add_executable(jellyfin
         app/main.c
         jf/api.c
         jf/arena.c
+        jf/blurhash.c
         jf/cfg.c
         jf/image.c
         jf/store.c

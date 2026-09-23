@@ -414,6 +414,11 @@ typedef struct {
     char thumbnail_tag[40];
     char backdrop_id[40];
     char backdrop_tag[40];
+    /* A cell of the blurhash atlas, valid while blur_rows_stamp[blur_row]
+     * matches. */
+    uint32_t blur_stamp;
+    uint16_t blur_row, blur_column;
+    uint8_t blur_width, blur_height;
     char title[96];
     char episode_title[128];
     char overview[1024];
@@ -501,6 +506,44 @@ static void set_overview(char *out, size_t out_len, const char *text)
     out[len] = '\0';
 }
 
+/* Blurhashes stand in for artwork that is still loading. Each result page's
+ * arrive decoded as whole atlas rows; pages take the next free rows and
+ * overwrite the oldest once the atlas is full, which a card notices by its
+ * stamp. */
+#define BLUR_ATLAS_ROWS 32
+static uint32_t blur_atlas;
+static uint32_t blur_rows_stamp[BLUR_ATLAS_ROWS];
+static uint32_t blur_next_row, blur_stamps;
+/* Where the page consume() is making cards from went. */
+static struct {
+  uint32_t stamp, row;
+} incoming_blur;
+
+static void upload_blurs(const jf_task *task) {
+  incoming_blur.stamp = 0;
+  if (task->blur == NULL || task->blur_rows > BLUR_ATLAS_ROWS)
+    return;
+  const uint32_t width = JF_BLUR_COLUMNS * JF_BLUR_CELL;
+  if (blur_atlas == 0) {
+    uint8_t *black = calloc((size_t)width * BLUR_ATLAS_ROWS * JF_BLUR_CELL, 3);
+    if (black == NULL)
+      return;
+    blur_atlas = jf_renderer_create_texture(
+        renderer, width, BLUR_ATLAS_ROWS * JF_BLUR_CELL, black);
+    free(black);
+  }
+  if (blur_next_row + task->blur_rows > BLUR_ATLAS_ROWS)
+    blur_next_row = 0;
+  incoming_blur.stamp = ++blur_stamps;
+  incoming_blur.row = blur_next_row;
+  for (uint32_t i = 0; i < task->blur_rows; i++)
+    blur_rows_stamp[blur_next_row + i] = incoming_blur.stamp;
+  jf_renderer_update_texture(renderer, blur_atlas, 0,
+                             blur_next_row * JF_BLUR_CELL, width,
+                             task->blur_rows * JF_BLUR_CELL, task->blur);
+  blur_next_row += task->blur_rows;
+}
+
 static card card_from(const jf_item *item)
 {
     card out;
@@ -520,6 +563,14 @@ static card card_from(const jf_item *item)
     set_text(out.poster_tag, sizeof(out.poster_tag), jf_item_poster_tag(item));
     set_text(out.series_id, sizeof(out.series_id), item->series_id);
     set_text(out.thumbnail_tag, sizeof(out.thumbnail_tag), item->primary_image_tag);
+    if (incoming_blur.stamp != 0 && item->blur_width != 0) {
+      out.blur_stamp = incoming_blur.stamp;
+      out.blur_row =
+          (uint16_t)(incoming_blur.row + item->blur_cell / JF_BLUR_COLUMNS);
+      out.blur_column = (uint16_t)(item->blur_cell % JF_BLUR_COLUMNS);
+      out.blur_width = item->blur_width;
+      out.blur_height = item->blur_height;
+    }
     if (item->backdrop_image_tag != NULL) {
         set_text(out.backdrop_id, sizeof(out.backdrop_id), item->id);
         set_text(out.backdrop_tag, sizeof(out.backdrop_tag), item->backdrop_image_tag);
@@ -1229,6 +1280,7 @@ static void consume(jf_task *task)
         on_failure(task);
         return;
     }
+    upload_blurs(task);
     switch (task->job) {
     case JF_JOB_DISCOVER:
         for (size_t incoming = 0;
@@ -1320,7 +1372,17 @@ static void consume(jf_task *task)
     case JF_JOB_ITEM:
         if (strcmp(task->a, detail.id) != 0)
             return;
-        detail = card_from(&task->one);
+        {
+          /* A single item comes without a page to decode; the card it opened
+           * from has the same poster's blurhash. */
+          const card opened = detail;
+          detail = card_from(&task->one);
+          detail.blur_stamp = opened.blur_stamp;
+          detail.blur_row = opened.blur_row;
+          detail.blur_column = opened.blur_column;
+          detail.blur_width = opened.blur_width;
+          detail.blur_height = opened.blur_height;
+        }
         set_text(detail_extra, sizeof(detail_extra), task->one.official_rating);
         break;
 
@@ -2005,9 +2067,10 @@ static void move(direction where, bool repeat) {
         (screen == SCREEN_GRID && grid_columns != 0 &&
          grid_selected % grid_columns == 0) ||
         screen == SCREEN_SEASON || (screen == SCREEN_PLAYBACK && focus == 0);
-    if (at_left) {
-      if (!repeat)
-        open_sidebar();
+    /* A held Left walks on through the grid's rows instead of opening the
+     * sidebar. */
+    if (at_left && !repeat) {
+      open_sidebar();
       return;
     }
   }
@@ -2371,13 +2434,37 @@ static const char *ellipsize(const char *text, float width, float size)
     return fmt("%s...", probe);
 }
 
+/* The card whose poster stands for this one. Seasons may omit both SeriesId and
+ * the inherited image tag; the show details carry the fallback and stay loaded
+ * on the season page. */
+static const card *poster_card(const card *source) {
+  return card_is(source, "Season") && source->thumbnail_tag[0] == '\0' ? &detail
+                                                                       : source;
+}
+
 static const poster_slot *card_poster(const card *source)
 {
-    /* Seasons may omit both SeriesId and the inherited image tag. The show details already
-     * carry the fallback and remain loaded on the season page. */
-    if (card_is(source, "Season") && source->thumbnail_tag[0] == '\0')
-        return poster(detail.poster_id, detail.poster_tag);
-    return poster(source->poster_id, source->poster_tag);
+  const card *owner = poster_card(source);
+  return poster(owner->poster_id, owner->poster_tag);
+}
+
+/* The card's blurhash, if its atlas row still holds it. */
+static bool draw_blur(loom_context *ctx, loom_rect rect, loom_rect clip,
+                      const card *source, float radius) {
+  if (source->blur_stamp == 0 ||
+      blur_rows_stamp[source->blur_row] != source->blur_stamp)
+    return false;
+  const float width = JF_BLUR_COLUMNS * JF_BLUR_CELL,
+              height = BLUR_ATLAS_ROWS * JF_BLUR_CELL;
+  const float x = (float)(source->blur_column * JF_BLUR_CELL);
+  const float y = (float)(source->blur_row * JF_BLUR_CELL);
+  /* Half a texel in, so linear filtering never reaches the neighbouring cell.
+   */
+  const float uv[4] = {(x + 0.5f) / width, (y + 0.5f) / height,
+                       (x + source->blur_width - 0.5f) / width,
+                       (y + source->blur_height - 0.5f) / height};
+  loom_textured(ctx, rect, &clip, blur_atlas, uv, WHITE, radius);
+  return true;
 }
 
 static void draw_watch_badge(loom_context *ctx, loom_rect art, loom_rect clip, const card *source,
@@ -2422,11 +2509,12 @@ static bool draw_card(loom_context *ctx, loom_rect rect, loom_rect clip, const c
         float uv[4];
         cover_uv(slot, art, uv);
         loom_textured(ctx, art, &clip, slot->texture, uv, WHITE, 10 * scale);
-    } else {
-        loom_fill(ctx, art, &clip, hot ? HOT : CARD, 10 * scale);
-        if (artwork_loading(source->poster_id, source->poster_tag, JF_IMAGE_PRIMARY, POSTER_W,
-                            POSTER_H))
-            draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale, &clip, scale);
+    } else if (!draw_blur(ctx, art, clip, poster_card(source), 10 * scale)) {
+      loom_fill(ctx, art, &clip, hot ? HOT : CARD, 10 * scale);
+      if (artwork_loading(source->poster_id, source->poster_tag,
+                          JF_IMAGE_PRIMARY, POSTER_W, POSTER_H))
+        draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale,
+                     &clip, scale);
     }
     draw_watch_badge(ctx, art, clip, source, scale);
 
@@ -2824,11 +2912,12 @@ static void draw_details(loom_context *ctx, float width, float scale)
         float uv[4];
         cover_uv(slot, art, uv);
         loom_textured(ctx, art, NULL, slot->texture, uv, WHITE, 16 * scale);
-    } else {
-        loom_fill(ctx, art, NULL, CARD, 16 * scale);
-        if (artwork_loading(detail.poster_id, detail.poster_tag, JF_IMAGE_PRIMARY, POSTER_W,
-                            POSTER_H))
-            draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale, &art, scale);
+    } else if (!draw_blur(ctx, art, ctx->viewport, &detail, 16 * scale)) {
+      loom_fill(ctx, art, NULL, CARD, 16 * scale);
+      if (artwork_loading(detail.poster_id, detail.poster_tag, JF_IMAGE_PRIMARY,
+                          POSTER_W, POSTER_H))
+        draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale,
+                     &art, scale);
     }
     draw_watch_badge(ctx, art, ctx->viewport, &detail, scale);
 
@@ -2892,11 +2981,13 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
         float uv[4];
         cover_uv(slot, art, uv);
         loom_textured(ctx, art, NULL, slot->texture, uv, WHITE, 12 * scale);
-    } else {
-        loom_fill(ctx, art, NULL, CARD, 12 * scale);
-        if (artwork_loading(season_detail.poster_id, season_detail.poster_tag, JF_IMAGE_PRIMARY,
-                            POSTER_W, POSTER_H))
-            draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale, &art, scale);
+    } else if (!draw_blur(ctx, art, ctx->viewport, poster_card(&season_detail),
+                          12 * scale)) {
+      loom_fill(ctx, art, NULL, CARD, 12 * scale);
+      if (artwork_loading(season_detail.poster_id, season_detail.poster_tag,
+                          JF_IMAGE_PRIMARY, POSTER_W, POSTER_H))
+        draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale,
+                     &art, scale);
     }
     draw_watch_badge(ctx, art, ctx->viewport, &season_detail, scale);
 
@@ -2973,12 +3064,12 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
             float uv[4];
             cover_uv(still, thumb, uv);
             loom_textured(ctx, thumb, &clip, still->texture, uv, WHITE, 7 * scale);
-        } else {
-            loom_fill(ctx, thumb, &clip, CARD, 7 * scale);
-            if (artwork_loading(source->id, source->thumbnail_tag, JF_IMAGE_PRIMARY, 384,
-                                216))
-                draw_spinner(ctx, thumb.x + thumb.w / 2, thumb.y + thumb.h / 2, 13 * scale,
-                             &clip, scale);
+        } else if (!draw_blur(ctx, thumb, clip, source, 7 * scale)) {
+          loom_fill(ctx, thumb, &clip, CARD, 7 * scale);
+          if (artwork_loading(source->id, source->thumbnail_tag,
+                              JF_IMAGE_PRIMARY, 384, 216))
+            draw_spinner(ctx, thumb.x + thumb.w / 2, thumb.y + thumb.h / 2,
+                         13 * scale, &clip, scale);
         }
         draw_watch_badge(ctx, thumb, clip, source, scale);
 

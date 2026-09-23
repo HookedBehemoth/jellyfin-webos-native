@@ -48,6 +48,11 @@ uint32_t jf_renderer_create_texture(jf_renderer *renderer, uint32_t width, uint3
  * mutable-format special case. */
 uint32_t jf_renderer_create_rgba_texture(jf_renderer *renderer, uint32_t width,
                                          uint32_t height, const uint8_t *rgba);
+/* Replaces a width x height block of an RGB texture made by
+ * jf_renderer_create_texture. */
+void jf_renderer_update_texture(jf_renderer *renderer, uint32_t id, uint32_t x,
+                                uint32_t y, uint32_t width, uint32_t height,
+                                const uint8_t *rgb);
 void jf_renderer_destroy_texture(jf_renderer *renderer, uint32_t id);
 
 /* Draw calls issued by the last draw, which is the number worth watching. */
