@@ -2,8 +2,10 @@
 // known FFmpeg build rather than trying to impersonate each TV's FFmpeg ABI.
 #include <errno.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "demux.h"
 
@@ -210,6 +212,33 @@ int jf_demux_subtitle_open(void *opaque, int index, const char **header,
 /// Title, else language, else the stream number; plus the codec, because a
 /// library commonly carries the same language as both full subtitles and forced
 /// signs.
+int jf_demux_font(void *opaque, int index, const char **name,
+                  const uint8_t **data, int *size) {
+  struct jf_demux *d = opaque;
+  if (index < 0 || index >= (int)d->format->nb_streams)
+    return 0;
+  const AVStream *stream = d->format->streams[index];
+  const AVCodecParameters *p = stream->codecpar;
+  if (p->codec_type != AVMEDIA_TYPE_ATTACHMENT || p->extradata == NULL ||
+      p->extradata_size <= 0)
+    return 0;
+  /* Matroska keeps the MIME type; FFmpeg maps the font ones to these ids. */
+  const AVDictionaryEntry *mime =
+      av_dict_get(stream->metadata, "mimetype", NULL, 0);
+  const bool font = p->codec_id == AV_CODEC_ID_TTF ||
+                    p->codec_id == AV_CODEC_ID_OTF ||
+                    (mime != NULL && (strstr(mime->value, "font") != NULL ||
+                                      strstr(mime->value, "opentype") != NULL));
+  if (!font)
+    return 0;
+  const AVDictionaryEntry *file =
+      av_dict_get(stream->metadata, "filename", NULL, 0);
+  *name = file != NULL ? file->value : "attachment";
+  *data = p->extradata;
+  *size = p->extradata_size;
+  return 1;
+}
+
 int jf_demux_stream_name(void *opaque, int index, char *out, int out_len) {
   struct jf_demux *d = opaque;
   if (index < 0 || index >= (int)d->format->nb_streams || out_len <= 0)

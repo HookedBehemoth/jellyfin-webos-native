@@ -245,7 +245,7 @@ static void test_subtitles(void) {
    * fields. */
   static const char line[] = "0,0,Default,,0,0,0,,Hello";
 
-  CHECK(jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080));
+  CHECK(jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 1080));
   CHECK(jf_subs_ready());
   jf_subs_feed(line, (int)sizeof(line) - 1, 1000, 2000);
 
@@ -274,7 +274,13 @@ static void test_subtitles(void) {
   jf_subs_flush();
   jf_subs_frame(1500, &image);
   CHECK(image.w == 0); /* a seek drops what was queued */
-  jf_subs_close();
+  /* A 2.4:1 picture letterboxed into the frame keeps its subtitles on the
+   * picture: above the bottom bar of (1080 - 800) / 2. */
+  CHECK(jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 800));
+  jf_subs_feed(line, (int)sizeof(line) - 1, 1000, 2000);
+  jf_subs_frame(1500, &image);
+  CHECK(image.w > 0 && image.y + image.h <= 940);
+  jf_subs_release();
   CHECK(!jf_subs_ready());
 }
 #endif

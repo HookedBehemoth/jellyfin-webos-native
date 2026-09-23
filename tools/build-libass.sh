@@ -8,8 +8,9 @@
 # libass requires FriBidi and HarfBuzz - neither is optional in 0.17 - and FreeType,
 # which the TV already ships. Fontconfig is deliberately left out: it is present in the
 # sysroot, but on the TV it would want a cache and a config of its own at startup, and
-# the app names the font file itself (see docs/fonts.md). Styles that ask for a family we
-# have no provider for fall back to that one face.
+# the app names the font file itself (see docs/fonts.md). Its config there also maps every
+# family to LG Display, so it would not find a style's font anyway: styles resolve to the
+# fonts the container attaches, and otherwise fall back to that one face.
 #
 # FriBidi and HarfBuzz build with meson because that is all HarfBuzz has had since 8.0;
 # the NDK ships a meson, but its cross file still carries the build machine's paths, so
@@ -110,7 +111,10 @@ EOF
     CONFIGURE_ARGS=(
         --host=arm-webos-linux-gnueabi
         CC="${CROSS}gcc"
-        CFLAGS="--sysroot=$SYSROOT $ARCH_FLAGS -Os"
+        # Speed, not size, for libass itself: on the TV its C rasteriser is the cost of a
+        # typeset sign, and -O2 in ARM state halves it against -Os in Thumb (an animated
+        # intro averaged 64 ms a frame at -Os, 31 ms here). -O3 measured no better.
+        CFLAGS="--sysroot=$SYSROOT $ARCH_FLAGS -O2 -marm"
         LDFLAGS="--sysroot=$SYSROOT $ARCH_FLAGS"
         PKG_CONFIG="$SDK/bin/pkg-config"
     )

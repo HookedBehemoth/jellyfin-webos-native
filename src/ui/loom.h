@@ -60,6 +60,8 @@ typedef struct {
              * anything else is a texture the application made, and each distinct one costs
              * a draw call, because this GPU has no bindless textures. */
             uint32_t texture;
+            /* The texture's colour is already multiplied by its alpha. */
+            bool premultiplied;
         } image;
     };
 } loom_command;
@@ -87,6 +89,11 @@ void loom_image(loom_context *ctx, loom_rect rect, const loom_rect *clip, const 
 void loom_textured(loom_context *ctx, loom_rect rect, const loom_rect *clip,
                    uint32_t texture, const float uv[4], const loom_color tint,
                    float radius);
+
+/* A texture holding premultiplied colour, drawn without rounded corners. */
+void loom_premultiplied(loom_context *ctx, loom_rect rect,
+                        const loom_rect *clip, uint32_t texture,
+                        const float uv[4], const loom_color tint);
 
 /* Cursor layout: the retained loom flex machinery reduced to what a TV screen uses most,
  * ordered rows and columns with padding and a gap. */

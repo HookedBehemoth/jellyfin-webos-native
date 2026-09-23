@@ -139,3 +139,12 @@ float4 fsImage(VSOut i) : SV_Target {
         alpha = 1.0 - smoothstep(0.0, 1.0, roundedDistance(i.local, i.size, r));
     return atlas.Sample(i.uv) * float4(i.color.rgb, masked(i, i.color.a * alpha));
 }
+
+// A texture composited premultiplied, which is how blending overlapping layers comes out
+// right and what filters correctly. Dividing it back out here is one reciprocal per
+// fragment; on the CPU it was a divide per pixel that nothing vectorises.
+[shader("fragment")]
+float4 fsImagePremultiplied(VSOut i) : SV_Target {
+    float4 t = atlas.Sample(i.uv);
+    return float4(t.rgb / max(t.a, 1.0 / 255.0), t.a) * float4(i.color.rgb, masked(i, i.color.a));
+}

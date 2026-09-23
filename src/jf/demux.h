@@ -23,6 +23,10 @@ int jf_demux_seek(void *demux, int64_t position_ns);
 int jf_demux_subtitle_open(void *demux, int index, const char **header,
                            int *header_size);
 void jf_demux_subtitle_stop(void *demux);
+/* A font attachment's file name and bytes, valid until the handle is closed or
+ * reopened. 0 for any other stream. */
+int jf_demux_font(void *demux, int index, const char **name,
+                  const uint8_t **data, int *size);
 /* Human-readable name for a stream: its title or language, and the codec. */
 int jf_demux_stream_name(void *demux, int index, char *out, int out_len);
 

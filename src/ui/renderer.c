@@ -10,6 +10,7 @@
 #include "ui_fill.h"
 #include "ui_glyph.h"
 #include "ui_image.h"
+#include "ui_image_premultiplied.h"
 #include "ui_round.h"
 #include "ui_vs.h"
 
@@ -22,6 +23,7 @@ typedef enum {
   KIND_BORDER,
   KIND_GLYPH,
   KIND_IMAGE,
+  KIND_IMAGE_PREMULTIPLIED,
   KIND_COUNT
 } kind;
 
@@ -198,7 +200,8 @@ jf_renderer *jf_renderer_create(const uint8_t *media, uint32_t media_width, uint
                       : r->texture;
 
     const unsigned char *const fragments[KIND_COUNT] = {
-        ui_fill, ui_round, ui_border, ui_glyph, ui_image};
+        ui_fill,  ui_round, ui_border,
+        ui_glyph, ui_image, ui_image_premultiplied};
     for (int i = 0; i < KIND_COUNT; i++)
         r->programs[i] = make_program(fragments[i]);
 
@@ -464,10 +467,13 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands, size_t count
             append_text(r, c->rect, c->clip, c);
             break;
         case LOOM_IMAGE:
-            want(r, KIND_IMAGE, c->image.texture != 0 ? c->image.texture : r->media_texture, u, true);
-            push(r, c->rect, c->clip, &c->mask, c->image.uv, c->image.tint,
-                 c->image.radius, 0);
-            break;
+          want(r,
+               c->image.premultiplied ? KIND_IMAGE_PREMULTIPLIED : KIND_IMAGE,
+               c->image.texture != 0 ? c->image.texture : r->media_texture, u,
+               true);
+          push(r, c->rect, c->clip, &c->mask, c->image.uv, c->image.tint,
+               c->image.radius, 0);
+          break;
         }
     }
     flush(r);

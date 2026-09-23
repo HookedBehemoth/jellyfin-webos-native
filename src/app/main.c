@@ -64,6 +64,26 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Where the render thread's time goes, for the stats overlay: the worst frame
+ * of each phase over the last second, in thread CPU time. */
+typedef enum {
+  PHASE_UI,
+  PHASE_ASS,
+  PHASE_COMPOSITE,
+  PHASE_UPLOAD,
+  PHASE_DRAW,
+  PHASE_COUNT
+} phase;
+static double phase_frame[PHASE_COUNT], phase_peak[PHASE_COUNT],
+    phase_shown[PHASE_COUNT];
+static unsigned runs_peak, runs_shown;
+
+static double thread_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
 typedef struct {
   float value, start, target;
   uint64_t started_at, duration;
@@ -3141,19 +3161,22 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
 
 /* The subtitle overlay sits under the transport chrome and over the video hole.
  * libass composes it; this only notices when it changed and re-uploads. */
-static void draw_subtitles(loom_context *ctx) {
-  if (!jf_subs_ready()) {
-    if (subtitle_texture != 0) {
-      jf_renderer_destroy_texture(renderer, subtitle_texture);
-      subtitle_texture = 0;
-    }
-    return;
-  }
+/* Asks libass for the picture at the playback position, uploading it when it
+ * changed. Runs on the subtitle tick, outside building the UI, so an unchanged
+ * subtitle costs no frame. */
+static bool update_subtitles(void) {
   const int media_ms = jf_player_media_ms();
   if (media_ms < 0)
-    return;
+    return false;
   jf_subs_image image;
-  if (jf_subs_frame(media_ms, &image)) {
+  const bool changed = jf_subs_frame(media_ms, &image);
+  const jf_subs_cost cost = jf_subs_last_cost();
+  phase_frame[PHASE_ASS] = cost.render_ms;
+  phase_frame[PHASE_COMPOSITE] = cost.composite_ms;
+  if (cost.runs > runs_peak)
+    runs_peak = cost.runs;
+  if (changed) {
+    const double started = thread_ms();
     if (subtitle_texture != 0)
       jf_renderer_destroy_texture(renderer, subtitle_texture);
     subtitle_texture =
@@ -3161,13 +3184,22 @@ static void draw_subtitles(loom_context *ctx) {
             ? jf_renderer_create_rgba_texture(renderer, (uint32_t)image.w,
                                               (uint32_t)image.h, image.rgba)
             : 0;
+    phase_frame[PHASE_UPLOAD] = thread_ms() - started;
     subtitle_rect = (loom_rect){(float)image.x, (float)image.y, (float)image.w,
                                 (float)image.h};
+  }
+  return changed;
+}
+
+static void draw_subtitles(loom_context *ctx) {
+  if (!jf_subs_ready() && subtitle_texture != 0) {
+    jf_renderer_destroy_texture(renderer, subtitle_texture);
+    subtitle_texture = 0;
   }
   if (subtitle_texture == 0)
     return;
   static const float whole[4] = {0, 0, 1, 1};
-  loom_textured(ctx, subtitle_rect, NULL, subtitle_texture, whole, WHITE, 0);
+  loom_premultiplied(ctx, subtitle_rect, NULL, subtitle_texture, whole, WHITE);
 }
 
 static void draw_licenses(loom_context *ctx, float width, float height,
@@ -3461,7 +3493,8 @@ static void build_ui(loom_context *ctx)
 
 /* -------------------------------------------------------------------- main */
 
-/* How often the subtitle overlay is asked whether it has changed.
+/* How often the subtitle overlay is asked whether it has changed; only a change
+ * draws a frame.
  *
  * ponytail: a poll, not a schedule. libass knows when the next event starts but
  * not when the current one ends, so there is no single wake-up to ask it for;
@@ -3721,7 +3754,8 @@ int main(void)
         if (screen == SCREEN_PLAYBACK && jf_subs_ready() &&
             now >= subtitle_tick) {
           subtitle_tick = now + SUBTITLE_TICK_NS;
-          jf_window_frame_requested = true;
+          if (update_subtitles())
+            jf_window_frame_requested = true;
         }
         /* A finished script still has to reach its capture. */
         const bool scripted_frame = script[script_at] != '\0' ||
@@ -3750,9 +3784,13 @@ int main(void)
             jf_player_render(gl_width, gl_height);
         if (jf_window_frame_requested || scripted_frame) {
             jf_window_frame_requested = false;
+            const double started = thread_ms();
             build_ui(&ctx);
+            phase_frame[PHASE_UI] = thread_ms() - started;
         }
+        const double draw_started = thread_ms();
         jf_renderer_draw(renderer, ctx.commands, ctx.count, (float)gl_width, (float)gl_height);
+        phase_frame[PHASE_DRAW] = thread_ms() - draw_started;
         if (stats_overlay) {
           char line[PROBE_OVERLAY_COLS + 1];
           probe_overlay_clear(&overlay);
@@ -3761,17 +3799,46 @@ int main(void)
           snprintf(line, sizeof(line), "gpu %s%6.2f ms",
                    timer.mode == PROBE_GPU_FINISH ? "*" : " ", timer.gpu_ms);
           probe_overlay_line(&overlay, 1, line);
-          snprintf(line, sizeof(line), "%5.1f fps",
-                   timer.frame_ms > 0 ? 1000.0 / timer.frame_ms : 0.0);
-          probe_overlay_line(&overlay, 2, line);
-          snprintf(line, sizeof(line), "%zu instances",
+          snprintf(line, sizeof(line), "%5.1f fps %zu inst",
+                   timer.frame_ms > 0 ? 1000.0 / timer.frame_ms : 0.0,
                    jf_renderer_instances(renderer));
-          probe_overlay_line(&overlay, 3, line);
+          probe_overlay_line(&overlay, 2, line);
           snprintf(line, sizeof(line), "%u draws %.1fx",
                    jf_renderer_batches(renderer),
                    jf_renderer_covered(renderer) /
                        ((double)gl_width * gl_height));
+          probe_overlay_line(&overlay, 3, line);
+          /* The rest are the worst frame of the last second, which is what a
+           * stutter is. */
+          for (int i = 0; i < PHASE_COUNT; i++)
+            if (phase_frame[i] > phase_peak[i])
+              phase_peak[i] = phase_frame[i];
+          static uint64_t window_started;
+          if (now_ns() - window_started >= 1000000000ull) {
+            window_started = now_ns();
+            memcpy(phase_shown, phase_peak, sizeof(phase_peak));
+            memset(phase_peak, 0, sizeof(phase_peak));
+            runs_shown = runs_peak;
+            runs_peak = 0;
+            fprintf(stderr,
+                    "peak ms: ui %.2f  ass %.2f  composite %.2f (%u runs)  "
+                    "upload %.2f  "
+                    "draw %.2f\n",
+                    phase_shown[PHASE_UI], phase_shown[PHASE_ASS],
+                    phase_shown[PHASE_COMPOSITE], runs_shown,
+                    phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
+          }
+          snprintf(line, sizeof(line), "ui   %6.2f ms", phase_shown[PHASE_UI]);
           probe_overlay_line(&overlay, 4, line);
+          snprintf(line, sizeof(line), "ass  %6.2f ms", phase_shown[PHASE_ASS]);
+          probe_overlay_line(&overlay, 5, line);
+          snprintf(line, sizeof(line), "comp %6.2f ms %4u",
+                   phase_shown[PHASE_COMPOSITE], runs_shown);
+          probe_overlay_line(&overlay, 6, line);
+          snprintf(line, sizeof(line), "up %5.2f gl %5.2f",
+                   phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
+          probe_overlay_line(&overlay, 7, line);
+          memset(phase_frame, 0, sizeof(phase_frame));
           glEnable(GL_BLEND);
           probe_overlay_draw(&overlay);
           probe_timer_end(&timer);

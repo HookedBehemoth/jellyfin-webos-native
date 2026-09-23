@@ -111,6 +111,8 @@ static struct {
 static atomic_int sub_track_count;
 static atomic_uint subtitle_lines_fed;
 static uint32_t frame_width = 1920, frame_height = 1080;
+/* The picture subtitles are laid out over, which the TV fits into the frame. */
+static int video_width = 1920, video_height = 1080;
 static int audio_rate = 48000;
 static const char *window_id = "";
 static atomic_uint transcode_sequence;
@@ -513,7 +515,8 @@ static void apply_subtitle_track(void *demux) {
   const char *header = NULL;
   int header_size = 0;
   if (!jf_demux_subtitle_open(demux, wanted, &header, &header_size) ||
-      !jf_subs_open(header, header_size, (int)frame_width, (int)frame_height)) {
+      !jf_subs_open(header, header_size, (int)frame_width, (int)frame_height,
+                    video_width, video_height)) {
     fprintf(stderr, "Subtitles: stream %d could not be opened\n", wanted);
     jf_demux_subtitle_stop(demux);
     read_subs = -1;
@@ -828,6 +831,20 @@ static void *session(void *unused)
      * off. */
     if (subtitle_count > 0)
       atomic_store(&wanted_subs, sub_tracks[0].stream);
+    /* Typeset tracks name the fonts the release attached; without them every
+     * style falls back to the one default face, at its own metrics. */
+    int font_count = 0;
+    for (int i = 0; subtitle_count > 0 && i < count; i++) {
+      const char *name = NULL;
+      const uint8_t *data = NULL;
+      int size = 0;
+      if (jf_demux_font(demux, i, &name, &data, &size)) {
+        jf_subs_add_font(name, data, size);
+        font_count++;
+      }
+    }
+    if (font_count > 0)
+      fprintf(stderr, "Jellyfin subtitles: %d attached font(s)\n", font_count);
     fprintf(stderr, "Jellyfin subtitles: %d text track(s)\n", subtitle_count);
     if (!jf_player_audio)
       audio_stream = -1;
@@ -835,6 +852,8 @@ static void *session(void *unused)
         set_error("No DirectMedia-compatible video stream");
         goto done;
     }
+    video_width = width;
+    video_height = height;
     if (audio_stream >= 0 && !open_audio_stream(demux, audio_stream)) {
         fprintf(stderr, "Jellyfin: no usable audio (%s), playing video only\n", jf_audio_error());
         audio_stream = -1;
@@ -914,7 +933,7 @@ done:
     atomic_store(&running, false);
     atomic_store(&segment_flowing, false);
     jf_audio_close();
-    jf_subs_close();
+    jf_subs_release();
     atomic_store(&sub_track_count, 0);
     atomic_store(&wanted_subs, -1);
     read_subs = -1;

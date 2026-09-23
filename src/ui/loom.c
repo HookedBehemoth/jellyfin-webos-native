@@ -93,17 +93,33 @@ void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip, const 
     c->text.size = size;
 }
 
-void loom_textured(loom_context *ctx, loom_rect rect, const loom_rect *clip, uint32_t texture,
-                   const float uv[4], const loom_color tint, float radius)
-{
-    loom_command *c = append(ctx, rect, clip);
-    if (c == NULL)
-        return;
-    c->kind = LOOM_IMAGE;
-    memcpy(c->image.uv, uv, sizeof(c->image.uv));
-    memcpy(c->image.tint, tint, sizeof(loom_color));
-    c->image.radius = radius;
-    c->image.texture = texture;
+static loom_command *image(loom_context *ctx, loom_rect rect,
+                           const loom_rect *clip, uint32_t texture,
+                           const float uv[4], const loom_color tint,
+                           float radius) {
+  loom_command *c = append(ctx, rect, clip);
+  if (c == NULL)
+    return NULL;
+  c->kind = LOOM_IMAGE;
+  memcpy(c->image.uv, uv, sizeof(c->image.uv));
+  memcpy(c->image.tint, tint, sizeof(loom_color));
+  c->image.radius = radius;
+  c->image.texture = texture;
+  return c;
+}
+
+void loom_textured(loom_context *ctx, loom_rect rect, const loom_rect *clip,
+                   uint32_t texture, const float uv[4], const loom_color tint,
+                   float radius) {
+  image(ctx, rect, clip, texture, uv, tint, radius);
+}
+
+void loom_premultiplied(loom_context *ctx, loom_rect rect,
+                        const loom_rect *clip, uint32_t texture,
+                        const float uv[4], const loom_color tint) {
+  loom_command *c = image(ctx, rect, clip, texture, uv, tint, 0);
+  if (c != NULL)
+    c->image.premultiplied = true;
 }
 
 void loom_image(loom_context *ctx, loom_rect rect, const loom_rect *clip, const float uv[4],

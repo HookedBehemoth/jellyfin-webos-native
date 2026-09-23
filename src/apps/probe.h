@@ -18,7 +18,7 @@
 unsigned probe_program(const unsigned char *vertex, const unsigned char *fragment);
 
 #define PROBE_OVERLAY_COLS 22
-#define PROBE_OVERLAY_ROWS 5
+#define PROBE_OVERLAY_ROWS 8
 #define PROBE_OVERLAY_ZOOM 2 /* on-screen magnification of the 1x rasterisation */
 
 typedef struct {
