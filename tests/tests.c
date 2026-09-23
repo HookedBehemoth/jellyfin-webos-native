@@ -168,7 +168,7 @@ static void test_virtual_list(void)
     CHECK(list.last - list.first <= 6);
     CHECK(loom_virtual_list_item(&list, list.first).y <= 0);
     /* Revealing an item already on screen must not move the view. */
-    CHECK(loom_virtual_list_reveal(&list, list.first + 1) == list.scroll);
+    CHECK(loom_virtual_list_reveal(&list, list.first + 1, 0) == list.scroll);
 }
 
 /* Glyphs are packed with an implicit one-pixel gutter; two regions that touch would bleed

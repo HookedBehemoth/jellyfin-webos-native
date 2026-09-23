@@ -25,11 +25,24 @@ loom_rect loom_inset(loom_rect r, float n);
 
 typedef enum { LOOM_FADE_TOP, LOOM_FADE_BOTTOM, LOOM_FADE_LEFT, LOOM_FADE_RIGHT } loom_fade_edge;
 
-typedef enum { LOOM_RECTANGLE, LOOM_BORDER, LOOM_TEXT, LOOM_IMAGE, LOOM_FADE } loom_command_kind;
+typedef enum {
+  LOOM_RECTANGLE,
+  LOOM_BORDER,
+  LOOM_TEXT,
+  LOOM_IMAGE
+} loom_command_kind;
+
+/* Per edge, content is transparent at `edge` and reaches full opacity `width`
+ * further in. A width of 0 leaves that edge alone. */
+typedef struct {
+  float edge[4];
+  float width[4];
+} loom_mask;
 
 typedef struct {
     loom_rect rect;
     loom_rect clip;
+    loom_mask mask;
     loom_command_kind kind;
     union {
         struct { loom_color color; float radius; } rectangle;
@@ -48,7 +61,6 @@ typedef struct {
              * a draw call, because this GPU has no bindless textures. */
             uint32_t texture;
         } image;
-        struct { loom_color color; loom_fade_edge edge; } fade;
     };
 } loom_command;
 
@@ -57,6 +69,9 @@ typedef struct {
     loom_command *commands;
     size_t count, capacity;
     loom_rect viewport;
+    /* Applied to every command appended while it is set; save and restore it by
+     * value. */
+    loom_mask mask;
 } loom_context;
 
 void loom_init(loom_context *ctx);
@@ -69,11 +84,9 @@ void loom_stroke(loom_context *ctx, loom_rect rect, const loom_rect *clip, const
 void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip, const char *contents, const loom_color color, float size);
 void loom_image(loom_context *ctx, loom_rect rect, const loom_rect *clip, const float uv[4], const loom_color tint, float radius);
 /* Same, from a texture the application owns rather than the default one. */
-void loom_textured(loom_context *ctx, loom_rect rect, const loom_rect *clip, uint32_t texture, const float uv[4], const loom_color tint, float radius);
-/* A smooth opaque-to-transparent overlay at one viewport edge. It makes offscreen list
- * content recede without the visible bands produced by stacking translucent rectangles. */
-void loom_fade(loom_context *ctx, loom_rect rect, const loom_rect *clip, const loom_color color,
-               loom_fade_edge edge);
+void loom_textured(loom_context *ctx, loom_rect rect, const loom_rect *clip,
+                   uint32_t texture, const float uv[4], const loom_color tint,
+                   float radius);
 
 /* Cursor layout: the retained loom flex machinery reduced to what a TV screen uses most,
  * ordered rows and columns with padding and a gap. */
@@ -85,6 +98,13 @@ typedef struct {
     float gap;
     float cursor;
 } loom_stack;
+
+/* Fades whatever is drawn next out towards both ends of a list spanning [start,
+ * end] on `axis`, so partly offscreen items recede into whatever is behind
+ * them. Each end's fade grows with how far the list can still scroll that way,
+ * up to `width`. */
+void loom_fade(loom_context *ctx, loom_axis axis, float start, float end,
+               float scroll, float max_scroll, float width);
 
 loom_stack loom_stack_init(loom_rect rect, loom_axis axis, float padding, float gap);
 loom_rect loom_stack_take(loom_stack *stack, float extent);
@@ -103,4 +123,6 @@ loom_virtual_list loom_virtual_list_init(loom_rect viewport, size_t count, float
                                          float requested_scroll);
 loom_rect loom_virtual_list_item(const loom_virtual_list *list, size_t index);
 float loom_virtual_list_max_scroll(const loom_virtual_list *list);
-float loom_virtual_list_reveal(const loom_virtual_list *list, size_t index);
+/* The scroll that shows `index` at least `margin` clear of either edge. */
+float loom_virtual_list_reveal(const loom_virtual_list *list, size_t index,
+                               float margin);

@@ -23,6 +23,7 @@
 
 #include "../platform/os.h"
 
+#include "../apps/probe.h"
 #include "../jf/api.h"
 #include "../jf/cfg.h"
 #include "../jf/player.h"
@@ -34,6 +35,8 @@
 #include "../ui/loom.h"
 #include "../ui/renderer.h"
 #include "licenses.h"
+#include "text_fs.h"
+#include "text_vs.h"
 
 #define APP_ID "dev.hookedbehemoth.jellyfin"
 
@@ -70,6 +73,7 @@ typedef struct {
 #define SIDEBAR_ANIMATION_NS 280000000ull
 
 static bool animations_enabled = true;
+static bool stats_overlay;
 static char preferences_path[576];
 static char ui_font[512];
 static char audio_device[64] = "default";
@@ -88,6 +92,8 @@ static void load_preferences(void) {
       continue;
     if (is(&reader, "ui", "animations"))
       animations_enabled = cfg_bool(&reader, animations_enabled);
+    else if (is(&reader, "ui", "overlay"))
+      stats_overlay = cfg_bool(&reader, stats_overlay);
     else if (is(&reader, "ui", "font"))
       snprintf(ui_font, sizeof(ui_font), "%s", cfg_text(&reader));
     else if (is(&reader, "playback", "audio"))
@@ -115,6 +121,9 @@ static void save_preferences(void) {
   cfg_writer_init(&writer, &arena);
   cfg_section(&writer, "ui");
   cfg_write_bool(&writer, "animations", animations_enabled);
+  cfg_comment(&writer,
+              "frame times and instance counts, redrawing every frame");
+  cfg_write_bool(&writer, "overlay", stats_overlay);
   cfg_comment(&writer, "a .ttf to draw the UI with; empty picks a system face");
   cfg_write_text(&writer, "font", ui_font);
   cfg_section(&writer, "playback");
@@ -170,6 +179,19 @@ static void animated_float_set(animated_float *value, float target,
   value->target = target;
   value->started_at = now_ns();
   value->duration = duration;
+}
+
+static uint64_t frame_index;
+
+/* A list that was not on screen last frame appears where it belongs rather than
+ * scrolling there. */
+static void animate_list(animated_float *motion, uint64_t *drawn_frame,
+                         float target) {
+  if (*drawn_frame + 1 == frame_index)
+    animated_float_set(motion, target, NAVIGATION_ANIMATION_NS);
+  else
+    animated_float_snap(motion, target);
+  *drawn_frame = frame_index;
 }
 
 static size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
@@ -243,7 +265,6 @@ typedef struct {
 } poster_slot;
 
 static poster_slot slots[CACHE_SIZE];
-static uint64_t frame_index;
 /* Poster requests started this frame. Scrolling a grid can name thirty new posters in one
  * frame; the fetcher has 32 slots shared with page requests, so let the visible ones
  * trickle in over a few frames instead of starving it. */
@@ -309,33 +330,6 @@ static const poster_slot *artwork(const char *id, const char *tag, jf_image_kind
     }
 
     const uint32_t index = (uint32_t)(victim - slots);
-    /* Disk artwork is decoded and uploaded in this frame. A cache hit must not spend a
-     * frame as an empty placeholder just because the normal network path is asynchronous. */
-    char path[768];
-    if (jf_store_image_path(path, sizeof(path), id, tag, width, height)) {
-        size_t size = 0;
-        uint8_t *bytes = jf_store_read_image(path, &size);
-        jf_image image = {0};
-        if (bytes != NULL && jf_image_decode(bytes, size, &image)) {
-            jf_renderer_destroy_texture(renderer, victim->texture);
-            memset(victim, 0, sizeof(*victim));
-            victim->texture = jf_renderer_create_texture(renderer, image.width, image.height,
-                                                          image.rgb);
-            victim->width = image.width;
-            victim->height = image.height;
-            victim->used = frame_index;
-            victim->kind = kind;
-            victim->requested_width = width;
-            victim->requested_height = height;
-            set_text(victim->id, sizeof(victim->id), id);
-            set_text(victim->tag, sizeof(victim->tag), tag);
-            jf_image_free(&image);
-            free(bytes);
-            return victim;
-        }
-        jf_image_free(&image);
-        free(bytes);
-    }
     jf_task *task = jf_fetcher_submit(&fetcher, JF_JOB_POSTER, index);
     if (task == NULL)
         return NULL;
@@ -729,8 +723,10 @@ static float grid_row_height = 360;
 /* Details and season screens. */
 static card detail;
 static char detail_extra[96];
-/* Backdrops live longer than a details screen. Track their transition here rather than on
- * the cache slot, so returning to a detail also fades an already-resident texture in. */
+/* Backdrops live longer than a details screen. Track their transition here
+ * rather than on the cache slot, so opening another item also fades an
+ * already-resident texture in, while moving between a series and its seasons
+ * keeps the backdrop that is already showing. */
 static uint32_t backdrop_texture;
 static uint64_t backdrop_fade_started_at;
 static card seasons_cards[SEASONS_CAPACITY];
@@ -744,12 +740,13 @@ static animated_float episode_scroll_motion;
 static loom_rect episode_rect;
 static float episode_row_height = 170;
 static bool episode_reveal;
-static bool episode_jump;
 static bool select_unfinished_season;
 static bool select_unfinished_episode;
 static char playback_title[160];
 static char playback_item_id[40];
 static bool playback_paused;
+static screen_id playback_return_screen;
+static size_t playback_return_focus;
 static uint64_t playback_started_at;
 static uint64_t playback_progress_at;
 /* The player chrome is deliberately transient: it never covers a scene for more than
@@ -889,9 +886,11 @@ static void open_grid(const card *source)
 static void open_details(const card *source)
 {
     select_unfinished_season = true;
+    if (strcmp(detail.backdrop_id, source->backdrop_id) != 0) {
+      backdrop_texture = 0;
+      backdrop_fade_started_at = 0;
+    }
     detail = *source;
-    backdrop_texture = 0;
-    backdrop_fade_started_at = 0;
     detail_extra[0] = '\0';
     seasons_row.count = 0;
     seasons_row.loading = false;
@@ -918,22 +917,22 @@ static void open_details(const card *source)
 
 static void open_season(const card *source)
 {
-    select_unfinished_episode = true;
-    episode_jump = false;
-    season_detail = *source;
-    episode_scroll = 0;
-    episode_reveal = true;
-    episodes_row.count = 0;
-    episodes_row.loading = true;
-    episode_selected = 0;
-    screen = SCREEN_SEASON;
-    jf_task *task = request(JF_JOB_EPISODES, 0);
-    if (task == NULL)
-        return;
-    set_text(task->a, sizeof(task->a),
-             season_detail.series_id[0] != '\0' ? season_detail.series_id : detail.id);
-    set_text(task->b, sizeof(task->b), season_detail.id);
-    jf_fetcher_start(&fetcher, task);
+  select_unfinished_episode = true;
+  season_detail = *source;
+  episode_scroll = 0;
+  episode_reveal = true;
+  episodes_row.count = 0;
+  episodes_row.loading = true;
+  episode_selected = 0;
+  screen = SCREEN_SEASON;
+  jf_task *task = request(JF_JOB_EPISODES, 0);
+  if (task == NULL)
+    return;
+  set_text(task->a, sizeof(task->a),
+           season_detail.series_id[0] != '\0' ? season_detail.series_id
+                                              : detail.id);
+  set_text(task->b, sizeof(task->b), season_detail.id);
+  jf_fetcher_start(&fetcher, task);
 }
 
 /* The library a grid belongs to, rebuilt from what the grid kept. */
@@ -1342,7 +1341,6 @@ static void consume(jf_task *task)
         if (select_unfinished_episode && screen == SCREEN_SEASON) {
             episode_selected = first_unfinished(episodes_row.cards, episodes_row.count);
             episode_reveal = true;
-            episode_jump = true;
             select_unfinished_episode = false;
         }
         break;
@@ -1589,7 +1587,8 @@ static void go_back(void)
         jf_player_stop();
         playback_paused = false;
         playback_item_id[0] = '\0';
-        screen = SCREEN_DETAILS;
+        screen = playback_return_screen;
+        focus = playback_return_focus;
         set_status("Stopped playback");
         return;
     }
@@ -1703,6 +1702,8 @@ static void start_playback(const char *id, const char *title, uint64_t resume_ti
     playback_paused = false;
     playback_started_at = now_ns();
     playback_progress_at = playback_started_at + 15000000000ull;
+    playback_return_screen = screen;
+    playback_return_focus = focus;
     focus = PLAY_PAUSE_INDEX;
     playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
     screen = SCREEN_PLAYBACK;
@@ -1944,7 +1945,8 @@ static void move_grid(direction where)
     focus_cursor_move_requested = true;
     const loom_virtual_list list =
         loom_virtual_list_init(grid_rect, grid_rows_count(), grid_row_height, grid_scroll);
-    grid_scroll = loom_virtual_list_reveal(&list, grid_selected / grid_columns);
+    grid_scroll =
+        loom_virtual_list_reveal(&list, grid_selected / grid_columns, 0);
     request_page((uint32_t)grid_selected);
 }
 
@@ -1995,18 +1997,18 @@ static void move(direction where, bool repeat) {
     return;
   }
   if (where == DIR_LEFT) {
-    bool at_left = screen == SCREEN_SERVER || screen == SCREEN_AUTH ||
-                   screen == SCREEN_QUICK || screen == SCREEN_DETAILS ||
-                   screen == SCREEN_SETTINGS ||
-                   (screen == SCREEN_HOME && col_focus[row_focus] == 0) ||
-                   (screen == SCREEN_GRID && grid_columns != 0 &&
-                    grid_selected % grid_columns == 0) ||
-                   (screen == SCREEN_SEASON && episode_selected == 0) ||
-                   (screen == SCREEN_PLAYBACK && focus == 0);
+    bool at_left =
+        screen == SCREEN_SERVER || (screen == SCREEN_AUTH && focus != 3) ||
+        screen == SCREEN_QUICK || (screen == SCREEN_DETAILS && focus == 0) ||
+        screen == SCREEN_SETTINGS ||
+        (screen == SCREEN_HOME && col_focus[row_focus] == 0) ||
+        (screen == SCREEN_GRID && grid_columns != 0 &&
+         grid_selected % grid_columns == 0) ||
+        screen == SCREEN_SEASON || (screen == SCREEN_PLAYBACK && focus == 0);
     if (at_left) {
-      if (!repeat) {
+      if (!repeat)
         open_sidebar();
-      }
+      return;
     }
   }
   switch (screen) {
@@ -2654,10 +2656,18 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
      * jump. */
     const size_t scroll_steps =
         col_focus[id] >= visible ? col_focus[id] - visible + 1 : 0;
-    const size_t first = scroll_steps > 0 ? scroll_steps - 1 : 0;
-    animated_float_set(&row_offset_motion[id], (float)scroll_steps * step,
-                       NAVIGATION_ANIMATION_NS);
+    /* The last card stops at the strip's right edge rather than a whole slot
+     * in. */
+    const float end_scroll = maxf(0, (float)row->count * step - gap - strip.w);
+    static uint64_t drawn[ROW_COUNT];
+    animate_list(&row_offset_motion[id], &drawn[id],
+                 minf((float)scroll_steps * step, end_scroll));
     const float strip_scroll = row_offset_motion[id].value;
+    const size_t first = dec((size_t)(strip_scroll / step));
+    const loom_mask outer = ctx->mask;
+    loom_fade(ctx, LOOM_HORIZONTAL, ctx->viewport.x,
+              ctx->viewport.x + ctx->viewport.w, strip_scroll, end_scroll,
+              86 * scale);
     loom_rect selected_art = {0};
     bool selected_drawn = false;
     for (size_t index = first; index < row->count; index++) {
@@ -2670,6 +2680,7 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
         row_focus = id;
         col_focus[id] = index;
         activate();
+        ctx->mask = outer;
         return;
       }
         if (focused) {
@@ -2681,16 +2692,7 @@ static void draw_row(loom_context *ctx, const item_row *row, size_t id, float to
     if (selected_drawn)
       draw_navigation_cursor(ctx, selected_art, &clip, 12 * scale, scale,
                              100 + (unsigned)id);
-    static const loom_color fade = {9, 13, 22, 255};
-    const float fade_width = 86 * scale;
-    if (scroll_steps > 0)
-      loom_fade(ctx, (loom_rect){0, strip.y, fade_width, strip.h},
-                &ctx->viewport, fade, LOOM_FADE_LEFT);
-    if (scroll_steps + visible < row->count)
-      loom_fade(ctx,
-                (loom_rect){ctx->viewport.x + ctx->viewport.w - fade_width,
-                            strip.y, fade_width, strip.h},
-                &ctx->viewport, fade, LOOM_FADE_RIGHT);
+    ctx->mask = outer;
 }
 
 static void draw_home(loom_context *ctx, float width, float height, float scale)
@@ -2703,28 +2705,25 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
     home_rect = (loom_rect){0, 0, width, height};
     loom_virtual_list target = loom_virtual_list_init(
         home_rect, ROW_COUNT, home_row_height, home_scroll);
+    const float fade_height = 78 * scale;
     if (home_reveal) {
-      home_scroll = loom_virtual_list_reveal(&target, row_focus);
+      home_scroll = loom_virtual_list_reveal(&target, row_focus, fade_height);
       home_reveal = false;
     }
     target = loom_virtual_list_init(home_rect, ROW_COUNT, home_row_height,
                                     home_scroll);
     home_scroll = target.scroll;
-    animated_float_set(&home_scroll_motion, home_scroll,
-                       NAVIGATION_ANIMATION_NS);
+    static uint64_t drawn;
+    animate_list(&home_scroll_motion, &drawn, home_scroll);
     const loom_virtual_list list = loom_virtual_list_init(
         home_rect, ROW_COUNT, home_row_height, home_scroll_motion.value);
+    const loom_mask outer = ctx->mask;
+    loom_fade(ctx, LOOM_VERTICAL, 0, height, list.scroll,
+              loom_virtual_list_max_scroll(&list), fade_height);
     for (size_t id = 0; id < ROW_COUNT; id++)
         draw_row(ctx, &rows[id], id, loom_virtual_list_item(&list, id).y, width, ctx->viewport,
                  scale);
-    static const loom_color fade = {9, 13, 22, 255};
-    const float fade_height = 78 * scale;
-    if (list.scroll > 0)
-        loom_fade(ctx, (loom_rect){0, 0, width, fade_height}, &ctx->viewport, fade,
-                  LOOM_FADE_TOP);
-    if (list.scroll < loom_virtual_list_max_scroll(&list))
-        loom_fade(ctx, (loom_rect){0, height - fade_height, width, fade_height}, &ctx->viewport,
-                  fade, LOOM_FADE_BOTTOM);
+    ctx->mask = outer;
 }
 
 static void draw_grid(loom_context *ctx, float width, float height, float scale)
@@ -2753,10 +2752,13 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     const loom_virtual_list target = loom_virtual_list_init(
         grid_rect, row_count, grid_row_height, grid_scroll);
     grid_scroll = target.scroll;
-    animated_float_set(&grid_scroll_motion, grid_scroll,
-                       NAVIGATION_ANIMATION_NS);
+    static uint64_t drawn;
+    animate_list(&grid_scroll_motion, &drawn, grid_scroll);
     const loom_virtual_list list = loom_virtual_list_init(
         grid_rect, row_count, grid_row_height, grid_scroll_motion.value);
+    const loom_mask outer = ctx->mask;
+    loom_fade(ctx, LOOM_VERTICAL, 0, height, list.scroll,
+              loom_virtual_list_max_scroll(&list), 72 * scale);
     loom_label(ctx, (loom_rect){margin, 40 * scale - grid_scroll, width - margin * 2, 50 * scale},
                NULL, grid_title, TEXT, 32 * scale);
     /* Grid padding reserves room for the first and last fully visible rows. It is not a
@@ -2782,6 +2784,7 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
             if (draw_card(ctx, rect, content, source, index == grid_selected, scale)) {
                 grid_selected = index;
                 activate();
+                ctx->mask = outer;
                 return;
             }
             if (index == grid_selected) {
@@ -2797,15 +2800,7 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     if (selected_drawn)
       draw_navigation_cursor(ctx, selected_art, &content, 12 * scale, scale,
                              200);
-
-    static const loom_color fade = {9, 13, 22, 255};
-    const float fade_height = 72 * scale;
-    if (list.scroll > 0)
-        loom_fade(ctx, (loom_rect){0, 0, width, fade_height}, &ctx->viewport, fade,
-                  LOOM_FADE_TOP);
-    if (list.scroll < loom_virtual_list_max_scroll(&list))
-        loom_fade(ctx, (loom_rect){0, height - fade_height, width, fade_height}, &ctx->viewport,
-                  fade, LOOM_FADE_BOTTOM);
+    ctx->mask = outer;
 
     const loom_rect track = {grid_rect.x + grid_rect.w, grid_rect.y, 4 * scale, grid_rect.h};
     const float max_scroll = loom_virtual_list_max_scroll(&list);
@@ -2924,26 +2919,33 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
         return;
     }
 
-    if (episode_jump) {
-        episode_scroll = (float)episode_selected * episode_row_height;
-        episode_jump = false;
-    }
-    loom_virtual_list target = loom_virtual_list_init(
-        episode_rect, episodes_row.count, episode_row_height, episode_scroll);
+    /* Like the home carousels: the selection walks down the fully visible
+     * slots, then stays in the last one while the list moves a whole episode at
+     * a time. The slot above it is then the one leaving through the fade. */
     if (episode_reveal) {
-      episode_scroll = loom_virtual_list_reveal(&target, episode_selected);
+      size_t visible = (size_t)(episode_rect.h / episode_row_height);
+      if (visible < 1)
+        visible = 1;
+      episode_scroll =
+          episode_selected >= visible
+              ? (float)(episode_selected - visible + 1) * episode_row_height
+              : 0;
       episode_reveal = false;
     }
-    target = loom_virtual_list_init(episode_rect, episodes_row.count,
-                                    episode_row_height, episode_scroll);
+    const float fade_height = 64 * scale;
+    const loom_virtual_list target = loom_virtual_list_init(
+        episode_rect, episodes_row.count, episode_row_height, episode_scroll);
     episode_scroll = target.scroll;
-    animated_float_set(&episode_scroll_motion, episode_scroll,
-                       NAVIGATION_ANIMATION_NS);
+    static uint64_t drawn;
+    animate_list(&episode_scroll_motion, &drawn, episode_scroll);
     const loom_virtual_list list =
         loom_virtual_list_init(episode_rect, episodes_row.count,
                                episode_row_height, episode_scroll_motion.value);
     /* Keep episodes below their heading, but let them reach the screen bottom. */
     const loom_rect content = {x, episode_rect.y, width - x, height - episode_rect.y};
+    const loom_mask outer = ctx->mask;
+    loom_fade(ctx, LOOM_VERTICAL, content.y, content.y + content.h, list.scroll,
+              loom_virtual_list_max_scroll(&list), fade_height);
     loom_rect selected_row = {0};
     bool selected_drawn = false;
     for (size_t index = list.first; index < list.last; index++) {
@@ -2996,21 +2998,14 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
         if (hot && pointer_press) {
             episode_selected = index;
             activate();
+            ctx->mask = outer;
             return;
         }
     }
     if (selected_drawn)
       draw_navigation_cursor(ctx, selected_row, &content, 11 * scale, scale,
                              400);
-    static const loom_color fade = {9, 13, 22, 255};
-    const float fade_height = 64 * scale;
-    if (list.scroll > 0)
-        loom_fade(ctx, (loom_rect){content.x, content.y, content.w, fade_height}, &content, fade,
-                  LOOM_FADE_TOP);
-    if (list.scroll < loom_virtual_list_max_scroll(&list))
-        loom_fade(ctx, (loom_rect){content.x, content.y + content.h - fade_height, content.w,
-                                   fade_height},
-                  &content, fade, LOOM_FADE_BOTTOM);
+    ctx->mask = outer;
 }
 
 static void draw_playback(loom_context *ctx, float width, float height, float scale)
@@ -3105,7 +3100,7 @@ static void draw_licenses(loom_context *ctx, float width, float height,
   loom_virtual_list target = loom_virtual_list_init(
       list_rect, JF_LICENSE_COUNT, row_height, licenses_scroll);
   if (licenses_reveal) {
-    licenses_scroll = loom_virtual_list_reveal(&target, focus);
+    licenses_scroll = loom_virtual_list_reveal(&target, focus, 0);
     licenses_reveal = false;
     target = loom_virtual_list_init(list_rect, JF_LICENSE_COUNT, row_height,
                                     licenses_scroll);
@@ -3177,21 +3172,17 @@ static void draw_license(loom_context *ctx, float width, float height,
   license_scroll = minf(license_scroll, end);
   list = loom_virtual_list_init(view, license_line_count, license_line_height,
                                 license_scroll);
+  /* Deep enough to cover the line being cut in half. It grows in with the
+   * scroll, so a licence at its top keeps its title readable. */
+  const loom_mask outer = ctx->mask;
+  loom_fade(ctx, LOOM_VERTICAL, view.y, view.y + view.h, license_scroll, end,
+            license_line_height * 2);
   for (size_t index = list.first; index < list.last; index++) {
     const loom_rect row = loom_virtual_list_item(&list, index);
     loom_label(ctx, (loom_rect){row.x, row.y, row.w, row.h}, &view,
                license_lines[index], DIM, size);
   }
-  /* Deep enough to cover the line being cut in half, and only at the end there
-   * is more text past - a fade over the first line of a licence that starts at
-   * the top just makes its title hard to read. */
-  const float fade = license_line_height * 2;
-  if (license_scroll > 0.5f)
-    loom_fade(ctx, (loom_rect){view.x, view.y, view.w, fade}, &panel, PANEL,
-              LOOM_FADE_TOP);
-  if (license_scroll < end - 0.5f)
-    loom_fade(ctx, (loom_rect){view.x, view.y + view.h - fade, view.w, fade},
-              &panel, PANEL, LOOM_FADE_BOTTOM);
+  ctx->mask = outer;
 }
 
 static void draw_settings(loom_context *ctx, float width, float scale)
@@ -3237,12 +3228,12 @@ static void draw_sidebar(loom_context *ctx, float height, float scale)
   loom_virtual_list target =
       loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
   if (sidebar_reveal) {
-    sidebar_scroll = loom_virtual_list_reveal(&target, sidebar_focus);
+    sidebar_scroll = loom_virtual_list_reveal(&target, sidebar_focus, 0);
     sidebar_reveal = false;
   }
   target = loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
-  animated_float_set(&sidebar_scroll_motion, target.scroll,
-                     NAVIGATION_ANIMATION_NS);
+  static uint64_t drawn;
+  animate_list(&sidebar_scroll_motion, &drawn, target.scroll);
   const loom_virtual_list list = loom_virtual_list_init(
       list_rect, count, row_height, sidebar_scroll_motion.value);
   const loom_rect selected_raw = loom_virtual_list_item(&list, sidebar_focus);
@@ -3568,6 +3559,13 @@ int main(void)
     }
     loom_context ctx;
     loom_init(&ctx);
+    probe_overlay overlay;
+    probe_timer timer;
+    if (stats_overlay) {
+      probe_overlay_init(&overlay, text_vs, text_fs, (int)gl_width,
+                         (int)gl_height);
+      probe_timer_init(&timer);
+    }
 
     if (!jf_fetcher_init(&fetcher, jf_window_wake)) {
         fprintf(stderr, "no fetcher worker threads\n");
@@ -3634,7 +3632,10 @@ int main(void)
           subtitle_tick = now + SUBTITLE_TICK_NS;
           jf_window_frame_requested = true;
         }
-        const bool scripted_frame = script[script_at] != '\0' || capture_after > 0;
+        /* A finished script still has to reach its capture. */
+        const bool scripted_frame = script[script_at] != '\0' ||
+                                    capture_after > 0 ||
+                                    (script[0] != '\0' && capture_path != NULL);
         if (!jf_window_drawable ||
             (!jf_window_frame_requested && !jf_player_needs_frame() && !scripted_frame &&
              !capture_requested)) {
@@ -3644,6 +3645,10 @@ int main(void)
             continue;
         }
 
+        if (stats_overlay) {
+          probe_timer_begin(&timer);
+          jf_window_frame_requested = true;
+        }
         glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
         if (screen == SCREEN_PLAYBACK && !jf_player_embedded())
             glClearColor(0, 0, 0, 0); /* Starfish owns the webOS video plane. */
@@ -3657,6 +3662,29 @@ int main(void)
             build_ui(&ctx);
         }
         jf_renderer_draw(renderer, ctx.commands, ctx.count, (float)gl_width, (float)gl_height);
+        if (stats_overlay) {
+          char line[PROBE_OVERLAY_COLS + 1];
+          probe_overlay_clear(&overlay);
+          snprintf(line, sizeof(line), "cpu  %6.2f ms", timer.cpu_ms);
+          probe_overlay_line(&overlay, 0, line);
+          snprintf(line, sizeof(line), "gpu %s%6.2f ms",
+                   timer.mode == PROBE_GPU_FINISH ? "*" : " ", timer.gpu_ms);
+          probe_overlay_line(&overlay, 1, line);
+          snprintf(line, sizeof(line), "%5.1f fps",
+                   timer.frame_ms > 0 ? 1000.0 / timer.frame_ms : 0.0);
+          probe_overlay_line(&overlay, 2, line);
+          snprintf(line, sizeof(line), "%zu instances",
+                   jf_renderer_instances(renderer));
+          probe_overlay_line(&overlay, 3, line);
+          snprintf(line, sizeof(line), "%u draws %.1fx",
+                   jf_renderer_batches(renderer),
+                   jf_renderer_covered(renderer) /
+                       ((double)gl_width * gl_height));
+          probe_overlay_line(&overlay, 4, line);
+          glEnable(GL_BLEND);
+          probe_overlay_draw(&overlay);
+          probe_timer_end(&timer);
+        }
 
         if (script[0] != '\0' && step_script() && capture_path != NULL && capture_after == 0)
             capture_after = SCRIPT_BEAT;

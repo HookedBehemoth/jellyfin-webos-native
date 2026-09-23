@@ -6,18 +6,24 @@
 
 #include "../platform/gl.h"
 
-#include "ui_vs.h"
-#include "ui_fill.h"
-#include "ui_round.h"
 #include "ui_border.h"
+#include "ui_fill.h"
 #include "ui_glyph.h"
 #include "ui_image.h"
-#include "ui_fade.h"
+#include "ui_round.h"
+#include "ui_vs.h"
 
 /* One program per kind of instance, so no fragment ever executes another kind's code.
  * The kind is also part of the batch state, so switching program costs a flush and
  * nothing else. */
-typedef enum { KIND_FILL, KIND_ROUND, KIND_BORDER, KIND_GLYPH, KIND_IMAGE, KIND_FADE, KIND_COUNT } kind;
+typedef enum {
+  KIND_FILL,
+  KIND_ROUND,
+  KIND_BORDER,
+  KIND_GLYPH,
+  KIND_IMAGE,
+  KIND_COUNT
+} kind;
 
 /* Slang hands out bindings in declaration order and the uniform block takes 0, so the
  * shader's single sampler is binding 1. Check the generated GLSL if the shader's
@@ -30,6 +36,8 @@ typedef struct {
     float color[4];
     float clip[4];
     float shape[4];
+    float mask_scale[4];
+    float mask_offset[4];
 } instance;
 
 /* std140 pads a float2 block to 16 bytes, so the tail is explicit. */
@@ -158,11 +166,11 @@ jf_renderer *jf_renderer_create(const uint8_t *media, uint32_t media_width, uint
 
     glBindBuffer(GL_ARRAY_BUFFER, buffers[1]);
     glBufferData(GL_ARRAY_BUFFER, 1, NULL, GL_DYNAMIC_DRAW);
-    for (GLuint i = 0; i < 5; i++) {
-        glEnableVertexAttribArray(i + 1);
-        glVertexAttribPointer(i + 1, 4, GL_FLOAT, GL_FALSE, sizeof(instance),
-                              (const void *)(uintptr_t)(i * 16));
-        glVertexAttribDivisor(i + 1, 1);
+    for (GLuint i = 0; i < 7; i++) {
+      glEnableVertexAttribArray(i + 1);
+      glVertexAttribPointer(i + 1, 4, GL_FLOAT, GL_FALSE, sizeof(instance),
+                            (const void *)(uintptr_t)(i * 16));
+      glVertexAttribDivisor(i + 1, 1);
     }
 
     glBindBuffer(GL_UNIFORM_BUFFER, buffers[2]);
@@ -189,8 +197,8 @@ jf_renderer *jf_renderer_create(const uint8_t *media, uint32_t media_width, uint
         media != NULL ? make_texture(media_width, media_height, media, false)
                       : r->texture;
 
-    const unsigned char *const fragments[KIND_COUNT] = {ui_fill, ui_round, ui_border, ui_glyph,
-                                                        ui_image, ui_fade};
+    const unsigned char *const fragments[KIND_COUNT] = {
+        ui_fill, ui_round, ui_border, ui_glyph, ui_image};
     for (int i = 0; i < KIND_COUNT; i++)
         r->programs[i] = make_program(fragments[i]);
 
@@ -211,6 +219,7 @@ void jf_renderer_destroy(jf_renderer *r)
 
 jf_atlas *jf_renderer_atlas(jf_renderer *r) { return r->atlas; }
 uint32_t jf_renderer_batches(const jf_renderer *r) { return r->batches; }
+size_t jf_renderer_instances(const jf_renderer *r) { return r->instance_count; }
 double jf_renderer_covered(const jf_renderer *r) { return r->covered; }
 
 float jf_renderer_measure(jf_renderer *r, const char *text, float size)
@@ -289,49 +298,63 @@ static void want(jf_renderer *r, kind which, GLuint texture, uniforms u, bool bl
     r->state = next;
 }
 
-static void push(jf_renderer *r, loom_rect rect, loom_rect clip, const float uv[4],
-                 const loom_color color, float radius, float border)
-{
-    if (!r->have_state)
-        return;
-    if (r->instance_count == r->instance_capacity) {
-        const size_t capacity = r->instance_capacity ? r->instance_capacity * 2 : 1024;
-        instance *grown = realloc(r->instances, capacity * sizeof(*grown));
-        if (grown == NULL)
-            return;
-        r->instances = grown;
-        r->instance_capacity = capacity;
-    }
-    /* Match the vertex shader: the quad is shrunk to its clip rectangle, so a fully
-     * clipped instance rasterises nothing. */
-    const loom_rect visible = loom_intersect(rect, clip);
-    r->covered += (double)visible.w * (double)visible.h;
+static void push(jf_renderer *r, loom_rect rect, loom_rect clip,
+                 const loom_mask *mask, const float uv[4],
+                 const loom_color color, float radius, float border) {
+  if (!r->have_state)
+    return;
+  if (r->instance_count == r->instance_capacity) {
+    const size_t capacity =
+        r->instance_capacity ? r->instance_capacity * 2 : 1024;
+    instance *grown = realloc(r->instances, capacity * sizeof(*grown));
+    if (grown == NULL)
+      return;
+    r->instances = grown;
+    r->instance_capacity = capacity;
+  }
+  /* Match the vertex shader: the quad is shrunk to its clip rectangle, so a
+   * fully clipped instance rasterises nothing. */
+  const loom_rect visible = loom_intersect(rect, clip);
+  r->covered += (double)visible.w * (double)visible.h;
 
-    instance *out = &r->instances[r->instance_count++];
-    out->rect[0] = rect.x;
-    out->rect[1] = rect.y;
-    out->rect[2] = rect.w;
-    out->rect[3] = rect.h;
-    memcpy(out->uv, uv, sizeof(out->uv));
-    for (int i = 0; i < 4; i++)
-        out->color[i] = (float)color[i] / 255.0f;
-    out->clip[0] = clip.x;
-    out->clip[1] = clip.y;
-    out->clip[2] = clip.x + clip.w;
-    out->clip[3] = clip.y + clip.h;
-    out->shape[0] = radius;
-    out->shape[1] = border;
-    out->shape[2] = 0;
-    out->shape[3] = 0;
+  instance *out = &r->instances[r->instance_count++];
+  out->rect[0] = rect.x;
+  out->rect[1] = rect.y;
+  out->rect[2] = rect.w;
+  out->rect[3] = rect.h;
+  memcpy(out->uv, uv, sizeof(out->uv));
+  for (int i = 0; i < 4; i++)
+    out->color[i] = (float)color[i] / 255.0f;
+  out->clip[0] = clip.x;
+  out->clip[1] = clip.y;
+  out->clip[2] = clip.x + clip.w;
+  out->clip[3] = clip.y + clip.h;
+  out->shape[0] = radius;
+  out->shape[1] = border;
+  out->shape[2] = 0;
+  out->shape[3] = 0;
+  /* Bottom and right measure inwards from the other side, hence the mirrored
+   * edge. An edge without a fade is a constant fully opaque 1. */
+  static const float sign[4] = {1, -1, 1, -1};
+  for (int i = 0; i < 4; i++) {
+    const float width = mask->width[i];
+    out->mask_scale[i] = width > 0 ? 1 / width : 0;
+    out->mask_offset[i] = width > 0 ? sign[i] * mask->edge[i] / width : -1;
+  }
 }
 
-static void push_fade(jf_renderer *r, loom_rect rect, loom_rect clip, const loom_command *command)
-{
-    const size_t before = r->instance_count;
-    static const float no_uv[4] = {0, 0, 0, 0};
-    push(r, rect, clip, no_uv, command->fade.color, 0, 0);
-    if (r->instance_count != before)
-        r->instances[r->instance_count - 1].shape[2] = (float)command->fade.edge;
+/* Whether any faded edge reaches into the visible part of the command. */
+static bool faded(const loom_command *c) {
+  const loom_rect v = loom_intersect(c->rect, c->clip);
+  const float *edge = c->mask.edge, *width = c->mask.width;
+  return (width[LOOM_FADE_TOP] > 0 &&
+          v.y < edge[LOOM_FADE_TOP] + width[LOOM_FADE_TOP]) ||
+         (width[LOOM_FADE_BOTTOM] > 0 &&
+          v.y + v.h > edge[LOOM_FADE_BOTTOM] - width[LOOM_FADE_BOTTOM]) ||
+         (width[LOOM_FADE_LEFT] > 0 &&
+          v.x < edge[LOOM_FADE_LEFT] + width[LOOM_FADE_LEFT]) ||
+         (width[LOOM_FADE_RIGHT] > 0 &&
+          v.x + v.w > edge[LOOM_FADE_RIGHT] - width[LOOM_FADE_RIGHT]);
 }
 
 static void append_text(jf_renderer *r, loom_rect rect, loom_rect clip, const loom_command *command)
@@ -348,8 +371,8 @@ static void append_text(jf_renderer *r, loom_rect rect, loom_rect clip, const lo
         if (glyph->region.w != 0 && glyph->region.h != 0) {
             float placed[4], uv[4];
             jf_atlas_quad(r->atlas, glyph, pen_x, baseline, size, placed, uv);
-            push(r, (loom_rect){placed[0], placed[1], placed[2], placed[3]}, clip, uv,
-                 command->text.color, 0, 0);
+            push(r, (loom_rect){placed[0], placed[1], placed[2], placed[3]},
+                 clip, &command->mask, uv, command->text.color, 0, 0);
         }
         pen_x += glyph->advance * scale;
     }
@@ -414,13 +437,16 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands, size_t count
             /* A square-cornered fill needs no corner code at all, and the background
              * alone is a full screen of them. */
             const bool square = c->rectangle.radius <= 0;
-            want(r, square ? KIND_FILL : KIND_ROUND, 0, u, !(square && c->rectangle.color[3] == 255));
-            push(r, c->rect, c->clip, no_uv, c->rectangle.color, c->rectangle.radius, 0);
+            want(r, square ? KIND_FILL : KIND_ROUND, 0, u,
+                 !(square && c->rectangle.color[3] == 255) || faded(c));
+            push(r, c->rect, c->clip, &c->mask, no_uv, c->rectangle.color,
+                 c->rectangle.radius, 0);
             break;
         }
         case LOOM_BORDER:
             want(r, KIND_BORDER, 0, u, true);
-            push(r, c->rect, c->clip, no_uv, c->border.color, c->border.radius, c->border.width);
+            push(r, c->rect, c->clip, &c->mask, no_uv, c->border.color,
+                 c->border.radius, c->border.width);
             break;
         case LOOM_TEXT:
             want(r, KIND_GLYPH, r->texture, u, true);
@@ -428,11 +454,8 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands, size_t count
             break;
         case LOOM_IMAGE:
             want(r, KIND_IMAGE, c->image.texture != 0 ? c->image.texture : r->media_texture, u, true);
-            push(r, c->rect, c->clip, c->image.uv, c->image.tint, c->image.radius, 0);
-            break;
-        case LOOM_FADE:
-            want(r, KIND_FADE, 0, u, true);
-            push_fade(r, c->rect, c->clip, c);
+            push(r, c->rect, c->clip, &c->mask, c->image.uv, c->image.tint,
+                 c->image.radius, 0);
             break;
         }
     }

@@ -29,6 +29,10 @@ struct VSIn {
     float4 color : COLOR;
     float4 clip : CLIP; // x0, y0, x1, y1
     float4 shape : SHAPE; // radius, border width, unused, unused
+    // Edge fade, per top/bottom/left/right: the distance into it, in fade widths, is
+    // position * scale - offset with the position mirrored for bottom and right.
+    float4 maskScale : MASKSCALE;
+    float4 maskOffset : MASKOFFSET;
 };
 
 struct VSOut {
@@ -38,6 +42,7 @@ struct VSOut {
     float2 local : TEXCOORD1;
     float2 size : TEXCOORD2;
     nointerpolation float4 shape : TEXCOORD3;
+    float4 mask : TEXCOORD4;
 };
 
 [shader("vertex")]
@@ -60,7 +65,16 @@ VSOut vsUi(VSIn v) {
     o.local = pixel - v.rect.xy;
     o.size = v.rect.zw;
     o.shape = v.shape;
+    // Linear in the position, so it interpolates exactly; the clamp keeps it in range
+    // however far the quad reaches past the fade.
+    o.mask = clamp(float4(pixel.y, -pixel.y, pixel.x, -pixel.x) * v.maskScale - v.maskOffset,
+                   -2.0, 2.0);
     return o;
+}
+
+float masked(VSOut i, float alpha) {
+    float4 m = i.mask;
+    return alpha * smoothstep(0.0, 1.0, min(min(m.x, m.y), min(m.z, m.w)));
 }
 
 float clampRadius(float2 size, float radius) {
@@ -83,15 +97,15 @@ bool interior(float2 local, float2 size, float margin) {
 
 [shader("fragment")]
 float4 fsFill(VSOut i) : SV_Target {
-    return i.color;
+    return float4(i.color.rgb, masked(i, i.color.a));
 }
 
 [shader("fragment")]
 float4 fsRound(VSOut i) : SV_Target {
     float r = clampRadius(i.size, i.shape.x);
-    if (interior(i.local, i.size, r)) return i.color;
+    if (interior(i.local, i.size, r)) return float4(i.color.rgb, masked(i, i.color.a));
     float alpha = 1.0 - smoothstep(0.0, 1.0, roundedDistance(i.local, i.size, r));
-    return float4(i.color.rgb, i.color.a * alpha);
+    return float4(i.color.rgb, masked(i, i.color.a * alpha));
 }
 
 [shader("fragment")]
@@ -107,14 +121,14 @@ float4 fsBorder(VSOut i) : SV_Target {
         float inner = roundedDistance(i.local - b, inner_size, max(0.0, r - b));
         alpha *= smoothstep(-1.0, 1.0, inner);
     }
-    return float4(i.color.rgb, i.color.a * alpha);
+    return float4(i.color.rgb, masked(i, i.color.a * alpha));
 }
 
 [shader("fragment")]
 float4 fsGlyph(VSOut i) : SV_Target {
     // Rasterised coverage, so the glyph is the texel: no distance field to
     // decode and no screen-space derivative to take.
-    return float4(i.color.rgb, i.color.a * atlas.Sample(i.uv).r);
+    return float4(i.color.rgb, masked(i, i.color.a * atlas.Sample(i.uv).r));
 }
 
 [shader("fragment")]
@@ -123,16 +137,5 @@ float4 fsImage(VSOut i) : SV_Target {
     float alpha = 1.0;
     if (!interior(i.local, i.size, r))
         alpha = 1.0 - smoothstep(0.0, 1.0, roundedDistance(i.local, i.size, r));
-    return atlas.Sample(i.uv) * float4(i.color.rgb, i.color.a * alpha);
-}
-
-// The fade itself is one fragment program, not a staircase of translucent rectangles.
-// shape.z is LOOM_FADE_{TOP,BOTTOM,LEFT,RIGHT}; its alpha is opaque exactly at the viewport
-// edge and reaches zero at the content side of this small overlay rectangle.
-[shader("fragment")]
-float4 fsFade(VSOut i) : SV_Target {
-    float t = i.shape.z < 2.0 ? i.local.y / max(i.size.y, 1e-6)
-                               : i.local.x / max(i.size.x, 1e-6);
-    float alpha = (i.shape.z == 0.0 || i.shape.z == 2.0) ? 1.0 - t : t;
-    return float4(i.color.rgb, i.color.a * smoothstep(0.0, 1.0, alpha));
+    return atlas.Sample(i.uv) * float4(i.color.rgb, masked(i, i.color.a * alpha));
 }

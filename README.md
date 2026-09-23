@@ -162,6 +162,8 @@ its defaults, the first time a setting changes in the UI:
 ```ini
 [ui]
 animations=true
+; frame times and instance counts in the corner, redrawing every frame
+overlay=false
 ; a .ttf to draw the UI with; empty picks a system face
 font=
 

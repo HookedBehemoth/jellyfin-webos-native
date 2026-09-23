@@ -52,6 +52,8 @@ void jf_renderer_destroy_texture(jf_renderer *renderer, uint32_t id);
 
 /* Draw calls issued by the last draw, which is the number worth watching. */
 uint32_t jf_renderer_batches(const jf_renderer *renderer);
+/* Instances the last draw submitted. */
+size_t jf_renderer_instances(const jf_renderer *renderer);
 /* Fragments the last frame actually rasterised, after the vertex shader's geometric
  * clipping. Divided by the screen area this is the overdraw factor. */
 double jf_renderer_covered(const jf_renderer *renderer);

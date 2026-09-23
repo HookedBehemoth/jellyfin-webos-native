@@ -32,6 +32,7 @@ void loom_destroy(loom_context *ctx)
 void loom_begin(loom_context *ctx, float width, float height)
 {
     ctx->count = 0;
+    ctx->mask = (loom_mask){0};
     ctx->viewport = (loom_rect){0, 0, width, height};
 }
 
@@ -53,6 +54,7 @@ static loom_command *append(loom_context *ctx, loom_rect rect, const loom_rect *
     memset(command, 0, sizeof(*command));
     command->rect = rect;
     command->clip = effective;
+    command->mask = ctx->mask;
     return command;
 }
 
@@ -110,15 +112,13 @@ void loom_image(loom_context *ctx, loom_rect rect, const loom_rect *clip, const 
     loom_textured(ctx, rect, clip, 0, uv, tint, radius);
 }
 
-void loom_fade(loom_context *ctx, loom_rect rect, const loom_rect *clip, const loom_color color,
-               loom_fade_edge edge)
-{
-    loom_command *c = append(ctx, rect, clip);
-    if (c == NULL)
-        return;
-    c->kind = LOOM_FADE;
-    memcpy(c->fade.color, color, sizeof(loom_color));
-    c->fade.edge = edge;
+void loom_fade(loom_context *ctx, loom_axis axis, float start, float end,
+               float scroll, float max_scroll, float width) {
+  const int low = axis == LOOM_VERTICAL ? LOOM_FADE_TOP : LOOM_FADE_LEFT;
+  ctx->mask.edge[low] = start - width + minf(maxf(scroll, 0), width);
+  ctx->mask.edge[low + 1] =
+      end + width - minf(maxf(max_scroll - scroll, 0), width);
+  ctx->mask.width[low] = ctx->mask.width[low + 1] = width;
 }
 
 /* ------------------------------------------------------------------ layout */
@@ -171,13 +171,13 @@ float loom_virtual_list_max_scroll(const loom_virtual_list *list)
     return maxf(0, (float)list->count * list->item_height - list->viewport.h);
 }
 
-float loom_virtual_list_reveal(const loom_virtual_list *list, size_t index)
-{
-    const float top = (float)index * list->item_height;
-    const float bottom = top + list->item_height;
-    if (top < list->scroll)
-        return top;
-    if (bottom > list->scroll + list->viewport.h)
-        return bottom - list->viewport.h;
-    return list->scroll;
+float loom_virtual_list_reveal(const loom_virtual_list *list, size_t index,
+                               float margin) {
+  const float top = (float)index * list->item_height - margin;
+  const float bottom = top + list->item_height + margin * 2;
+  if (top < list->scroll)
+    return top;
+  if (bottom > list->scroll + list->viewport.h)
+    return bottom - list->viewport.h;
+  return list->scroll;
 }
