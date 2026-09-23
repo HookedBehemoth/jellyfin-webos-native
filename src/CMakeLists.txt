@@ -87,14 +87,7 @@ endif ()
 if (HAVE_PLATFORM)
     # Window, GL context, input and the webOS lifecycle. Off the TV the webOS-only halves
     # compile out and SDL picks an ordinary desktop backend, so the probes run either way.
-    # Only the TV has switches to read from a file; see platform/env.h.
-    if (TARGET_WEBOS)
-        set(ENV_IMPL platform/env_webos.c)
-    else ()
-        set(ENV_IMPL platform/env_null.c)
-    endif ()
-    add_library(jf-platform STATIC platform/window.c platform/luna.c platform/luna_json.c
-            platform/env.c ${ENV_IMPL})
+    add_library(jf-platform STATIC platform/window.c platform/luna.c platform/luna_json.c)
     target_include_directories(jf-platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(jf-platform SYSTEM PUBLIC ${SDL2_INCLUDE_DIRS}
             ${GLIB_INCLUDE_DIRS} ${GLESV2_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS})

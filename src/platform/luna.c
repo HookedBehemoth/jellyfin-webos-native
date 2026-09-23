@@ -1,5 +1,7 @@
 #include "luna.h"
 
+bool jf_luna_log;
+
 #ifndef JF_WEBOS
 
 /* Off-device there is no Luna bus and nothing asking the app to close, which is not an
@@ -25,23 +27,12 @@ void jf_luna_deinit(void) {}
 
 #include <webos-helpers/libhelpers.h>
 
-#include "env.h"
-
 static HContext context;
 static GMainLoop *loop;
 static pthread_t loop_thread;
 static bool loop_running;
 static void (*on_quit)(void);
 static void (*on_relaunch)(void);
-
-/* Resolved once: this runs for every lifecycle payload. */
-static bool lunalog(void)
-{
-    static int cached = -1;
-    if (cached < 0)
-        cached = jf_env_flag("JF_LUNALOG");
-    return cached != 0;
-}
 
 static bool on_message(LSHandle *handle, LSMessage *message, void *user)
 {
@@ -50,8 +41,8 @@ static bool on_message(LSHandle *handle, LSMessage *message, void *user)
     const char *payload = HLunaServiceMessage(message);
     if (payload == NULL)
         return true;
-    if (lunalog())
-        fprintf(stderr, "luna: %s\n", payload);
+    if (jf_luna_log)
+      fprintf(stderr, "luna: %s\n", payload);
     char event[32];
     if (!jf_luna_json_string(payload, "event", event, sizeof(event)))
         return true;

@@ -8,7 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../platform/env.h"
 #include "../platform/os.h"
 
 #define GUTTER 1
@@ -70,6 +69,8 @@ uint32_t jf_utf8_next(const char **text)
 }
 
 /* ------------------------------------------------------------------- faces */
+
+const char *jf_atlas_font;
 
 static bool add_face(jf_atlas *atlas, const char *path)
 {
@@ -200,24 +201,24 @@ jf_atlas *jf_atlas_create(void)
         return NULL;
     }
 
-    const char *override = jf_env("UI_FONT");
-    if (override != NULL && override[0] != '\0' && add_face(atlas, override)) {
-        atlas->primary_path = override;
+    if (jf_atlas_font != NULL && add_face(atlas, jf_atlas_font)) {
+      atlas->primary_path = jf_atlas_font;
     } else {
-        size_t count = 0;
-        const char *const *paths = jf_os_font_candidates(&count);
-        for (size_t i = 0; i < count; i++) {
-            if (add_face(atlas, paths[i])) {
-                atlas->primary_path = paths[i];
-                break;
-            }
+      size_t count = 0;
+      const char *const *paths = jf_os_font_candidates(&count);
+      for (size_t i = 0; i < count; i++) {
+        if (add_face(atlas, paths[i])) {
+          atlas->primary_path = paths[i];
+          break;
         }
+      }
     }
     if (atlas->face_count == 0) {
-        fprintf(stderr, "No UI font found; set UI_FONT to a .ttf\n");
-        FT_Done_FreeType(atlas->library);
-        free(atlas);
-        return NULL;
+      fprintf(stderr, "No UI font found; set font in the [ui] section of "
+                      "preferences.ini\n");
+      FT_Done_FreeType(atlas->library);
+      free(atlas);
+      return NULL;
     }
     if (!skyline_init(&atlas->packer, 512)) {
         jf_atlas_destroy(atlas);

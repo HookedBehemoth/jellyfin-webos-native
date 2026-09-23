@@ -21,6 +21,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* A .ttf to use instead of the system candidates; NULL for those. */
+extern const char *jf_subs_font;
+
 /* The composited overlay: `rgba` is straight (not premultiplied) alpha, `w * h
  * * 4` bytes, and lives until the next jf_subs_frame. An empty image has w ==
  * 0. */

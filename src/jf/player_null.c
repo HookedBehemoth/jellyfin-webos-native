@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <string.h>
 
+bool jf_player_audio = true;
+bool jf_player_subtitles = true;
+const char *jf_player_audio_device = "default";
+
 static jf_player_state state = JF_IDLE;
 static const char *error_text = "";
 

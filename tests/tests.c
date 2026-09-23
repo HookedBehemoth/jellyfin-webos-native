@@ -4,12 +4,15 @@
  */
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "jf/audio_sync.h"
 #include "jf/cfg.h"
 #include "jf/clock.h"
 #include "jf/smp_payload.h"
+#include "jf/store.h"
 #include "platform/luna.h"
 #include "ui/loom.h"
 #include "ui/skyline.h"
@@ -356,10 +359,31 @@ static void test_cfg_reader_tolerance(void) {
   CHECK(cfg_next(&reader) == CFG_END);
 }
 
+static void test_credentials(void) {
+  setenv("JELLYFIN_STORE", "store-test", 1);
+  jf_store_init();
+  const jf_credentials saved = {"http://host:8096", "0123abcd", "user-id",
+                                "Some User", "p=ss word;#x"};
+  jf_store_save(&saved);
+  jf_credentials loaded;
+  CHECK(jf_store_load(&loaded));
+  CHECK(strcmp(loaded.server, saved.server) == 0);
+  CHECK(strcmp(loaded.token, saved.token) == 0);
+  CHECK(strcmp(loaded.user_id, saved.user_id) == 0);
+  CHECK(strcmp(loaded.user_name, saved.user_name) == 0);
+  CHECK(strcmp(loaded.password, saved.password) == 0);
+  jf_store_forget();
+  CHECK(!jf_store_load(&loaded));
+  rmdir("store-test/conf");
+  rmdir("store-test/cache");
+  rmdir("store-test");
+}
+
 int main(void)
 {
   test_cfg_round_trip();
   test_cfg_reader_tolerance();
+  test_credentials();
   test_load_payload();
   test_feed_and_control_payloads();
   test_audio_placement();

@@ -79,8 +79,6 @@ XMB_DUMP=1 ./build-host/src/xmb
 GLTRI_DUMP=1 ./build-host/src/gltri
 ```
 
-`SWAP_INTERVAL=0` unthrottles them, which is what shows the GPU's real ceiling.
-
 ### Playback is the one thing that does not run here
 
 Video on the TV belongs to `libplayerAPIs` and `libpf`, which exist nowhere
@@ -156,25 +154,41 @@ context asked for there is ES 3.1: ANGLE returns exactly the version requested,
 and the UI shaders need 3.10 for their storage buffer blocks. Running the
 resulting `.exe` needs `C:\msys64\ucrt64\bin` on `PATH` for the DLLs.
 
-## Debug switches
+## Settings
 
-SAM launches an app with an environment of its own making, so the switches are
-read from `conf/debug.env` inside the installed app as well as from the
-environment:
+`conf/preferences.ini` holds every setting. The app writes the whole file, with
+its defaults, the first time a setting changes in the UI:
 
-```sh
-echo JF_KEYLOG=1 > $APPDIR/dev.hookedbehemoth.jellyfin/conf/debug.env
+```ini
+[ui]
+animations=true
+; a .ttf to draw the UI with; empty picks a system face
+font=
+
+[playback]
+; false plays video only
+audio=true
+; false keeps the reader off the subtitle path entirely
+subtitles=true
+audio_device=default
+
+[log]
+; every key SDL reports
+keys=false
+; every SDL window event with the sizes reported at it
+window=false
+; every Luna lifecycle payload
+luna=false
 ```
+
+Host debugging only, from the environment:
 
 | variable | effect |
 |---|---|
-| `JF_KEYLOG` | log every key SDL reports |
-| `JF_LUNALOG` | log every Luna lifecycle payload |
-| `JF_WINLOG` | log every SDL window event with the sizes reported at it |
-| `JF_ALSA_DEV` | ALSA device for audio output (default `default`) |
-| `JF_NOAUDIO` | play video only |
-| `UI_FONT` | rasterise the UI from this .ttf |
 | `UI_SCRIPT` / `UI_CAPTURE` | replay remote presses, then save a PPM |
+| `JELLYFIN_ADDRESS` / `JELLYFIN_USER` / `JELLYFIN_PASSWORD` | prefill sign-in when nothing is stored |
+| `JELLYFIN_STORE` | where `conf/` and `cache/` live |
+| `XMB_DUMP`, `GLTRI_DUMP` | the xmb and gltri probes |
 
 An installed app has no terminal, so it redirects stdout and stderr to
 `conf/jellyfin.log`.

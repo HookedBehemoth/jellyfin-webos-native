@@ -7,6 +7,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Read when playback starts. */
+extern bool jf_player_audio;
+extern bool jf_player_subtitles;
+extern const char *jf_player_audio_device;
+
 typedef enum { JF_IDLE, JF_LOADING, JF_PLAYING, JF_FAILED } jf_player_state;
 
 bool jf_player_play(const char *stream_uri, const char *transcode_uri,

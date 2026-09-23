@@ -1,13 +1,13 @@
 #include "audio_alsa.h"
-#include "../platform/env.h"
 
+#include "audio_sync.h"
+#include "clock.h"
+#include "player.h"
 #include <alsa/asoundlib.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "audio_sync.h"
-#include "clock.h"
 
 /* Enough to ride out demux jitter without the queue becoming the thing that decides
  * latency; the sync correction below keeps it honest either way. */
@@ -34,10 +34,11 @@ void jf_audio_interrupt(void) { atomic_store(&interrupted, true); }
 bool jf_audio_open(int rate, int channels)
 {
     jf_audio_close();
-    /* webOS routes app audio through its own daemon, so which device that ends up being
-     * is a property of the TV rather than of this code. `default` is the right first
-     * guess; JF_ALSA_DEV exists so trying another is not a rebuild. */
-    const char *device = jf_env("JF_ALSA_DEV");
+    /* webOS routes app audio through its own daemon, so which device that ends
+     * up being is a property of the TV rather than of this code. `default` is
+     * the right first guess; the audio_device preference exists so trying
+     * another is not a rebuild. */
+    const char *device = jf_player_audio_device;
     if (device == NULL || device[0] == '\0')
         device = "default";
 

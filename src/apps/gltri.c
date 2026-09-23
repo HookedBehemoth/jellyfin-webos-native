@@ -16,7 +16,6 @@
 
 #include "../platform/gl.h"
 #include "../platform/luna.h"
-#include "../platform/env.h"
 #include "../platform/window.h"
 #include "probe.h"
 
@@ -47,33 +46,37 @@ static float next_unit(unsigned *state)
 
 int main(void)
 {
-    const char *appid = jf_env("APPID");
-    jf_window_set_handler(on_event);
-    if (!jf_window_init(appid != NULL ? appid : "dev.hookedbehemoth.gltri", "3000 triangles", 0,
-                        0))
-        return 1;
-    if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
-        fprintf(stderr, "no webOS lifecycle\n");
+  const char *appid = getenv("APPID");
+  jf_window_set_handler(on_event);
+  if (!jf_window_init(appid != NULL ? appid : "dev.hookedbehemoth.gltri",
+                      "3000 triangles", 0, 0))
+    return 1;
+  if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
+    fprintf(stderr, "no webOS lifecycle\n");
 
-    const int w = (int)gl_width;
-    const int h = (int)gl_height;
-    glViewport(0, 0, w, h);
-    glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
+  const int w = (int)gl_width;
+  const int h = (int)gl_height;
+  glViewport(0, 0, w, h);
+  glClearColor(0.04f, 0.04f, 0.06f, 1.0f);
 
-    const GLuint tri_program = probe_program(tri_vs, tri_fs);
+  const GLuint tri_program = probe_program(tri_vs, tri_fs);
 
-    /* One equilateral triangle, reused by every instance. */
-    static const float verts[6] = {
-        0.0f,                 TRI_RADIUS,
-        -TRI_RADIUS * 0.866f, -TRI_RADIUS * 0.5f,
-        TRI_RADIUS * 0.866f,  -TRI_RADIUS * 0.5f,
-    };
+  /* One equilateral triangle, reused by every instance. */
+  static const float verts[6] = {
+      0.0f,
+      TRI_RADIUS,
+      -TRI_RADIUS * 0.866f,
+      -TRI_RADIUS * 0.5f,
+      TRI_RADIUS * 0.866f,
+      -TRI_RADIUS * 0.5f,
+  };
 
-    float *instances = malloc((size_t)INSTANCES * INSTANCE_FLOATS * sizeof(float));
-    if (instances == NULL) {
-        fprintf(stderr, "failed to allocate triangle instances\n");
-        return 1;
-    }
+  float *instances =
+      malloc((size_t)INSTANCES * INSTANCE_FLOATS * sizeof(float));
+  if (instances == NULL) {
+    fprintf(stderr, "failed to allocate triangle instances\n");
+    return 1;
+  }
     unsigned seed = 0x7A1B;
     for (size_t i = 0; i < INSTANCES; i++) {
         float *instance = instances + i * INSTANCE_FLOATS;
@@ -140,11 +143,12 @@ int main(void)
 
     probe_timer timer;
     probe_timer_init(&timer);
-    fprintf(stderr, "%d instances at %ux%u, output %u.%03u Hz, swap interval %d, GPU timing: %s\n",
+    fprintf(stderr,
+            "%d instances at %ux%u, output %u.%03u Hz, GPU timing: %s\n",
             INSTANCES, gl_width, gl_height, jf_window_refresh_mhz / 1000,
-            jf_window_refresh_mhz % 1000, gl_swap_interval, probe_gpu_mode_name(&timer));
+            jf_window_refresh_mhz % 1000, probe_gpu_mode_name(&timer));
 
-    unsigned dump_after = jf_env_flag("GLTRI_DUMP") ? 3 : 0;
+    unsigned dump_after = getenv("GLTRI_DUMP") != NULL ? 3 : 0;
     const uint64_t start = probe_now_ns();
     char line[PROBE_OVERLAY_COLS + 1];
 

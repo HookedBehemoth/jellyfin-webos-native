@@ -29,7 +29,6 @@
 #include <string.h>
 #include <time.h>
 
-#include "../platform/env.h"
 #include "../platform/window.h"
 #include "audio_alsa.h"
 #include "clock.h"
@@ -48,6 +47,10 @@
 #define VIDEO_FEED_AHEAD_NS (1600 * 1000000LL)
 #define AUDIO_FEED_AHEAD_NS (400 * 1000000LL)
 #define PLAYBACK_RATE_MILLIS 1000
+
+bool jf_player_audio = true;
+bool jf_player_subtitles = true;
+const char *jf_player_audio_device = "default";
 
 static atomic_int playback_state = JF_IDLE;
 static char error_text[160];
@@ -814,10 +817,9 @@ static void *session(void *unused)
     for (int i = 0; i < subtitle_count; i++)
       fprintf(stderr, "Jellyfin subtitle track %d: stream %d, %s\n", i,
               sub_tracks[i].stream, sub_tracks[i].name);
-    /* Escape hatch, like JF_NOAUDIO above: JF_NOSUBS=1 keeps the reader off the
-     * subtitle path entirely, which is the A/B test when playback itself
-     * misbehaves. */
-    if (jf_env_flag("JF_NOSUBS")) {
+    /* Off keeps the reader off the subtitle path entirely, which is the A/B
+     * test when playback itself misbehaves. */
+    if (!jf_player_subtitles) {
       atomic_store(&sub_track_count, 0);
       subtitle_count = 0;
     }
@@ -827,9 +829,8 @@ static void *session(void *unused)
     if (subtitle_count > 0)
       atomic_store(&wanted_subs, sub_tracks[0].stream);
     fprintf(stderr, "Jellyfin subtitles: %d text track(s)\n", subtitle_count);
-    /* Escape hatch: JF_NOAUDIO=1 plays video only. */
-    if (jf_env_flag("JF_NOAUDIO"))
-        audio_stream = -1;
+    if (!jf_player_audio)
+      audio_stream = -1;
     if (video_stream < 0 || width <= 0 || height <= 0) {
         set_error("No DirectMedia-compatible video stream");
         goto done;

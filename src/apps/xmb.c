@@ -11,7 +11,6 @@
 
 #include "../platform/gl.h"
 #include "../platform/luna.h"
-#include "../platform/env.h"
 #include "../platform/window.h"
 #include "probe.h"
 
@@ -31,60 +30,61 @@ static void on_event(const jf_event *event)
 
 int main(void)
 {
-    const char *appid = jf_env("APPID");
-    jf_window_set_handler(on_event);
-    if (!jf_window_init(appid != NULL ? appid : "dev.hookedbehemoth.xmb", "XMB", 0, 0))
-        return 1;
-    /* SAM lifecycle messages arrive on Luna's worker thread; SDL's posted events bring
-     * them safely back to this render thread. */
-    if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
-        fprintf(stderr, "no webOS lifecycle\n");
+  const char *appid = getenv("APPID");
+  jf_window_set_handler(on_event);
+  if (!jf_window_init(appid != NULL ? appid : "dev.hookedbehemoth.xmb", "XMB",
+                      0, 0))
+    return 1;
+  /* SAM lifecycle messages arrive on Luna's worker thread; SDL's posted events
+   * bring them safely back to this render thread. */
+  if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
+    fprintf(stderr, "no webOS lifecycle\n");
 
-    const int w = (int)gl_width;
-    const int h = (int)gl_height;
-    glViewport(0, 0, w, h);
-    glClearColor(0, 0, 0, 1);
+  const int w = (int)gl_width;
+  const int h = (int)gl_height;
+  glViewport(0, 0, w, h);
+  glClearColor(0, 0, 0, 1);
 
-    const GLuint xmb_program = probe_program(xmb_vs, xmb_fs);
+  const GLuint xmb_program = probe_program(xmb_vs, xmb_fs);
 
-    /* Both the XMB and text shaders consume the same (0,0)-(1,1) strip. */
-    GLuint vao = 0;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
-    GLuint quad_vbo = 0;
-    glGenBuffers(1, &quad_vbo);
-    static const float quad[8] = {0, 0, 1, 0, 0, 1, 1, 1};
-    glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * 4, (const void *)0);
+  /* Both the XMB and text shaders consume the same (0,0)-(1,1) strip. */
+  GLuint vao = 0;
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+  GLuint quad_vbo = 0;
+  glGenBuffers(1, &quad_vbo);
+  static const float quad[8] = {0, 0, 1, 0, 0, 1, 1, 1};
+  glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * 4, (const void *)0);
 
-    /* std140 layout: time at byte 0, float2 resolution at byte 8. */
-    float uniforms[4] = {0, 0, (float)w, (float)h};
-    GLuint xmb_ubo = 0;
-    glGenBuffers(1, &xmb_ubo);
-    glBindBuffer(GL_UNIFORM_BUFFER, xmb_ubo);
-    glBufferData(GL_UNIFORM_BUFFER, sizeof(uniforms), uniforms, GL_DYNAMIC_DRAW);
+  /* std140 layout: time at byte 0, float2 resolution at byte 8. */
+  float uniforms[4] = {0, 0, (float)w, (float)h};
+  GLuint xmb_ubo = 0;
+  glGenBuffers(1, &xmb_ubo);
+  glBindBuffer(GL_UNIFORM_BUFFER, xmb_ubo);
+  glBufferData(GL_UNIFORM_BUFFER, sizeof(uniforms), uniforms, GL_DYNAMIC_DRAW);
 
-    probe_overlay overlay;
-    probe_overlay_init(&overlay, text_vs, text_fs, w, h);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  probe_overlay overlay;
+  probe_overlay_init(&overlay, text_vs, text_fs, w, h);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    const GLenum setup_error = glGetError();
-    if (setup_error != GL_NO_ERROR) {
-        fprintf(stderr, "GL error after setup: 0x%x\n", setup_error);
-        return 1;
-    }
+  const GLenum setup_error = glGetError();
+  if (setup_error != GL_NO_ERROR) {
+    fprintf(stderr, "GL error after setup: 0x%x\n", setup_error);
+    return 1;
+  }
 
     probe_timer timer;
     probe_timer_init(&timer);
-    fprintf(stderr, "XMB at %ux%u, output %u.%03u Hz, swap interval %d, GPU timing: %s\n",
-            gl_width, gl_height, jf_window_refresh_mhz / 1000, jf_window_refresh_mhz % 1000,
-            gl_swap_interval, probe_gpu_mode_name(&timer));
+    fprintf(stderr, "XMB at %ux%u, output %u.%03u Hz, GPU timing: %s\n",
+            gl_width, gl_height, jf_window_refresh_mhz / 1000,
+            jf_window_refresh_mhz % 1000, probe_gpu_mode_name(&timer));
 
     /* A couple of frames first, so the timer query has a result to show. */
-    unsigned dump_after = jf_env_flag("XMB_DUMP") ? 3 : 0;
+    unsigned dump_after = getenv("XMB_DUMP") != NULL ? 3 : 0;
     const uint64_t start = probe_now_ns();
     char line[PROBE_OVERLAY_COLS + 1];
 

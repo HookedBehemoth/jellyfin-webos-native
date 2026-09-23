@@ -22,6 +22,9 @@
 
 #include "skyline.h"
 
+/* A .ttf to use instead of the system candidates; NULL for those. */
+extern const char *jf_atlas_font;
+
 #define JF_ATLAS_BASE_PX 48.0f
 
 typedef struct {

@@ -9,8 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../platform/env.h"
 #include "../platform/os.h"
+#include "cfg.h"
 
 /* Artwork budget. The cache is pruned to this at startup, oldest first. Two hundred-odd
  * posters at 240x360 PNG; a library of any size settles here. */
@@ -77,7 +77,7 @@ static bool writable(void)
 void jf_store_init(void)
 {
     char cwd[512];
-    const char *override = jf_env("JELLYFIN_STORE");
+    const char *override = getenv("JELLYFIN_STORE");
     if (override != NULL && override[0] != '\0') {
         snprintf(root, sizeof(root), "%s", override);
     } else if (app_directory(cwd, sizeof(cwd))) {
@@ -112,44 +112,45 @@ void jf_store_save(const jf_credentials *credentials)
 {
     char path[576];
     credentials_path(path, sizeof(path));
-    const int file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (file < 0)
-        return;
-    char body[1200];
-    const int n = snprintf(body, sizeof(body), "%s\n%s\n%s\n%s\n%s\n", credentials->server,
-                           credentials->token, credentials->user_id, credentials->user_name,
-                           credentials->password);
-    if (n > 0 && (size_t)n < sizeof(body))
-        (void)!write(file, body, (size_t)n);
-    close(file);
+    jf_arena arena = {0};
+    cfg_writer writer;
+    cfg_writer_init(&writer, &arena);
+    cfg_write_text(&writer, "server", credentials->server);
+    cfg_write_text(&writer, "token", credentials->token);
+    cfg_write_text(&writer, "user_id", credentials->user_id);
+    cfg_write_text(&writer, "user_name", credentials->user_name);
+    cfg_write_text(&writer, "password", credentials->password);
+    if (!cfg_flush(&writer, path))
+      fprintf(stderr, "store: could not save %s\n", path);
+    jf_arena_destroy(&arena);
 }
 
 bool jf_store_load(jf_credentials *out)
 {
     char path[576];
     credentials_path(path, sizeof(path));
-    const int file = open(path, O_RDONLY);
-    if (file < 0)
-        return false;
-    char body[1200];
-    const ssize_t n = read(file, body, sizeof(body) - 1);
-    close(file);
-    if (n <= 0)
-        return false;
-    body[n] = '\0';
-
     memset(out, 0, sizeof(*out));
-    char *fields[5] = {out->server, out->token, out->user_id, out->user_name, out->password};
-    const size_t sizes[5] = {sizeof(out->server), sizeof(out->token), sizeof(out->user_id),
-                             sizeof(out->user_name), sizeof(out->password)};
-    char *cursor = body;
-    for (int i = 0; i < 5 && cursor != NULL; i++) {
-        char *newline = strchr(cursor, '\n');
-        if (newline != NULL)
-            *newline = '\0';
-        snprintf(fields[i], sizes[i], "%s", cursor);
-        cursor = newline != NULL ? newline + 1 : NULL;
+    jf_arena arena = {0};
+    cfg_reader reader;
+    (void)cfg_open(&reader, &arena, path);
+    const struct {
+      const char *key;
+      char *field;
+      size_t size;
+    } fields[] = {
+        {"server", out->server, sizeof(out->server)},
+        {"token", out->token, sizeof(out->token)},
+        {"user_id", out->user_id, sizeof(out->user_id)},
+        {"user_name", out->user_name, sizeof(out->user_name)},
+        {"password", out->password, sizeof(out->password)},
+    };
+    for (cfg_event event; (event = cfg_next(&reader)) != CFG_END;) {
+      for (size_t i = 0;
+           event == CFG_VALUE && i < sizeof(fields) / sizeof(*fields); i++)
+        if (strcmp(reader.key, fields[i].key) == 0)
+          snprintf(fields[i].field, fields[i].size, "%s", cfg_text(&reader));
     }
+    jf_arena_destroy(&arena);
     return out->server[0] != '\0';
 }
 

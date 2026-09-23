@@ -15,4 +15,3 @@
 
 extern uint32_t gl_width;
 extern uint32_t gl_height;
-extern int gl_swap_interval;

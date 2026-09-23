@@ -1,5 +1,4 @@
 #include "subs.h"
-#include "../platform/env.h"
 
 #include <ass/ass.h>
 #include <pthread.h>
@@ -50,10 +49,11 @@ static void ass_log(int level, const char *format, va_list args, void *unused) {
   fputc('\n', stderr);
 }
 
+const char *jf_subs_font;
+
 static const char *pick_font(void) {
-  const char *override = jf_env("UI_FONT");
-  if (override != NULL)
-    return override;
+  if (jf_subs_font != NULL)
+    return jf_subs_font;
   for (size_t i = 0; i < sizeof(font_candidates) / sizeof(*font_candidates);
        i++) {
     FILE *probe = fopen(font_candidates[i], "rb");

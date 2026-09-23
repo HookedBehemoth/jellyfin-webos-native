@@ -21,7 +21,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../platform/env.h"
 #include "../platform/os.h"
 
 #include "../jf/api.h"
@@ -31,6 +30,7 @@
 #include "../platform/gl.h"
 #include "../platform/luna.h"
 #include "../platform/window.h"
+#include "../ui/glyph_atlas.h"
 #include "../ui/loom.h"
 #include "../ui/renderer.h"
 #include "licenses.h"
@@ -71,20 +71,42 @@ typedef struct {
 
 static bool animations_enabled = true;
 static char preferences_path[576];
+static char ui_font[512];
+static char audio_device[64] = "default";
+
+static bool is(const cfg_reader *reader, const char *section, const char *key) {
+  return strcmp(reader->section, section) == 0 && strcmp(reader->key, key) == 0;
+}
 
 static void load_preferences(void) {
   jf_arena arena = {0};
   cfg_reader reader;
   if (!cfg_open(&reader, &arena, preferences_path))
     fprintf(stderr, "could not load preferences: %s\n", preferences_path);
-  bool ui = false;
   for (cfg_event event; (event = cfg_next(&reader)) != CFG_END;) {
-    if (event == CFG_SECTION)
-      ui = strcmp(reader.section, "ui") == 0;
-    else if (ui && strcmp(reader.key, "animations") == 0)
+    if (event != CFG_VALUE)
+      continue;
+    if (is(&reader, "ui", "animations"))
       animations_enabled = cfg_bool(&reader, animations_enabled);
+    else if (is(&reader, "ui", "font"))
+      snprintf(ui_font, sizeof(ui_font), "%s", cfg_text(&reader));
+    else if (is(&reader, "playback", "audio"))
+      jf_player_audio = cfg_bool(&reader, jf_player_audio);
+    else if (is(&reader, "playback", "subtitles"))
+      jf_player_subtitles = cfg_bool(&reader, jf_player_subtitles);
+    else if (is(&reader, "playback", "audio_device"))
+      snprintf(audio_device, sizeof(audio_device), "%s", cfg_text(&reader));
+    else if (is(&reader, "log", "keys"))
+      jf_window_log_keys = cfg_bool(&reader, jf_window_log_keys);
+    else if (is(&reader, "log", "window"))
+      jf_window_log_events = cfg_bool(&reader, jf_window_log_events);
+    else if (is(&reader, "log", "luna"))
+      jf_luna_log = cfg_bool(&reader, jf_luna_log);
   }
   jf_arena_destroy(&arena);
+  jf_atlas_font = ui_font[0] != '\0' ? ui_font : NULL;
+  jf_subs_font = jf_atlas_font;
+  jf_player_audio_device = audio_device;
 }
 
 static void save_preferences(void) {
@@ -93,6 +115,16 @@ static void save_preferences(void) {
   cfg_writer_init(&writer, &arena);
   cfg_section(&writer, "ui");
   cfg_write_bool(&writer, "animations", animations_enabled);
+  cfg_comment(&writer, "a .ttf to draw the UI with; empty picks a system face");
+  cfg_write_text(&writer, "font", ui_font);
+  cfg_section(&writer, "playback");
+  cfg_write_bool(&writer, "audio", jf_player_audio);
+  cfg_write_bool(&writer, "subtitles", jf_player_subtitles);
+  cfg_write_text(&writer, "audio_device", audio_device);
+  cfg_section(&writer, "log");
+  cfg_write_bool(&writer, "keys", jf_window_log_keys);
+  cfg_write_bool(&writer, "window", jf_window_log_events);
+  cfg_write_bool(&writer, "luna", jf_luna_log);
   if (!cfg_flush(&writer, preferences_path))
     fprintf(stderr, "could not save preferences: %s\n", preferences_path);
   jf_arena_destroy(&arena);
@@ -3512,9 +3544,6 @@ int main(void)
              "%s/conf/preferences.ini", jf_store_root());
     load_preferences();
     log_to_file();
-    /* After the redirect, so the confirmation lands in the log rather than on a stdout
-     * nobody is reading. */
-    jf_env_init();
     const bool restored = jf_session_load(&session);
     if (session.url[0] != '\0') {
         set_text(server_url, sizeof(server_url), session.url);
@@ -3522,7 +3551,7 @@ int main(void)
     }
 
     jf_window_set_handler(on_event);
-    const char *appid = jf_env("APPID");
+    const char *appid = getenv("APPID");
     if (!jf_window_init(appid != NULL ? appid : APP_ID, "Jellyfin", 0, 0))
         return 1;
     /* How the TV asks the app to close. Absent off-device, where nothing asks. */
@@ -3557,17 +3586,17 @@ int main(void)
         /* Development convenience, and the only way a script can sign in: the fields start
          * filled from the environment. Nothing is read from there once a token is
          * stored. */
-        const char *address = jf_env("JELLYFIN_ADDRESS");
+        const char *address = getenv("JELLYFIN_ADDRESS");
         if (address != NULL) {
             set_text(server_url, sizeof(server_url), address);
             set_text(session.url, sizeof(session.url), address);
             set_text(server_name, sizeof(server_name), address);
             jf_fetcher_set_session(&fetcher, &session);
         }
-        const char *user = jf_env("JELLYFIN_USER");
+        const char *user = getenv("JELLYFIN_USER");
         if (user != NULL)
             set_text(username, sizeof(username), user);
-        const char *secret = jf_env("JELLYFIN_PASSWORD");
+        const char *secret = getenv("JELLYFIN_PASSWORD");
         if (secret != NULL)
             set_text(password, sizeof(password), secret);
         if (session.url[0] != '\0') {
@@ -3577,8 +3606,8 @@ int main(void)
         }
     }
 
-    const char *capture_path = jf_env("UI_CAPTURE");
-    const char *requested_script = jf_env("UI_SCRIPT");
+    const char *capture_path = getenv("UI_CAPTURE");
+    const char *requested_script = getenv("UI_SCRIPT");
     script = requested_script != NULL ? requested_script : "";
     /* Without a script, hold long enough for discovery's three timeouts. */
     unsigned capture_after = (capture_path != NULL && script[0] == '\0') ? 240 : 0;

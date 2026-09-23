@@ -86,6 +86,8 @@ const char *jf_window_export_video(const int src[4], const int dst[4]);
 bool jf_window_is_back_key(uint32_t code);
 
 extern bool jf_window_running;
+extern bool jf_window_log_keys;
+extern bool jf_window_log_events;
 /* False while SDL reports the window minimized. Render loops wait for an event in this
  * state instead of swapping invisible frames in a tight loop. */
 extern bool jf_window_drawable;

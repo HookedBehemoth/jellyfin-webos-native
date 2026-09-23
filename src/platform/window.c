@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "env.h"
 #include "gl.h"
 
 #ifdef JF_WEBOS
@@ -15,8 +14,9 @@
 
 uint32_t gl_width;
 uint32_t gl_height;
-int gl_swap_interval = 1;
 
+bool jf_window_log_keys;
+bool jf_window_log_events;
 bool jf_window_running = true;
 bool jf_window_drawable = true;
 bool jf_window_frame_requested = true;
@@ -38,26 +38,6 @@ static char video_window_id[64];
  * main thread may do. */
 #define EV_RAISE (SDL_USEREVENT)
 #define EV_WAKE (SDL_USEREVENT + 1)
-
-/* Resolved once: these are consulted per key and per window event. */
-static bool flag_once(const char *name, int *cached)
-{
-    if (*cached < 0)
-        *cached = jf_env_flag(name);
-    return *cached != 0;
-}
-
-static bool keylog(void)
-{
-    static int cached = -1;
-    return flag_once("JF_KEYLOG", &cached);
-}
-
-static bool winlog(void)
-{
-    static int cached = -1;
-    return flag_once("JF_WINLOG", &cached);
-}
 
 static void emit(const jf_event *event)
 {
@@ -204,11 +184,7 @@ bool jf_window_init(const char *app_id, const char *title, uint32_t want_width,
         return false;
     }
 
-    /* 1 = throttle to the display. SWAP_INTERVAL=0 lets frames go out as fast as they are
-     * drawn, which is what shows the GPU's real ceiling. */
-    const char *interval = jf_env("SWAP_INTERVAL");
-    gl_swap_interval = interval != NULL ? atoi(interval) : 1;
-    SDL_GL_SetSwapInterval(gl_swap_interval);
+    SDL_GL_SetSwapInterval(1);
 
     /* Everything above the platform layer works in framebuffer pixels, so the drawable
      * size is the one that matters - the window size is in logical units and the two
@@ -355,11 +331,12 @@ static void translate(const SDL_Event *event)
         }
         uint32_t code = 0;
         const bool known = evdev_for(scancode, &code);
-        /* JF_KEYLOG=1 shows every key SDL reports, which is the only way to learn what a
-         * TV remote actually sends. */
-        if (!known || keylog())
-            fprintf(stderr, "sdl: key scancode=%d sym=0x%x down=%d repeat=%d\n", scancode,
-                    (unsigned)event->key.keysym.sym, down, event->key.repeat);
+        /* Logging every key is the only way to learn what a TV remote actually
+         * sends. */
+        if (!known || jf_window_log_keys)
+          fprintf(stderr, "sdl: key scancode=%d sym=0x%x down=%d repeat=%d\n",
+                  scancode, (unsigned)event->key.keysym.sym, down,
+                  event->key.repeat);
         if (!known)
             break;
         if (down)
@@ -414,16 +391,18 @@ static void translate(const SDL_Event *event)
         /* Which events carry a size, and whether it has landed by the time one arrives,
          * differs between backends - the first thing to reach for when a window is drawn
          * at the wrong dimensions. */
-        if (winlog()) {
-            int drawable_w = 0, drawable_h = 0, logical_w = 0, logical_h = 0;
-            if (window != NULL) {
-                SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
-                SDL_GetWindowSize(window, &logical_w, &logical_h);
-            }
-            fprintf(stderr,
-                    "winevent=%u data=%dx%d drawable=%dx%d windowsize=%dx%d gl=%ux%u\n",
-                    event->window.event, event->window.data1, event->window.data2,
-                    drawable_w, drawable_h, logical_w, logical_h, gl_width, gl_height);
+        if (jf_window_log_events) {
+          int drawable_w = 0, drawable_h = 0, logical_w = 0, logical_h = 0;
+          if (window != NULL) {
+            SDL_GL_GetDrawableSize(window, &drawable_w, &drawable_h);
+            SDL_GetWindowSize(window, &logical_w, &logical_h);
+          }
+          fprintf(stderr,
+                  "winevent=%u data=%dx%d drawable=%dx%d windowsize=%dx%d "
+                  "gl=%ux%u\n",
+                  event->window.event, event->window.data1, event->window.data2,
+                  drawable_w, drawable_h, logical_w, logical_h, gl_width,
+                  gl_height);
         }
         switch (event->window.event) {
         case SDL_WINDOWEVENT_HIDDEN:

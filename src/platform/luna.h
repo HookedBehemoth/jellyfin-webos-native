@@ -26,6 +26,9 @@
 bool jf_luna_register_lifecycle(void (*on_quit)(void), void (*on_relaunch)(void));
 void jf_luna_deinit(void);
 
+/* Print every lifecycle payload. */
+extern bool jf_luna_log;
+
 /* The value of a top-level string key, copied into `out`. Exposed for its test: a
  * lifecycle payload arrives as a flat C string and one field of it is not worth a JSON
  * parser. */

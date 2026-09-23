@@ -25,16 +25,16 @@ void jf_store_init(void);
 const char *jf_store_root(void);
 bool jf_store_installed(void);
 
-/* Five fields, in order: server, token, user id, user name, password.
+/* Kept as key=value lines in conf/credentials.
  *
- * The password is stored because Jellyfin invalidates a device's previous token whenever
- * that device signs in again, so a stored token alone eventually stops working and leaves
- * the user typing on a remote. With it, a 401 is recoverable in the background.
+ * The password is stored because Jellyfin invalidates a device's previous token
+ * whenever that device signs in again, so a stored token alone eventually stops
+ * working and leaves the user typing on a remote. With it, a 401 is recoverable
+ * in the background.
  *
- * It is therefore a plaintext password on disk, mode 0600. The directory around it is
- * world-writable because webOS gives the app a jail uid that owns nothing, so the file
- * mode is what protects it, and root on this TV can read it regardless. Quick Connect
- * stores no password and simply signs out on a 401. */
+ * It is therefore a plaintext password in the app's own storage, which other
+ * apps on the TV cannot read. Quick Connect stores no password and simply signs
+ * out on a 401. */
 typedef struct {
     char server[512];
     char token[256];
