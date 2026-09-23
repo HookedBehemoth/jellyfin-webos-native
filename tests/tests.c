@@ -225,6 +225,16 @@ static void test_demux_open_failure(void) {
  * with it. This is where an off-by-one in the timing or a wrong premultiply
  * shows up as nothing on screen, which the app itself cannot tell apart from
  * "no subtitles here". */
+/* Rendering is on background threads, so a frame arrives a little later. */
+static void frame_until(int64_t ms, jf_subs_image *image, bool drawn) {
+  for (int tries = 0; tries < 400; tries++) {
+    jf_subs_frame(ms, image);
+    if ((image->w > 0) == drawn)
+      return;
+    usleep(5000);
+  }
+}
+
 static void test_subtitles(void) {
   static const char header[] =
       "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n"
@@ -245,7 +255,8 @@ static void test_subtitles(void) {
    * fields. */
   static const char line[] = "0,0,Default,,0,0,0,,Hello";
 
-  CHECK(jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 1080));
+  CHECK(
+      jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 1080, 0));
   CHECK(jf_subs_ready());
   jf_subs_feed(line, (int)sizeof(line) - 1, 1000, 2000);
 
@@ -253,7 +264,7 @@ static void test_subtitles(void) {
   jf_subs_frame(500, &image);
   CHECK(image.w == 0); /* before the event */
 
-  jf_subs_frame(1500, &image);
+  frame_until(1500, &image, true);
   CHECK(image.w > 0 && image.h > 0 && image.rgba != NULL);
   CHECK(image.x >= 0 && image.y >= 0);
   CHECK(image.x + image.w <= 1920 && image.y + image.h <= 1080);
@@ -268,17 +279,21 @@ static void test_subtitles(void) {
   }
   CHECK(opaque > 0 && clear > 0);
 
-  jf_subs_frame(4000, &image);
+  frame_until(4000, &image, false);
   CHECK(image.w == 0); /* after it */
+  /* Holding still is not a change, even though another thread rendered it. */
+  usleep(100000);
+  CHECK(!jf_subs_frame(4000, &image));
 
   jf_subs_flush();
   jf_subs_frame(1500, &image);
   CHECK(image.w == 0); /* a seek drops what was queued */
   /* A 2.4:1 picture letterboxed into the frame keeps its subtitles on the
    * picture: above the bottom bar of (1080 - 800) / 2. */
-  CHECK(jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 800));
+  CHECK(
+      jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 800, 0));
   jf_subs_feed(line, (int)sizeof(line) - 1, 1000, 2000);
-  jf_subs_frame(1500, &image);
+  frame_until(1500, &image, true);
   CHECK(image.w > 0 && image.y + image.h <= 940);
   jf_subs_release();
   CHECK(!jf_subs_ready());

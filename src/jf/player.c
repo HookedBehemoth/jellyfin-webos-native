@@ -113,6 +113,7 @@ static atomic_uint subtitle_lines_fed;
 static uint32_t frame_width = 1920, frame_height = 1080;
 /* The picture subtitles are laid out over, which the TV fits into the frame. */
 static int video_width = 1920, video_height = 1080;
+static double video_frame_ms;
 static int audio_rate = 48000;
 static const char *window_id = "";
 static atomic_uint transcode_sequence;
@@ -516,7 +517,7 @@ static void apply_subtitle_track(void *demux) {
   int header_size = 0;
   if (!jf_demux_subtitle_open(demux, wanted, &header, &header_size) ||
       !jf_subs_open(header, header_size, (int)frame_width, (int)frame_height,
-                    video_width, video_height)) {
+                    video_width, video_height, video_frame_ms)) {
     fprintf(stderr, "Subtitles: stream %d could not be opened\n", wanted);
     jf_demux_subtitle_stop(demux);
     read_subs = -1;
@@ -864,6 +865,8 @@ static void *session(void *unused)
 
     int fps_num = 0, fps_den = 0;
     jf_demux_video_fps(demux, video_stream, &fps_num, &fps_den);
+    video_frame_ms =
+        fps_num > 0 && fps_den > 0 ? 1000.0 * fps_den / fps_num : 0;
 
     static const char *const codec_names[] = {"", "H264", "H265", "VP9", "AV1"};
     smp_video_params params = {APP_ID, window_id, codec_names[codec], width, height,

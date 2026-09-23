@@ -65,7 +65,8 @@ static uint64_t now_ns(void)
 }
 
 /* Where the render thread's time goes, for the stats overlay: the worst frame
- * of each phase over the last second, in thread CPU time. */
+ * of each phase over the last second, in thread CPU time. The subtitle render
+ * and composite are the background thread's cost for the frame shown. */
 typedef enum {
   PHASE_UI,
   PHASE_ASS,

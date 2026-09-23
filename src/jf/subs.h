@@ -37,9 +37,11 @@ void jf_subs_add_font(const char *name, const uint8_t *data, int size);
 
 /* `header` is the decoder's ASS script header - the styles the events refer to.
  * The script is laid out over the video's picture, fitted into the width x
- * height overlay, as a player compositing into the video would. */
+ * height overlay, as a player compositing into the video would. Frames are
+ * rendered ahead on background threads, one per `frame_ms` of the video; 0
+ * means 24 fps. */
 bool jf_subs_open(const char *header, int header_size, int width, int height,
-                  int video_width, int video_height);
+                  int video_width, int video_height, double frame_ms);
 void jf_subs_close(void);
 /* Closes the track and drops the fonts: the end of a playback. */
 void jf_subs_release(void);
@@ -52,11 +54,13 @@ void jf_subs_feed(const char *line, int length, int64_t start_ms,
 /* A seek invalidates every event still held. */
 void jf_subs_flush(void);
 
-/* Compose what is on screen at `media_ms`. True when the image changed since
- * the last call, which is the only time the caller has to re-upload it. */
+/* The newest rendered frame at or before `media_ms`, which also moves the
+ * rendering along. True when the image changed since the last call, which is
+ * the only time the caller has to re-upload it. */
 bool jf_subs_frame(int64_t media_ms, jf_subs_image *out);
 
-/* What the last jf_subs_frame cost, in thread CPU time. */
+/* What rendering the frame now shown cost its background thread, in CPU time.
+ */
 typedef struct {
   double render_ms, composite_ms;
   unsigned runs;
