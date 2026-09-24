@@ -303,7 +303,7 @@ webos_add_ipk(
         TARGET jellyfin
         APPID dev.hookedbehemoth.jellyfin
         TITLE "Jellyfin"
-        VERSION 0.0.1
+        VERSION 1.0.0
         COLOR "#00a4dc"
         ICON "${CMAKE_SOURCE_DIR}/assets/icon.png"
         WEBOS_VERSIONS ">=5"
