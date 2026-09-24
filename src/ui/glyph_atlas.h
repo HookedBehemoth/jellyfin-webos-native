@@ -27,6 +27,22 @@ extern const char *jf_atlas_font;
 
 #define JF_ATLAS_BASE_PX 48.0f
 
+/* Icons, which the atlas draws itself as private-use codepoints so a label can
+ * show them: each is one em square with its top at the label's top, coverage
+ * like any glyph and so tinted by the label's colour. */
+#define JF_ICON_BASE 0xe000u
+#define JF_ICON_GLOW 0xe008u
+#define JF_ICON_PLAY "\xee\x80\x80"
+#define JF_ICON_PAUSE "\xee\x80\x81"
+#define JF_ICON_PREVIOUS "\xee\x80\x82"
+#define JF_ICON_NEXT "\xee\x80\x83"
+#define JF_ICON_BACK "\xee\x80\x84"
+#define JF_ICON_FORWARD "\xee\x80\x85"
+#define JF_ICON_SUBTITLES "\xee\x80\x86"
+#define JF_ICON_AUDIO "\xee\x80\x87"
+/* A soft round falloff, for a glow behind something. */
+#define JF_ICON_GLOW_TEXT "\xee\x80\x88"
+
 typedef struct {
     skyline_region region;
     /* All three in pixels at JF_ATLAS_BASE_PX; jf_atlas_quad scales them. */

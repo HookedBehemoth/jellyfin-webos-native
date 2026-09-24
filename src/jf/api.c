@@ -199,6 +199,8 @@ static size_t collect(char *data, size_t size, size_t count, void *user)
 }
 
 static const char *json_string(jf_arena *arena, json_object *object, const char *key);
+static http_result parse_playback_info(jf_arena *arena, const char *body,
+                                       jf_playback_info *out);
 
 /* One request. The body is copied into `arena`; `payload` carries the JSON for a POST
  * (an empty string still means POST, as Quick Connect's Initiate requires). */
@@ -471,6 +473,15 @@ void jf_stream_url(const jf_session *session, const char *id, char *out, size_t 
     char base[512];
     snprintf(out, out_len, "%s/Videos/%s/stream?static=true&api_key=%s",
              jf_session_base(session, base, sizeof(base)), id, session->token);
+}
+
+void jf_subtitle_url(const jf_session *session, const char *id,
+                     const char *media_source_id, int index, char *out,
+                     size_t out_len) {
+  char base[512];
+  snprintf(out, out_len, "%s/Videos/%s/%s/Subtitles/%d/0/Stream.ass?api_key=%s",
+           jf_session_base(session, base, sizeof(base)), id, media_source_id,
+           index, session->token);
 }
 
 /* --------------------------------------------------------------- discovery */
@@ -798,6 +809,39 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
         return get_list(curl, arena, session, url, &task->list);
     }
 
+    case JF_JOB_ADJACENT: {
+      char id[256], series[256];
+      jf_url_escape(id, sizeof(id), task->a);
+      if (task->b[0] == '\0') {
+        snprintf(url, sizeof(url), "%s/Items/%s?userId=%s",
+                 jf_session_base(session, base, sizeof(base)), id,
+                 session->user_id);
+        result =
+            send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+        if (result != HTTP_OK)
+          return result;
+        json_object *root = json_tokener_parse((const char *)body);
+        if (root == NULL)
+          return HTTP_STATUS;
+        parse_item(arena, root, &task->one);
+        json_object_put(root);
+        if (task->one.series_id == NULL) {
+          task->list = (jf_item_list){0};
+          return HTTP_OK;
+        }
+        snprintf(task->b, sizeof(task->b), "%s", task->one.series_id);
+      }
+      jf_url_escape(series, sizeof(series), task->b);
+      /* Previous, this one and next, in the series' order: seasons do not
+       * get in the way. */
+      snprintf(
+          url, sizeof(url),
+          "%s/Shows/%s/Episodes?userId=%s&adjacentTo=%s&enableUserData=true",
+          jf_session_base(session, base, sizeof(base)), series,
+          session->user_id, id);
+      return get_list(curl, arena, session, url, &task->list);
+    }
+
     case JF_JOB_POSTER:
         result = artwork(curl, arena, session, task->a, task->b, task->start, task->limit,
                          task->image_kind, &task->image);
@@ -808,15 +852,80 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
     case JF_JOB_PLAYBACK_PROGRESS: {
         char id[520];
         json_quote(id, sizeof(id), task->a);
-        snprintf(payload, sizeof(payload), "{\"ItemId\":%s,\"PositionTicks\":%llu}", id,
-                 (unsigned long long)task->position_ticks);
+        /* The subtitle stream is what lets the server remember the choice for
+         * the next episode, when the user has it set to. */
+        char source[520];
+        json_quote(source, sizeof(source),
+                   task->b[0] != '\0' ? task->b : task->a);
+        snprintf(payload, sizeof(payload),
+                 "{\"ItemId\":%s,\"MediaSourceId\":%s,\"PositionTicks\":%llu,"
+                 "\"SubtitleStreamIndex\":%d}",
+                 id, source, (unsigned long long)task->position_ticks,
+                 task->subtitle_stream);
         snprintf(url, sizeof(url), "%s/Sessions/Playing%s",
                  jf_session_base(session, base, sizeof(base)),
                  task->job == JF_JOB_PLAYBACK_PROGRESS ? "/Progress" : "");
         return send_request(curl, arena, session, "POST", url, payload, &body, &size);
     }
+
+    case JF_JOB_PLAYBACK_INFO: {
+      char id[256];
+      jf_url_escape(id, sizeof(id), task->a);
+      snprintf(url, sizeof(url), "%s/Items/%s/PlaybackInfo?userId=%s",
+               jf_session_base(session, base, sizeof(base)), id,
+               session->user_id);
+      result =
+          send_request(curl, arena, session, "POST", url, "{}", &body, &size);
+      return result != HTTP_OK ? result
+                               : parse_playback_info(arena, (const char *)body,
+                                                     &task->playback);
+    }
     }
     return HTTP_STATUS;
+}
+
+/* The first media source's subtitle streams. The server applies the user's
+ * subtitle mode and language to pick the default, which is the point of asking
+ * it rather than reading the container. */
+static http_result parse_playback_info(jf_arena *arena, const char *body,
+                                       jf_playback_info *out) {
+  json_object *root = json_tokener_parse(body);
+  if (root == NULL)
+    return HTTP_STATUS;
+  *out = (jf_playback_info){NULL, -1, NULL, 0};
+  json_object *sources = NULL, *source = NULL, *streams = NULL;
+  if (json_object_object_get_ex(root, "MediaSources", &sources) &&
+      json_object_get_type(sources) == json_type_array &&
+      json_object_array_length(sources) > 0)
+    source = json_object_array_get_idx(sources, 0);
+  if (source != NULL) {
+    out->media_source_id = json_string(arena, source, "Id");
+    double number = 0;
+    if (json_number(source, "DefaultSubtitleStreamIndex", &number))
+      out->default_subtitle = (int)number;
+    if (json_object_object_get_ex(source, "MediaStreams", &streams) &&
+        json_object_get_type(streams) == json_type_array) {
+      const size_t length = json_object_array_length(streams);
+      out->subtitles = jf_arena_alloc(arena, (length ? length : 1) *
+                                                 sizeof(*out->subtitles));
+      for (size_t i = 0; out->subtitles != NULL && i < length; i++) {
+        json_object *stream = json_object_array_get_idx(streams, i);
+        const char *type = json_string(arena, stream, "Type");
+        if (type == NULL || strcmp(type, "Subtitle") != 0 ||
+            !json_number(stream, "Index", &number))
+          continue;
+        jf_subtitle_stream *sub = &out->subtitles[out->subtitle_count++];
+        sub->index = (int)number;
+        sub->title = json_string(arena, stream, "DisplayTitle");
+        if (sub->title == NULL)
+          sub->title = "Subtitles";
+        sub->external = json_flag(stream, "IsExternal");
+        sub->text = json_flag(stream, "IsTextSubtitleStream");
+      }
+    }
+  }
+  json_object_put(root);
+  return out->media_source_id != NULL ? HTTP_OK : HTTP_STATUS;
 }
 
 /* ----------------------------------------------------------------- fetcher */

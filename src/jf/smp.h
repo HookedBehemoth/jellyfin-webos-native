@@ -79,6 +79,14 @@ void *smp_player(void);
 /* Set when a shim call threw; empty otherwise. */
 const char *smp_shim_error(void);
 
+#ifdef JF_HOST_VIDEO
+/* The desktop stand-in (smp_host.c) decodes the picture itself: whether a
+ * frame is waiting to be shown, and drawing the one the clock has reached into
+ * the current GL framebuffer. */
+bool smp_host_frame_due(void);
+void smp_host_render(uint32_t width, uint32_t height);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

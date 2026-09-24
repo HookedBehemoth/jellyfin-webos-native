@@ -400,7 +400,7 @@ UI_SCRIPT=oddo UI_CAPTURE=/tmp/home.ppm ./build/src/jellyfin
 ```
 
 `UI_SCRIPT` letters are `u`/`d`/`l`/`r` for the arrows, `o` for OK, `b` for
-Back, `[`/`]` to scroll up/down, and `.` to wait a beat. Back uses the native
+Back, `s` for the subtitle key, `[`/`]` to scroll up/down, and `.` to wait a beat. Back uses the native
 LG keycode on the TV. A press is held until nothing is outstanding in the
 fetcher, so a script does not race a request. `UI_CAPTURE` saves the screen it
 ends on — this application's own OpenGL backbuffer, the same path as `uidemo`'s

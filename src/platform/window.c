@@ -61,17 +61,22 @@ bool jf_window_is_back_key(uint32_t code)
  * SDL reports USB-HID scancodes; the app speaks evdev. Only the keys it acts on are here -
  * letters and digits are deliberately absent, because their text arrives as
  * SDL_TEXTINPUT instead, already shifted, capsed and in the user's own layout. */
-static const struct { int scancode; uint32_t evdev; } keymap[] = {
-    {40, 28},   /* Return */
-    {41, 1},    /* Escape */
-    {42, 14},   /* Backspace */
-    {43, 15},   /* Tab */
-    {44, 57},   /* Space */
-    {58, 59},   /* F1 */
-    {59, 60},   /* F2 */
-    {60, 61},   /* F3 */
-    {61, 62},   /* F4 */
-    {66, 67},   /* F9  - sign out */
+static const struct {
+  int scancode;
+  uint32_t evdev;
+} keymap[] = {
+    {40, 28}, /* Return */
+    {41, 1},  /* Escape */
+    {42, 14}, /* Backspace */
+    {43, 15}, /* Tab */
+    {44, 57}, /* Space */
+    {58, 59}, /* F1 */
+    {59, 60}, /* F2 */
+    {60, 61}, /* F3 */
+    {61, 62}, /* F4 */
+    {66, 67}, /* F9  - sign out */
+    {67,
+     370}, /* F10 - KEY_SUBTITLE, which the webOS keymap has no scancode for */
     {69, 88},   /* F12 - screenshot */
     {79, 106},  /* Right */
     {80, 105},  /* Left */
@@ -79,12 +84,12 @@ static const struct { int scancode; uint32_t evdev; } keymap[] = {
     {82, 103},  /* Up */
     {88, 96},   /* Keypad Enter */
     {270, 158}, /* AC_BACK */
-    /* The webOS remote, from SDL's own scancode block. The colour buttons are the TV's
-     * only spare inputs, so Blue keeps doing what F9 does. */
+    /* The webOS remote, from SDL's own scancode block. The colour buttons are
+     * the TV's only spare inputs, so Blue keeps doing what F9 does. */
     {482, 158}, /* WEBOS_BACK */
     {486, 64},  /* WEBOS_RED    -> F6 */
     {487, 65},  /* WEBOS_GREEN  -> F7 */
-    {488, 66},  /* WEBOS_YELLOW -> F8 */
+    {488, 370}, /* WEBOS_YELLOW -> KEY_SUBTITLE */
     {489, 67},  /* WEBOS_BLUE   -> F9 */
 };
 /* Sent as keys by the webOS backend when the magic remote's pointer appears and
@@ -512,6 +517,8 @@ const char *jf_window_export_video(const int src[4], const int dst[4])
     (void)src;
     (void)dst;
     (void)video_window_id;
-    return NULL;
+    /* No video plane; the host pipeline (jf/smp_host.c) shows nothing anyway.
+     */
+    return "";
 #endif
 }

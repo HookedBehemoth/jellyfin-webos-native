@@ -3,6 +3,7 @@
  * Run with `cmake --preset host && ctest --preset host`.
  */
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -255,10 +256,15 @@ static void test_subtitles(void) {
    * fields. */
   static const char line[] = "0,0,Default,,0,0,0,,Hello";
 
-  CHECK(
-      jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 1080, 0));
+  jf_subs_geometry(1920, 1080, 1920, 1080, 0);
+  CHECK(jf_subs_open(1, 0, header, (int)sizeof(header) - 1));
   CHECK(jf_subs_ready());
-  jf_subs_feed(line, (int)sizeof(line) - 1, 1000, 2000);
+  jf_subs_feed(0, line, (int)sizeof(line) - 1, 1000, 2000);
+  /* Read again after a seek back, with the read order a flushed decoder
+   * restarts from: still one line. */
+  jf_subs_feed(0, "7,0,Default,,0,0,0,,Hello", 25, 1000, 2000);
+  /* Another stream's line is not this one's. */
+  jf_subs_feed(1, "0,0,Default,,0,0,0,,Stale", 25, 5000, 2000);
 
   jf_subs_image image;
   jf_subs_frame(500, &image);
@@ -278,25 +284,105 @@ static void test_subtitles(void) {
       clear++;
   }
   CHECK(opaque > 0 && clear > 0);
+  const int drawn_w = image.w;
 
   frame_until(4000, &image, false);
   CHECK(image.w == 0); /* after it */
+  frame_until(5500, &image, false);
+  CHECK(image.w == 0); /* the other stream's line never arrived */
   /* Holding still is not a change, even though another thread rendered it. */
   usleep(100000);
-  CHECK(!jf_subs_frame(4000, &image));
+  CHECK(!jf_subs_frame(5500, &image));
 
-  jf_subs_flush();
-  jf_subs_frame(1500, &image);
-  CHECK(image.w == 0); /* a seek drops what was queued */
+  /* A seek back lands in the middle of the line, which is still there. */
+  frame_until(2500, &image, true);
+  CHECK(image.w == drawn_w);
+
+  /* The server's copy, as it converts an SRT: its own short event format, and
+   * a line that was never fed. It replaces what the demuxer fed. */
+  static const char script[] =
+      "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n"
+      "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+      "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+      "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+      "MarginL, MarginR, MarginV, Encoding\n"
+      "Style: Default,Sans,48,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+      "0,0,0,0,100,100,0,0,1,2,0,2,10,10,40,1\n\n"
+      "[Events]\nFormat: Layer, Start, End, Style, Text\n"
+      "Dialogue: 0,0:00:08.00,0:00:10.00,Default,Later\n"
+      "Dialogue: 0,0:00:01.00,0:00:03.00,Default,Hello there\n"
+      /* SRT markup as the server leaves it: empty tags, which draw nothing
+       * once they are ASS, and a soft break that is a real one. */
+      "Dialogue: 0,0:00:12.00,0:00:14.00,Default,<i></i>Hello <FONT "
+      "color=\"#ff0000\"></font>there\n"
+      "Dialogue: 0,0:00:16.00,0:00:18.00,Default,Hello\\nthere\n"
+      "Dialogue: 0,0:00:20.00,0:00:22.00,Default,Hello\n";
+  char *copy = malloc(sizeof(script));
+  memcpy(copy, script, sizeof(script));
+  CHECK(jf_subs_open_file(1, copy, sizeof(script) - 1));
+  frame_until(9000, &image, true);
+  CHECK(image.w > 0);
+  frame_until(2000, &image, true);
+  for (int tries = 0; tries < 400 && image.w == drawn_w; tries++) {
+    usleep(5000);
+    jf_subs_frame(2000, &image);
+  }
+  CHECK(image.w > drawn_w); /* "Hello there", not the fed "Hello" */
+  const int there_w = image.w, there_h = image.h;
+  frame_until(11000, &image, false);
+  frame_until(13000, &image, true);
+  CHECK(image.w == there_w); /* no tags drawn as text */
+  frame_until(15000, &image, false);
+  frame_until(17000, &image, true);
+  CHECK(image.h > there_h * 3 / 2); /* two lines */
+  frame_until(19000, &image, false);
+  frame_until(21000, &image, true);
+  CHECK(image.w == drawn_w); /* "Hello" alone, as fed */
+  /* An older selection's file is not used. */
+  copy = malloc(sizeof(script));
+  memcpy(copy, script, sizeof(script));
+  CHECK(!jf_subs_open_file(0, copy, sizeof(script) - 1));
+
   /* A 2.4:1 picture letterboxed into the frame keeps its subtitles on the
    * picture: above the bottom bar of (1080 - 800) / 2. */
-  CHECK(
-      jf_subs_open(header, (int)sizeof(header) - 1, 1920, 1080, 1920, 800, 0));
-  jf_subs_feed(line, (int)sizeof(line) - 1, 1000, 2000);
+  jf_subs_geometry(1920, 1080, 1920, 800, 0);
+  /* Switching back to the stream finds the line it was fed before, with
+   * nothing fed since. */
+  CHECK(jf_subs_open(2, 0, header, (int)sizeof(header) - 1));
   frame_until(1500, &image, true);
   CHECK(image.w > 0 && image.y + image.h <= 940);
-  jf_subs_release();
+  /* Kept above the player's controls: the dialogue line rises, a sign pinned
+   * with \pos stays on the picture. */
+  const int low_y = image.y;
+  jf_subs_keep_above(700);
+  for (int tries = 0; tries < 400 && image.y == low_y; tries++) {
+    usleep(5000);
+    jf_subs_frame(1500, &image);
+  }
+  CHECK(image.w > 0 && image.y + image.h <= 700);
+  static const char sign[] = "0,0,Default,,0,0,0,,{\\pos(960,900)}Sign";
+  jf_subs_feed(0, sign, (int)sizeof(sign) - 1, 30000, 2000);
+  frame_until(29000, &image, false);
+  frame_until(31000, &image, true);
+  /* 900 of 1080 on the 800-row picture at 140: its bottom near 806. */
+  CHECK(image.w > 0 && image.y + image.h > 780);
+  jf_subs_keep_above(INT_MAX);
+  /* A switch mid-item draws nothing from the item's start in the meantime -
+   * a sign at 0:00 flashed up until the real frame was rendered. */
+  static const char opening[] = "0,0,Default,,0,0,0,,Opening";
+  jf_subs_feed(0, opening, (int)sizeof(opening) - 1, 0, 2000);
+  CHECK(jf_subs_open(4, 0, header, (int)sizeof(header) - 1));
+  usleep(100000); /* long enough for a worker to have rendered frame 0 */
+  bool flashed = false;
+  for (int tries = 0; tries < 60; tries++) {
+    jf_subs_frame(20000, &image);
+    flashed |= image.w > 0;
+    usleep(5000);
+  }
+  CHECK(!flashed);
+  jf_subs_close(5);
   CHECK(!jf_subs_ready());
+  jf_subs_release();
 }
 #endif
 

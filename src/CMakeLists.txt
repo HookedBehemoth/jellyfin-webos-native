@@ -231,7 +231,29 @@ target_link_libraries(jellyfin PRIVATE jf-ui jf-probe
         ${PLATFORM_SYSTEM_LIBS} m pthread)
 
 if (NOT TARGET_WEBOS)
-    target_sources(jellyfin PRIVATE jf/player_null.c)
+    # The real player against a faked pipeline (jf/smp_host.c): audio, subtitles
+    # and seeking on a desktop, with a clock where the picture would be. Without
+    # ALSA or a host FFmpeg, the null backend.
+    pkg_check_modules(ALSA alsa)
+    if (NOT (ALSA_FOUND AND TARGET jf-demux))
+        target_sources(jellyfin PRIVATE jf/player_null.c)
+        return()
+    endif ()
+    target_sources(jellyfin PRIVATE
+            jf/player.c
+            jf/picsubs.c
+            jf/audio_alsa.c
+            jf/clock.c
+            jf/packet_queue.c
+            jf/smp_payload.c
+            jf/smp_host.c)
+    target_include_directories(jellyfin SYSTEM PRIVATE ${ALSA_INCLUDE_DIRS})
+    target_link_libraries(jellyfin PRIVATE jf-demux ${ALSA_LIBRARIES})
+    # The picture too, when the host FFmpeg was built with swscale for it.
+    if (EXISTS "${FFMPEG_ROOT}/lib/libswscale.so")
+        target_compile_definitions(jellyfin PRIVATE JF_HOST_VIDEO=1)
+        target_link_libraries(jellyfin PRIVATE "${FFMPEG_ROOT}/lib/libswscale.so")
+    endif ()
     return()
 endif ()
 
@@ -250,6 +272,7 @@ target_link_libraries(jf-smp-shim PUBLIC ${LIBPLAYERAPIS_LIBRARIES} stdc++)
 
 target_sources(jellyfin PRIVATE
         jf/player.c
+        jf/picsubs.c
         jf/demux.c
         jf/audio_alsa.c
         jf/clock.c

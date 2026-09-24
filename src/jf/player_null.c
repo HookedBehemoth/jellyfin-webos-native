@@ -41,6 +41,19 @@ void jf_player_resume(void) {}
 void jf_player_stop(void) { state = JF_IDLE; }
 void jf_player_deinit(void) {}
 void jf_player_seek(int delta_seconds) { (void)delta_seconds; }
+void jf_player_seek_to(int position_ms) { (void)position_ms; }
+int jf_player_duration(void) { return 0; }
+int jf_player_chapters(const int **starts_ms) {
+  *starts_ms = NULL;
+  return 0;
+}
+int jf_player_audio_count(void) { return 0; }
+const char *jf_player_audio_name(int track) {
+  (void)track;
+  return "";
+}
+int jf_player_audio_current(void) { return -1; }
+void jf_player_audio_select(int track) { (void)track; }
 
 jf_player_state jf_player_state_get(void) { return state; }
 const char *jf_player_error(void) { return error_text; }
@@ -52,12 +65,23 @@ bool jf_player_embedded(void) { return false; }
 bool jf_player_needs_frame(void) { return false; }
 void jf_player_render(uint32_t width, uint32_t height) { (void)width; (void)height; }
 
-/* No pipeline here, so no container and no tracks to offer. */
+/* No pipeline here, so no tracks to offer. */
+void jf_player_subtitle_tracks(const jf_player_track *tracks, int count,
+                               int selected) {
+  (void)tracks;
+  (void)count;
+  (void)selected;
+}
 int jf_player_subtitle_count(void) { return 0; }
 const char *jf_player_subtitle_name(int track) {
   (void)track;
   return "";
 }
+int jf_player_subtitle_stream(int track) {
+  (void)track;
+  return -1;
+}
 int jf_player_subtitle_current(void) { return -1; }
 void jf_player_subtitle_select(int track) { (void)track; }
-int jf_player_media_ms(void) { return -1; }
+void jf_player_subtitle_preview(bool on) { (void)on; }
+int jf_player_subtitle_ms(void) { return -1; }

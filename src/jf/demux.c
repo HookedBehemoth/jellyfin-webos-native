@@ -36,8 +36,9 @@ struct jf_demux {
     AVBSFContext *bsf;
     AVPacket *filtered;
     int video_index;
-    // Text subtitles, decoded to ASS dialogue lines for libass; see subs.h.
-    AVCodecContext *subs;
+    // Subtitle decoders by stream: the selected text track, and every bitmap
+    // track, which are decoded all along so a switch has pictures to show.
+    AVCodecContext *subs[JF_DEMUX_SUB_STREAMS];
 };
 
 static void audio_close(struct jf_demux *d) {
@@ -168,45 +169,114 @@ int jf_demux_audio_decode(void *opaque, uint8_t **out, int *size, int64_t *pts) 
 }
 
 static void subtitle_close(struct jf_demux *d) {
-  avcodec_free_context(&d->subs);
+  for (int i = 0; i < JF_DEMUX_SUB_STREAMS; i++)
+    avcodec_free_context(&d->subs[i]);
 }
 
-void jf_demux_subtitle_stop(void *opaque) { subtitle_close(opaque); }
+void jf_demux_subtitle_stop(void *opaque, int index) {
+  struct jf_demux *d = opaque;
+  if (index < 0)
+    subtitle_close(d);
+  else if (index < JF_DEMUX_SUB_STREAMS)
+    avcodec_free_context(&d->subs[index]);
+}
 
 /// Open one subtitle stream for decode. Every text format FFmpeg knows decodes
 /// to ASS dialogue lines, which is exactly what ass_process_chunk takes, so
 /// SRT, WebVTT, mov_text and ASS itself all arrive here in one shape. Bitmap
-/// subtitles do not, and are refused rather than half-supported.
+/// formats - PGS, VobSub, DVB - decode to paletted pictures instead, on a
+/// canvas of the stream's own size.
 int jf_demux_subtitle_open(void *opaque, int index, const char **header,
-                           int *header_size) {
+                           int *header_size, int *canvas_w, int *canvas_h) {
   struct jf_demux *d = opaque;
-  if (index < 0 || index >= (int)d->format->nb_streams)
+  if (index < 0 || index >= (int)d->format->nb_streams ||
+      index >= JF_DEMUX_SUB_STREAMS)
     return 0;
-  subtitle_close(d);
+  AVCodecContext **subs = &d->subs[index];
+  avcodec_free_context(subs);
   AVStream *stream = d->format->streams[index];
   if (stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE)
     return 0;
   const AVCodecDescriptor *about =
       avcodec_descriptor_get(stream->codecpar->codec_id);
-  if (about == NULL || (about->props & AV_CODEC_PROP_TEXT_SUB) == 0)
+  if (about == NULL ||
+      (about->props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB)) == 0)
     return 0;
   const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
-  if (decoder == NULL || (d->subs = avcodec_alloc_context3(decoder)) == NULL)
+  if (decoder == NULL || (*subs = avcodec_alloc_context3(decoder)) == NULL)
     return 0;
-  if (avcodec_parameters_to_context(d->subs, stream->codecpar) < 0) {
-    subtitle_close(d);
-    return 0;
-  }
-  d->subs->pkt_timebase = stream->time_base;
-  // The decoders that synthesise a header want to know what they are laying out
-  // over.
-  if (avcodec_open2(d->subs, decoder, NULL) < 0) {
-    subtitle_close(d);
+  if (avcodec_parameters_to_context(*subs, stream->codecpar) < 0) {
+    avcodec_free_context(subs);
     return 0;
   }
-  *header = (const char *)d->subs->subtitle_header;
-  *header_size = d->subs->subtitle_header_size;
-  return 1;
+  (*subs)->pkt_timebase = stream->time_base;
+  if (avcodec_open2(*subs, decoder, NULL) < 0) {
+    avcodec_free_context(subs);
+    return 0;
+  }
+  *header = (const char *)(*subs)->subtitle_header;
+  *header_size = (*subs)->subtitle_header_size;
+  *canvas_w = (*subs)->width;
+  *canvas_h = (*subs)->height;
+  return (about->props & AV_CODEC_PROP_TEXT_SUB) ? 1 : 2;
+}
+
+/// The bitmap rectangles of one subtitle, flattened into a single premultiplied
+/// RGBA image over their union. NULL when there is nothing to show.
+static uint8_t *flatten(const AVSubtitle *sub, int *x, int *y, int *w, int *h) {
+  int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
+  for (unsigned i = 0; i < sub->num_rects; i++) {
+    const AVSubtitleRect *r = sub->rects[i];
+    if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0)
+      continue;
+    if (r->x < x0)
+      x0 = r->x;
+    if (r->y < y0)
+      y0 = r->y;
+    if (r->x + r->w > x1)
+      x1 = r->x + r->w;
+    if (r->y + r->h > y1)
+      y1 = r->y + r->h;
+  }
+  if (x1 <= x0 || y1 <= y0)
+    return NULL;
+  const int width = x1 - x0, height = y1 - y0;
+  uint8_t *out = calloc((size_t)width * height, 4);
+  if (out == NULL)
+    return NULL;
+  for (unsigned i = 0; i < sub->num_rects; i++) {
+    const AVSubtitleRect *r = sub->rects[i];
+    if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0)
+      continue;
+    // data[1] is the palette, native-endian 0xAARRGGBB.
+    const uint32_t *palette = (const uint32_t *)r->data[1];
+    uint8_t colors[256][4];
+    for (int c = 0; c < 256 && c < (r->nb_colors > 0 ? r->nb_colors : 256);
+         c++) {
+      const uint32_t argb = palette[c];
+      const unsigned a = argb >> 24;
+      colors[c][0] = (uint8_t)(((argb >> 16) & 0xff) * a / 255);
+      colors[c][1] = (uint8_t)(((argb >> 8) & 0xff) * a / 255);
+      colors[c][2] = (uint8_t)((argb & 0xff) * a / 255);
+      colors[c][3] = (uint8_t)a;
+    }
+    const int colors_used =
+        r->nb_colors > 0 && r->nb_colors < 256 ? r->nb_colors : 256;
+    for (int row = 0; row < r->h; row++) {
+      const uint8_t *src = r->data[0] + (size_t)row * r->linesize[0];
+      uint8_t *dst =
+          out + ((size_t)(r->y - y0 + row) * width + (r->x - x0)) * 4;
+      for (int col = 0; col < r->w; col++) {
+        const int c = src[col] < colors_used ? src[col] : 0;
+        memcpy(dst + col * 4, colors[c], 4);
+      }
+    }
+  }
+  *x = x0;
+  *y = y0;
+  *w = width;
+  *h = height;
+  return out;
 }
 
 /// Title, else language, else the stream number; plus the codec, because a
@@ -239,6 +309,22 @@ int jf_demux_font(void *opaque, int index, const char **name,
   return 1;
 }
 
+int jf_demux_duration_ms(void *opaque) {
+  struct jf_demux *d = opaque;
+  return d->format->duration > 0 ? (int)(d->format->duration / 1000) : 0;
+}
+
+int jf_demux_chapters(void *opaque, int *starts_ms, int max) {
+  struct jf_demux *d = opaque;
+  int count = 0;
+  for (unsigned i = 0; i < d->format->nb_chapters && count < max; i++) {
+    const AVChapter *chapter = d->format->chapters[i];
+    starts_ms[count++] = (int)av_rescale_q(chapter->start, chapter->time_base,
+                                           (AVRational){1, 1000});
+  }
+  return count;
+}
+
 int jf_demux_stream_name(void *opaque, int index, char *out, int out_len) {
   struct jf_demux *d = opaque;
   if (index < 0 || index >= (int)d->format->nb_streams || out_len <= 0)
@@ -263,13 +349,16 @@ int jf_demux_stream_name(void *opaque, int index, char *out, int out_len) {
   return 1;
 }
 
-int jf_demux_subtitle_decode(void *opaque, jf_subtitle_sink sink, void *user) {
+int jf_demux_subtitle_decode(void *opaque, jf_subtitle_sink sink,
+                             jf_picture_sink pictures, void *user) {
   struct jf_demux *d = opaque;
-  if (d->subs == NULL)
+  const int index = d->packet->stream_index;
+  AVCodecContext *subs = index < JF_DEMUX_SUB_STREAMS ? d->subs[index] : NULL;
+  if (subs == NULL)
     return 0;
   AVSubtitle sub;
   int got = 0;
-  if (avcodec_decode_subtitle2(d->subs, &sub, &got, d->packet) < 0 || !got)
+  if (avcodec_decode_subtitle2(subs, &sub, &got, d->packet) < 0 || !got)
     return 0;
   const AVRational ms = {1, 1000};
   AVStream *stream = d->format->streams[d->packet->stream_index];
@@ -280,22 +369,76 @@ int jf_demux_subtitle_decode(void *opaque, jf_subtitle_sink sink, void *user) {
       d->packet->duration > 0
           ? av_rescale_q(d->packet->duration, stream->time_base, ms)
           : 0;
+  // The display window is the decoder's when it has one, the packet's
+  // otherwise.
+  int64_t duration =
+      (int64_t)sub.end_display_time - (int64_t)sub.start_display_time;
+  if (sub.end_display_time == UINT32_MAX || duration <= 0)
+    duration = packet_ms;
+  if (sub.format == 0) {
+    // A picture with no end lasts until the next one, which is how PGS clears.
+    int x = 0, y = 0, w = 0, h = 0;
+    uint8_t *rgba = flatten(&sub, &x, &y, &w, &h);
+    // The canvas, not known to PGS until its first display set.
+    pictures(user, base + sub.start_display_time, duration > 0 ? duration : -1,
+             x, y, w, h, index, subs->width, subs->height, rgba);
+    avsubtitle_free(&sub);
+    return 1;
+  }
+  // A line with no end would otherwise never come off.
+  if (duration <= 0)
+    duration = 5000;
   for (unsigned i = 0; i < sub.num_rects; i++) {
     const AVSubtitleRect *rect = sub.rects[i];
     if (rect->type != SUBTITLE_ASS || rect->ass == NULL)
       continue;
-    // The display window is the decoder's when it has one, the packet's
-    // otherwise. Either can be missing; a line with no end would otherwise
-    // never come off.
-    int64_t duration =
-        (int64_t)sub.end_display_time - (int64_t)sub.start_display_time;
-    if (sub.end_display_time == UINT32_MAX || duration <= 0)
-      duration = packet_ms;
-    if (duration <= 0)
-      duration = 5000;
     sink(user, rect->ass, base + sub.start_display_time, duration);
   }
   avsubtitle_free(&sub);
+  return 1;
+}
+
+/// The whole body at `url`, NUL-terminated, through FFmpeg's own HTTP. For a
+/// subtitle file: the player has no other client, and this one already speaks
+/// to the server.
+int jf_demux_fetch(const char *url, char **data, size_t *size,
+                   int (*cancel)(void *), void *opaque) {
+  AVIOContext *io = NULL;
+  const AVIOInterruptCB interrupt = {cancel, opaque};
+  if (avio_open2(&io, url, AVIO_FLAG_READ, cancel != NULL ? &interrupt : NULL,
+                 NULL) < 0)
+    return 0;
+  size_t used = 0, capacity = 1 << 16;
+  char *buffer = malloc(capacity + 1);
+  int ok = buffer != NULL;
+  while (ok) {
+    if (used == capacity) {
+      char *grown = realloc(buffer, capacity * 2 + 1);
+      if (grown == NULL) {
+        ok = 0;
+        break;
+      }
+      buffer = grown;
+      capacity *= 2;
+    }
+    const int n =
+        avio_read(io, (unsigned char *)buffer + used,
+                  (int)(capacity - used < INT_MAX ? capacity - used : INT_MAX));
+    if (n == AVERROR_EOF)
+      break;
+    if (n < 0)
+      ok = 0;
+    else
+      used += (size_t)n;
+  }
+  avio_closep(&io);
+  if (!ok) {
+    free(buffer);
+    return 0;
+  }
+  buffer[used] = '\0';
+  *data = buffer;
+  *size = used;
   return 1;
 }
 
@@ -432,8 +575,9 @@ int jf_demux_seek(void *opaque, int64_t position_ns) {
     if (av_seek_frame(d->format, -1, position_ns / 1000, AVSEEK_FLAG_BACKWARD) < 0)
         return 0;
     if (d->audio) avcodec_flush_buffers(d->audio);
-    if (d->subs)
-      avcodec_flush_buffers(d->subs);
+    for (int i = 0; i < JF_DEMUX_SUB_STREAMS; i++)
+      if (d->subs[i])
+        avcodec_flush_buffers(d->subs[i]);
     if (d->bsf) av_bsf_flush(d->bsf);
     // Discard any buffered conversion samples along with the decoder state.
     if (d->swr) {

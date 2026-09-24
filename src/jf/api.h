@@ -94,6 +94,23 @@ typedef struct {
     uint32_t start_index;
 } jf_item_list;
 
+/* A subtitle stream as the server lists it for playback: the container's own
+ * and any file beside the video. */
+typedef struct {
+  int index;
+  const char *title; /* DisplayTitle: language, name, codec */
+  bool external;
+  bool text;
+} jf_subtitle_stream;
+
+typedef struct {
+  const char *media_source_id;
+  /* What the user's subtitle preferences pick, -1 for none. */
+  int default_subtitle;
+  jf_subtitle_stream *subtitles;
+  size_t subtitle_count;
+} jf_playback_info;
+
 typedef struct {
     const char *access_token;
     const char *user_id;
@@ -143,26 +160,33 @@ void jf_api_init(void);
  * direct stream URL for when it is not. Both write into `out`. */
 void jf_transcode_url(const jf_session *session, const char *id, char *out, size_t out_len);
 void jf_stream_url(const jf_session *session, const char *id, char *out, size_t out_len);
+/* The server's copy of a text subtitle stream, converted to ASS whatever it
+ * was. */
+void jf_subtitle_url(const jf_session *session, const char *id,
+                     const char *media_source_id, int index, char *out,
+                     size_t out_len);
 
 /* ---------------------------------------------------------------- fetcher */
 
 typedef enum {
-    JF_JOB_DISCOVER,
-    JF_JOB_PROBE,
-    JF_JOB_LOGIN,
-    JF_JOB_QUICK_INITIATE,
-    JF_JOB_QUICK_POLL,
-    JF_JOB_QUICK_AUTHENTICATE,
-    JF_JOB_VIEWS,
-    JF_JOB_RESUME,
-    JF_JOB_NEXT_UP,
-    JF_JOB_CHILDREN,
-    JF_JOB_ITEM,
-    JF_JOB_SEASONS,
-    JF_JOB_EPISODES,
-    JF_JOB_POSTER,
-    JF_JOB_PLAYBACK_STARTED,
-    JF_JOB_PLAYBACK_PROGRESS,
+  JF_JOB_DISCOVER,
+  JF_JOB_PROBE,
+  JF_JOB_LOGIN,
+  JF_JOB_QUICK_INITIATE,
+  JF_JOB_QUICK_POLL,
+  JF_JOB_QUICK_AUTHENTICATE,
+  JF_JOB_VIEWS,
+  JF_JOB_RESUME,
+  JF_JOB_NEXT_UP,
+  JF_JOB_CHILDREN,
+  JF_JOB_ITEM,
+  JF_JOB_SEASONS,
+  JF_JOB_EPISODES,
+  JF_JOB_POSTER,
+  JF_JOB_PLAYBACK_STARTED,
+  JF_JOB_PLAYBACK_PROGRESS,
+  JF_JOB_PLAYBACK_INFO,
+  JF_JOB_ADJACENT,
 } jf_job;
 
 typedef enum { JF_IMAGE_PRIMARY, JF_IMAGE_BACKDROP } jf_image_kind;
@@ -187,6 +211,8 @@ typedef struct {
     char b[512];
     uint32_t start, limit;
     uint64_t position_ticks;
+    /* The subtitle stream a playback report names, -1 for none. */
+    int subtitle_stream;
     jf_image_kind image_kind;
     /* Opaque to the fetcher: the UI uses it to match a result to the row, grid slot or
      * poster tile that asked for it. */
@@ -204,6 +230,7 @@ typedef struct {
     jf_discovered server;
     jf_image image;
     bool has_image;
+    jf_playback_info playback;
     /* Every item's blurhash, JF_BLUR_COLUMNS cells to a row, ready to go into
      * the UI's atlas in one upload. NULL when no item has one. */
     uint8_t *blur;

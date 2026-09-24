@@ -4,6 +4,7 @@
 #include "clock.h"
 #include "player.h"
 #include <alsa/asoundlib.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,7 +43,12 @@ bool jf_audio_open(int rate, int channels)
     if (device == NULL || device[0] == '\0')
         device = "default";
 
-    int error = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, 0);
+    /* Non-blocking: a device that stops draining - paused, or left behind by a
+     * video pipeline that failed - would otherwise hold a write, and every
+     * thread joining this one, forever. write_frames waits in slices instead.
+     */
+    int error =
+        snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
     if (error < 0) {
         char message[160];
         snprintf(message, sizeof(message), "cannot open %s: %s", device, snd_strerror(error));
@@ -125,14 +131,18 @@ static bool recover(int error)
     return true;
 }
 
-/* One blocking write of whole frames, in period-sized bites so an interrupt does not have
- * to wait out the whole buffer. */
+/* Writes whole frames, waiting for room at most 50 ms at a time so an interrupt
+ * is seen even when the device has stopped taking any. */
 static bool write_frames(const uint8_t *data, snd_pcm_uframes_t frames)
 {
     while (frames > 0) {
         if (atomic_load(&interrupted))
             return false;
         snd_pcm_sframes_t written = snd_pcm_writei(pcm, data, frames);
+        if (written == -EAGAIN) {
+          snd_pcm_wait(pcm, 50);
+          continue;
+        }
         if (written < 0) {
             if (!recover((int)written))
                 return false;

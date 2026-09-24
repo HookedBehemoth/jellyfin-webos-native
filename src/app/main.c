@@ -13,6 +13,7 @@
  * demuxer; audio is decoded here and written to ALSA. See jf/player.c.
  */
 #include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -26,6 +27,7 @@
 #include "../apps/probe.h"
 #include "../jf/api.h"
 #include "../jf/cfg.h"
+#include "../jf/picsubs.h"
 #include "../jf/player.h"
 #include "../jf/subs.h"
 #include "../platform/gl.h"
@@ -816,6 +818,14 @@ static bool select_unfinished_season;
 static bool select_unfinished_episode;
 static char playback_title[160];
 static char playback_item_id[40];
+static char playback_source_id[40];
+/* The episodes either side of the one playing, from the server; `present`
+ * false when there is none, or the item is not an episode. */
+static card previous_episode, next_episode;
+/* The subtitle picker, over the video so a choice shows on the frame behind
+ * it. Row 0 is off, row i + 1 the player's track i. */
+static bool subtitle_picker;
+static size_t picker_focus;
 static bool playback_paused;
 static screen_id playback_return_screen;
 static size_t playback_return_focus;
@@ -825,6 +835,25 @@ static uint64_t playback_progress_at;
  * three seconds unless playback is paused. */
 static uint64_t playback_controls_until;
 #define PLAYBACK_CONTROLS_NS (3ull * 1000000000ull)
+/* Hidden with Up from the seek bar, until the next key or pointer movement. */
+static bool chrome_dismissed;
+/* 0: the buttons, 1: the seek bar above them. */
+static size_t playback_row;
+/* How far the chrome is in, 0 to 1, and where the focus glow is. */
+static animated_float chrome_motion, glow_x, glow_y;
+static bool glow_placed;
+
+static bool playback_chrome_wanted(uint64_t now) {
+  return !chrome_dismissed &&
+         (playback_paused || now < playback_controls_until);
+}
+
+static void show_playback_chrome(void) {
+  chrome_dismissed = false;
+  playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
+}
+/* evdev's KEY_SUBTITLE: F10 on a keyboard, Yellow on the remote. */
+#define KEY_SUBTITLE 370
 
 /* Text entry, remote, and pointer input. */
 static char server_url[512];
@@ -839,6 +868,8 @@ static float cursor_x = -1;
 static float cursor_y = -1;
 static bool cursor_present;
 static bool pointer_press;
+/* Set by movement, so hovering takes the focus only when the pointer moved. */
+static bool pointer_moved;
 
 /* The sidebar is an overlay containing every library category and the one settings row. */
 static bool sidebar_open;
@@ -1193,6 +1224,10 @@ static const char *job_name(jf_job job)
     case JF_JOB_POSTER: return "poster";
     case JF_JOB_PLAYBACK_STARTED: return "playback_started";
     case JF_JOB_PLAYBACK_PROGRESS: return "playback_progress";
+    case JF_JOB_PLAYBACK_INFO:
+      return "playback_info";
+    case JF_JOB_ADJACENT:
+      return "adjacent";
     }
     return "?";
 }
@@ -1292,6 +1327,8 @@ static void on_failure(jf_task *task)
         break;
     }
 }
+
+static void use_playback_info(const jf_playback_info *info);
 
 static void consume(jf_task *task)
 {
@@ -1441,6 +1478,22 @@ static void consume(jf_task *task)
     case JF_JOB_PLAYBACK_STARTED:
     case JF_JOB_PLAYBACK_PROGRESS:
         break;
+    case JF_JOB_PLAYBACK_INFO:
+      if (strcmp(task->a, playback_item_id) == 0)
+        use_playback_info(&task->playback);
+      break;
+    case JF_JOB_ADJACENT:
+      if (strcmp(task->a, playback_item_id) != 0)
+        break;
+      for (size_t i = 0; i < task->list.count; i++) {
+        if (strcmp(task->list.items[i].id, playback_item_id) != 0)
+          continue;
+        if (i > 0)
+          previous_episode = card_from(&task->list.items[i - 1]);
+        if (i + 1 < task->list.count)
+          next_episode = card_from(&task->list.items[i + 1]);
+      }
+      break;
     }
 }
 
@@ -1722,27 +1775,68 @@ static void go_back(void)
 /* The transport row. The play/pause button is the one that toggles; the rest seek by
  * their own number of seconds. */
 typedef enum {
-    ACTION_PREVIOUS,
-    ACTION_BACK_30,
-    ACTION_BACK_10,
-    ACTION_PAUSE,
-    ACTION_FORWARD_10,
-    ACTION_FORWARD_30,
-    ACTION_NEXT,
-    ACTION_SUBTITLES,
-    ACTION_AUDIO,
+  ACTION_PREVIOUS,
+  ACTION_CHAPTER_BACK,
+  ACTION_BACK_30,
+  ACTION_BACK_10,
+  ACTION_PAUSE,
+  ACTION_FORWARD_10,
+  ACTION_FORWARD_30,
+  ACTION_CHAPTER_NEXT,
+  ACTION_NEXT,
+  ACTION_SUBTITLES,
+  ACTION_AUDIO,
 } playback_action;
 
+/* In display order; the first TRANSPORT_COUNT are the transport, centred on
+ * play/pause, and the rest sit at the right. `number` is drawn inside the
+ * circular-arrow icons, `tag` small under the skip ones: they skip episodes
+ * or chapters, and each shows only when there is one to skip to. */
 static const struct {
-    const char *label;
-    playback_action action;
+  const char *icon, *number, *tag, *hint;
+  playback_action action;
 } playback_buttons[] = {
-    {"|<", ACTION_PREVIOUS},   {"-30", ACTION_BACK_30},   {"-10", ACTION_BACK_10},
-    {"Pause", ACTION_PAUSE},   {"+10", ACTION_FORWARD_10}, {"+30", ACTION_FORWARD_30},
-    {">|", ACTION_NEXT},       {"Subtitles", ACTION_SUBTITLES}, {"Audio", ACTION_AUDIO},
+    {JF_ICON_PREVIOUS, "", "EP", "", ACTION_PREVIOUS},
+    {JF_ICON_PREVIOUS, "", "CH", "Previous chapter", ACTION_CHAPTER_BACK},
+    {JF_ICON_BACK, "30", "", "Back 30 seconds", ACTION_BACK_30},
+    {JF_ICON_BACK, "10", "", "Back 10 seconds", ACTION_BACK_10},
+    {JF_ICON_PAUSE, "", "", "", ACTION_PAUSE},
+    {JF_ICON_FORWARD, "10", "", "Forward 10 seconds", ACTION_FORWARD_10},
+    {JF_ICON_FORWARD, "30", "", "Forward 30 seconds", ACTION_FORWARD_30},
+    {JF_ICON_NEXT, "", "CH", "Next chapter", ACTION_CHAPTER_NEXT},
+    {JF_ICON_NEXT, "", "EP", "", ACTION_NEXT},
+    {JF_ICON_SUBTITLES, "", "", "", ACTION_SUBTITLES},
+    {JF_ICON_AUDIO, "", "", "", ACTION_AUDIO},
 };
 #define PLAYBACK_BUTTON_COUNT (sizeof(playback_buttons) / sizeof(playback_buttons[0]))
-#define PLAY_PAUSE_INDEX 3
+#define PLAY_PAUSE_INDEX 4
+#define TRANSPORT_COUNT 9
+
+static bool button_shown(size_t index) {
+  const int *starts = NULL;
+  switch (playback_buttons[index].action) {
+  case ACTION_PREVIOUS:
+    return previous_episode.present;
+  case ACTION_NEXT:
+    return next_episode.present;
+  case ACTION_CHAPTER_BACK:
+  case ACTION_CHAPTER_NEXT:
+    return jf_player_chapters(&starts) > 0;
+  default:
+    return true;
+  }
+}
+
+/* The shown button `direction` steps from `from`, or `from` at the end. */
+static size_t step_button(size_t from, int direction) {
+  for (size_t at = from;
+       direction < 0 ? at > 0 : at + 1 < PLAYBACK_BUTTON_COUNT;) {
+    at = direction < 0 ? at - 1 : at + 1;
+    if (button_shown(at))
+      return at;
+  }
+  return from;
+}
 
 static void report_playback(jf_job job)
 {
@@ -1752,45 +1846,94 @@ static void report_playback(jf_job job)
     if (task == NULL)
         return;
     set_text(task->a, sizeof(task->a), playback_item_id);
+    set_text(task->b, sizeof(task->b), playback_source_id);
+    task->subtitle_stream =
+        jf_player_subtitle_stream(jf_player_subtitle_current());
     const int position_ms = jf_player_position();
     task->position_ticks = (uint64_t)(position_ms > 0 ? position_ms : 0) * 10000ull;
     jf_fetcher_start(&fetcher, task);
 }
 
-static void start_playback(const char *id, const char *title, uint64_t resume_ticks)
-{
-    char stream[1024];
-    jf_stream_url(&session, id, stream, sizeof(stream));
-    if (stream[0] == '\0') {
-        set_error("Could not build a stream URL");
-        return;
-    }
-    /* The transcode request carries the hardware capability constraints. Keep this
-     * comfortably above a long reverse-proxy address plus access token. */
-    char transcode[2048];
-    jf_transcode_url(&session, id, transcode, sizeof(transcode));
-    const uint64_t resume_ms = resume_ticks / 10000ull;
-    const int start_ms = resume_ms > INT32_MAX ? INT32_MAX : (int)resume_ms;
-    if (!jf_player_play(stream, transcode, gl_width, gl_height, start_ms)) {
-        set_error("Playback failed: %s", jf_player_error());
-        return;
-    }
-    if (subtitle_texture != 0) {
-      /* Whatever the last item left on screen is not this one's. */
-      jf_renderer_destroy_texture(renderer, subtitle_texture);
-      subtitle_texture = 0;
-    }
-    set_text(playback_title, sizeof(playback_title), title);
-    set_text(playback_item_id, sizeof(playback_item_id), id);
-    playback_paused = false;
-    playback_started_at = now_ns();
-    playback_progress_at = playback_started_at + 15000000000ull;
-    playback_return_screen = screen;
-    playback_return_focus = focus;
-    focus = PLAY_PAUSE_INDEX;
-    playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
-    screen = SCREEN_PLAYBACK;
-    report_playback(JF_JOB_PLAYBACK_STARTED);
+/* The server's subtitle streams, with its pick for the user's preferences
+ * selected. */
+static void use_playback_info(const jf_playback_info *info) {
+  set_text(playback_source_id, sizeof(playback_source_id),
+           info->media_source_id);
+  static jf_player_track tracks[32];
+  int count = 0, selected = -1;
+  for (size_t i = 0; i < info->subtitle_count && count < 32; i++) {
+    const jf_subtitle_stream *stream = &info->subtitles[i];
+    /* A bitmap file beside the video has no source here: the server
+     * converts only text, and it is not in the container. */
+    if (!stream->text && stream->external)
+      continue;
+    jf_player_track *track = &tracks[count];
+    *track = (jf_player_track){
+        stream->index, stream->external, stream->text, "", "", -1};
+    set_text(track->name, sizeof(track->name), stream->title);
+    if (stream->text)
+      jf_subtitle_url(&session, playback_item_id, info->media_source_id,
+                      stream->index, track->url, sizeof(track->url));
+    if (stream->index == info->default_subtitle)
+      selected = count;
+    count++;
+  }
+  jf_player_subtitle_tracks(tracks, count, selected);
+  fprintf(stderr, "Playback info: %d subtitle track(s), default stream %d\n",
+          count, info->default_subtitle);
+}
+
+static void start_playback(const char *id, const char *title,
+                           const char *series_id, uint64_t resume_ticks) {
+  char stream[1024];
+  jf_stream_url(&session, id, stream, sizeof(stream));
+  if (stream[0] == '\0') {
+    set_error("Could not build a stream URL");
+    return;
+  }
+  /* The transcode request carries the hardware capability constraints. Keep
+   * this comfortably above a long reverse-proxy address plus access token. */
+  char transcode[2048];
+  jf_transcode_url(&session, id, transcode, sizeof(transcode));
+  const uint64_t resume_ms = resume_ticks / 10000ull;
+  const int start_ms = resume_ms > INT32_MAX ? INT32_MAX : (int)resume_ms;
+  if (!jf_player_play(stream, transcode, gl_width, gl_height, start_ms)) {
+    set_error("Playback failed: %s", jf_player_error());
+    return;
+  }
+  if (subtitle_texture != 0) {
+    /* Whatever the last item left on screen is not this one's. */
+    jf_renderer_destroy_texture(renderer, subtitle_texture);
+    subtitle_texture = 0;
+  }
+  set_text(playback_title, sizeof(playback_title), title);
+  set_text(playback_item_id, sizeof(playback_item_id), id);
+  set_text(playback_source_id, sizeof(playback_source_id), id);
+  subtitle_picker = false;
+  jf_task *info = request(JF_JOB_PLAYBACK_INFO, 0);
+  if (info != NULL) {
+    set_text(info->a, sizeof(info->a), id);
+    jf_fetcher_start(&fetcher, info);
+  }
+  previous_episode.present = next_episode.present = false;
+  jf_task *adjacent = request(JF_JOB_ADJACENT, 0);
+  if (adjacent != NULL) {
+    set_text(adjacent->a, sizeof(adjacent->a), id);
+    set_text(adjacent->b, sizeof(adjacent->b), series_id);
+    jf_fetcher_start(&fetcher, adjacent);
+  }
+  playback_paused = false;
+  playback_started_at = now_ns();
+  playback_progress_at = playback_started_at + 15000000000ull;
+  playback_return_screen = screen;
+  playback_return_focus = focus;
+  focus = PLAY_PAUSE_INDEX;
+  playback_row = 0;
+  glow_placed = false;
+  animated_float_snap(&chrome_motion, 0);
+  show_playback_chrome();
+  screen = SCREEN_PLAYBACK;
+  report_playback(JF_JOB_PLAYBACK_STARTED);
 }
 
 static void toggle_playback(void)
@@ -1806,6 +1949,73 @@ static void toggle_playback(void)
     }
 }
 
+static void open_subtitle_picker(void) {
+  if (jf_player_subtitle_count() == 0) {
+    set_status("No subtitle tracks are available");
+    return;
+  }
+  subtitle_picker = true;
+  jf_player_subtitle_preview(true);
+  picker_focus = (size_t)(jf_player_subtitle_current() + 1);
+}
+
+/* Moving is choosing: the frame behind the picker shows the track at once. */
+static void pick_subtitle(size_t row) {
+  picker_focus = row;
+  jf_player_subtitle_select((int)row - 1);
+}
+
+/* The picker takes every key while it is up. */
+static void picker_key(uint32_t code) {
+  const size_t rows = (size_t)jf_player_subtitle_count() + 1;
+  if (jf_window_is_back_key(code) || code == 28 || code == 96 || code == 352) {
+    subtitle_picker = false;
+    jf_player_subtitle_preview(false);
+    report_playback(JF_JOB_PLAYBACK_PROGRESS);
+  } else if (code == 103) {
+    pick_subtitle(picker_focus > 0 ? picker_focus - 1 : 0);
+  } else if (code == 108) {
+    pick_subtitle(min_size(picker_focus + 1, rows - 1));
+  } else if (code == KEY_SUBTITLE) {
+    pick_subtitle((picker_focus + 1) % rows);
+  }
+}
+
+/* Next is the first chapter starting after here; back is the start of this
+ * one, or of the one before when this one has only just begun. */
+static void seek_chapter(int direction) {
+  const int *starts = NULL;
+  const int count = jf_player_chapters(&starts);
+  const int position = jf_player_position();
+  int target = direction > 0 ? -1 : 0;
+  for (int i = 0; i < count; i++) {
+    if (direction > 0 && starts[i] > position + 1000) {
+      target = starts[i];
+      break;
+    }
+    if (direction < 0 && starts[i] < position - 3000)
+      target = starts[i];
+  }
+  if (target >= 0)
+    jf_player_seek_to(target);
+}
+
+/* Straight from one episode into the next, with Back still going where it
+ * went before. */
+static void play_adjacent(const card *episode) {
+  if (!episode->present)
+    return;
+  const card chosen = *episode;
+  const screen_id back = playback_return_screen;
+  const size_t back_focus = playback_return_focus;
+  report_playback(JF_JOB_PLAYBACK_PROGRESS);
+  jf_player_stop();
+  start_playback(chosen.id, chosen.episode_title, chosen.series_id,
+                 chosen.playback_position_ticks);
+  playback_return_screen = back;
+  playback_return_focus = back_focus;
+}
+
 static void activate_playback(void)
 {
     playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
@@ -1816,29 +2026,110 @@ static void activate_playback(void)
     case ACTION_FORWARD_10: jf_player_seek(10); break;
     case ACTION_FORWARD_30: jf_player_seek(30); break;
     case ACTION_PREVIOUS:
+      play_adjacent(&previous_episode);
+      break;
     case ACTION_NEXT:
-        set_status("Episode navigation is not available for this item");
-        break;
-    case ACTION_SUBTITLES: {
-      const int count = jf_player_subtitle_count();
-      if (count == 0) {
-        set_status("No subtitle tracks are available");
-        break;
-      }
-      /* Off, then each track in turn, then off again. A picker is a screen;
-       * this is a button that already exists. */
-      const int next = jf_player_subtitle_current() + 1;
-      if (next >= count) {
-        jf_player_subtitle_select(-1);
-        set_status("Subtitles off");
-      } else {
-        jf_player_subtitle_select(next);
-        set_status("Subtitles: %s", jf_player_subtitle_name(next));
-      }
+      play_adjacent(&next_episode);
+      break;
+    case ACTION_CHAPTER_BACK:
+      seek_chapter(-1);
+      break;
+    case ACTION_CHAPTER_NEXT:
+      seek_chapter(1);
+      break;
+    case ACTION_SUBTITLES:
+      open_subtitle_picker();
+      break;
+    case ACTION_AUDIO:
+      if (jf_player_audio_count() > 1)
+        jf_player_audio_select((jf_player_audio_current() + 1) %
+                               jf_player_audio_count());
       break;
     }
-    case ACTION_AUDIO: set_status("This stream has one audio track"); break;
+}
+
+/* The chrome is two rows: the buttons, and above them the seek bar. Up from the
+ * bar hides it all, even paused; with it hidden, a key only brings it back,
+ * except OK, which pauses, and Left and Right, which seek. */
+/* Holding Left or Right on the seek bar scrubs: the bar moves, faster the
+ * longer the key is held, and the seek happens once, on release - a seek per
+ * key repeat would have the TV reopening the stream faster than it can. */
+static bool scrubbing;
+static int scrub_ms;
+static uint64_t scrub_started_at, scrub_moved_at;
+
+static void end_scrub(void) {
+  if (!scrubbing)
+    return;
+  scrubbing = false;
+  jf_player_seek_to(scrub_ms);
+}
+
+static void scrub(int direction, bool repeat) {
+  const uint64_t now = now_ns();
+  if (!repeat) {
+    end_scrub();
+    jf_player_seek(direction * 10);
+    return;
+  }
+  if (!scrubbing) {
+    scrubbing = true;
+    scrub_ms = jf_player_position();
+    scrub_started_at = scrub_moved_at = now;
+  }
+  /* Media seconds per second held: 20 at first, doubling every second held,
+   * up to ten minutes a second. */
+  const float held = (float)(now - scrub_started_at) / 1e9f;
+  const float rate = minf(20.0f * powf(2.0f, held), 600.0f);
+  scrub_ms += direction * (int)(rate * (float)(now - scrub_moved_at) / 1e6f);
+  scrub_moved_at = now;
+  const int duration = jf_player_duration();
+  scrub_ms = scrub_ms < 0                          ? 0
+             : duration > 0 && scrub_ms > duration ? duration
+                                                   : scrub_ms;
+}
+
+static void playback_key(uint32_t code, bool repeat) {
+  const bool shown = playback_chrome_wanted(now_ns());
+  show_playback_chrome();
+  const bool ok = code == 28 || code == 96 || code == 352;
+  if (!shown) {
+    if (ok)
+      toggle_playback();
+    if (code == 105 || code == 106) {
+      playback_row = 1;
+      scrub(code == 105 ? -1 : 1, repeat);
     }
+    return;
+  }
+  switch (code) {
+  case 103:
+    if (playback_row == 0) {
+      playback_row = 1;
+    } else {
+      chrome_dismissed = true;
+      playback_row = 0;
+    }
+    break;
+  case 108:
+    playback_row = 0;
+    break;
+  case 105:
+  case 106:
+    if (playback_row == 1)
+      scrub(code == 105 ? -1 : 1, repeat);
+    else
+      focus = step_button(focus, code == 105 ? -1 : 1);
+    break;
+  default:
+    if (ok) {
+      if (playback_row == 1)
+        toggle_playback();
+      else
+        activate_playback();
+    }
+    break;
+  }
 }
 
 static void activate_server(void)
@@ -1878,7 +2169,8 @@ static void activate_details(void)
         return;
     }
     if (focus == 0)
-        start_playback(detail.id, detail.title, detail.playback_position_ticks);
+      start_playback(detail.id, detail.title, detail.series_id,
+                     detail.playback_position_ticks);
 }
 
 static void activate(void)
@@ -1941,9 +2233,11 @@ static void activate(void)
         break;
     case SCREEN_SEASON:
         if (episode_selected < episodes_row.count)
-            start_playback(episodes_row.cards[episode_selected].id,
-                           episodes_row.cards[episode_selected].episode_title,
-                           episodes_row.cards[episode_selected].playback_position_ticks);
+          start_playback(
+              episodes_row.cards[episode_selected].id,
+              episodes_row.cards[episode_selected].episode_title,
+              episodes_row.cards[episode_selected].series_id,
+              episodes_row.cards[episode_selected].playback_position_ticks);
         break;
     case SCREEN_PLAYBACK:
         activate_playback();
@@ -2195,22 +2489,33 @@ static void navigate(uint32_t code, bool repeat) {
 /* ------------------------------------------------------------------- input */
 
 static void on_key(uint32_t code, bool pressed, bool repeat) {
-  if (!pressed)
+  if (!pressed) {
+    if (screen == SCREEN_PLAYBACK && (code == 105 || code == 106) &&
+        scrubbing) {
+      end_scrub();
+      jf_window_frame_requested = true;
+    }
     return;
+  }
   jf_window_frame_requested = true;
+  if (screen == SCREEN_PLAYBACK && subtitle_picker) {
+    picker_key(code);
+    return;
+  }
+  if (screen == SCREEN_PLAYBACK && code == KEY_SUBTITLE) {
+    open_subtitle_picker();
+    return;
+  }
   if (jf_window_is_back_key(code)) {
     go_back();
     return;
   }
-  if (screen == SCREEN_PLAYBACK) {
-    if (code == 103) { /* Up dismisses player chrome immediately. */
-      playback_controls_until = 0;
-      return;
-    }
-    playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
-  }
   if (code == 88) { /* F12 */
     capture_requested = true;
+    return;
+  }
+  if (screen == SCREEN_PLAYBACK) {
+    playback_key(code, repeat);
     return;
   }
   if (active_field != EDIT_NONE) {
@@ -2234,6 +2539,9 @@ static void move_cursor(jf_fixed x, jf_fixed y)
     cursor_x = (float)jf_fixed_to_int(x);
     cursor_y = (float)jf_fixed_to_int(y);
     cursor_present = true;
+    pointer_moved = true;
+    if (screen == SCREEN_PLAYBACK)
+      show_playback_chrome();
 }
 
 static void on_event(const jf_event *event)
@@ -3120,44 +3428,285 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
     ctx->mask = outer;
 }
 
+/* A column at the right, clear of where dialogue sits, so the line a choice
+ * brings up is in view. */
+static void draw_subtitle_picker(loom_context *ctx, float width, float height,
+                                 float scale) {
+  static const loom_color chrome = {8, 12, 20, 215};
+  const int count = jf_player_subtitle_count();
+  const float row = 58 * scale, head = 64 * scale;
+  const size_t visible = min_size((size_t)count + 1, 11);
+  const size_t first =
+      picker_focus < visible / 2
+          ? 0
+          : min_size(picker_focus - visible / 2, (size_t)count + 1 - visible);
+  const loom_rect panel = {width - 620 * scale,
+                           (height - head - visible * row) / 2 - 40 * scale,
+                           560 * scale, head + visible * row + 16 * scale};
+  loom_fill(ctx, panel, NULL, chrome, 16 * scale);
+  loom_label(ctx,
+             (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
+                         36 * scale},
+             &panel, "Subtitles", DIM, 22 * scale);
+  for (size_t i = first; i < first + visible; i++) {
+    const loom_rect rect = {panel.x + 12 * scale,
+                            panel.y + head + (float)(i - first) * row,
+                            panel.w - 24 * scale, row - 6 * scale};
+    const bool chosen = i == picker_focus;
+    if (chosen)
+      loom_fill(ctx, rect, &panel, SELECTED, 10 * scale);
+    const char *name = i == 0 ? "Off" : jf_player_subtitle_name((int)i - 1);
+    loom_label(ctx,
+               (loom_rect){rect.x + 16 * scale,
+                           rect.y + (rect.h - 30 * scale) / 2,
+                           rect.w - 32 * scale, 36 * scale},
+               &rect, ellipsize(name, rect.w - 32 * scale, 22 * scale),
+               chosen ? WHITE : TEXT, 22 * scale);
+    if (hovered(rect) && pointer_press)
+      pick_subtitle(i);
+  }
+}
+
+static const char *clock_text(int ms) {
+  const int seconds = ms > 0 ? ms / 1000 : 0;
+  return seconds >= 3600 ? fmt("%d:%02d:%02d", seconds / 3600,
+                               seconds / 60 % 60, seconds % 60)
+                         : fmt("%d:%02d", seconds / 60, seconds % 60);
+}
+
+/* Glides the focus glow to (x, y), or puts it there when it was not showing. */
+static void move_glow(float x, float y) {
+  if (!glow_placed) {
+    animated_float_snap(&glow_x, x);
+    animated_float_snap(&glow_y, y);
+    glow_placed = true;
+    return;
+  }
+  animated_float_set(&glow_x, x, NAVIGATION_ANIMATION_NS);
+  animated_float_set(&glow_y, y, NAVIGATION_ANIMATION_NS);
+}
+
+static const char *playback_hint(size_t index) {
+  switch (playback_buttons[index].action) {
+  case ACTION_PAUSE:
+    return playback_paused ? "Play" : "Pause";
+  case ACTION_SUBTITLES: {
+    const int track = jf_player_subtitle_current();
+    return fmt("Subtitles: %s",
+               track >= 0 ? jf_player_subtitle_name(track) : "Off");
+  }
+  case ACTION_AUDIO: {
+    const int count = jf_player_audio_count();
+    if (count == 0)
+      return "Audio: none";
+    return fmt("Audio: %s  (%d of %d)",
+               jf_player_audio_name(jf_player_audio_current()),
+               jf_player_audio_current() + 1, count);
+  }
+  case ACTION_PREVIOUS:
+    return fmt("Previous episode: %s", previous_episode.episode_title);
+  case ACTION_NEXT:
+    return fmt("Next episode: %s", next_episode.episode_title);
+  default:
+    return playback_buttons[index].hint;
+  }
+}
+
+/* Over the video: a gradient rising from the bottom rather than a box, the
+ * title, the seek bar and a row of icon buttons. It slides and fades in and out
+ * as a whole; the focus is a blue glow that glides between whatever it is on.
+ */
 static void draw_playback(loom_context *ctx, float width, float height, float scale)
 {
-    if (!playback_paused && now_ns() >= playback_controls_until)
-        return;
-    /* The video itself is on the TV's own plane. This graphics-plane strip is the only
-     * part of playback this process draws. */
-    static const loom_color chrome = {8, 12, 20, 205};
-    const loom_rect panel = {0, height - 166 * scale, width, 166 * scale};
-    loom_fill(ctx, panel, NULL, chrome, 0);
-    loom_label(ctx, (loom_rect){64 * scale, panel.y + 20 * scale, width - 128 * scale,
-                                34 * scale},
-               &panel, playback_title, TEXT, 27 * scale);
+  if (subtitle_picker) {
+    draw_subtitle_picker(ctx, width, height, scale);
+    return;
+  }
+  const bool wanted = playback_chrome_wanted(now_ns());
+  animated_float_set(&chrome_motion, wanted ? 1 : 0,
+                     2 * NAVIGATION_ANIMATION_NS);
+  const float shown = chrome_motion.value;
+  if (shown <= 0.001f) {
+    glow_placed = false;
+    return;
+  }
+  const size_t first = ctx->count;
 
-    const jf_player_state state = jf_player_state_get();
-    const char *message = state == JF_LOADING ? "Loading stream..."
-                          : state == JF_PLAYING
-                              ? (playback_paused ? "Paused - OK resumes, Back stops"
-                                                 : "OK pauses, Back stops")
-                          : state == JF_FAILED ? jf_player_error()
-                                               : "Stopped";
-    loom_label(ctx, (loom_rect){64 * scale, panel.y + 58 * scale, width - 128 * scale,
-                                26 * scale},
-               &panel, message, state == JF_FAILED ? RED : DIM, 19 * scale);
+  static const loom_color shade = {0, 0, 0, 215};
+  static const loom_color track = {255, 255, 255, 64};
+  static const loom_color mark = {255, 255, 255, 170};
+  static const loom_color glow = {20, 130, 255, 235};
+  const loom_rect scrim = {0, height - 440 * scale, width, 440 * scale};
+  const loom_mask outer = ctx->mask;
+  ctx->mask.edge[LOOM_FADE_TOP] = scrim.y;
+  ctx->mask.width[LOOM_FADE_TOP] = scrim.h;
+  loom_fill(ctx, scrim, NULL, shade, 0);
+  ctx->mask = outer;
 
-    /* Centre the transport, with the track controls held at the right edge. */
-    float x = (width - 830 * scale) / 2;
-    for (size_t index = 0; index < 7; index++) {
-        const float button_width = playback_buttons[index].action == ACTION_PAUSE ? 130.0f : 88.0f;
-        const loom_rect rect = {x, panel.y + 96 * scale, button_width * scale, 48 * scale};
-        draw_button(ctx, rect, playback_buttons[index].label, index, scale);
-        x += rect.w + 10 * scale;
+  const float margin = 40 * scale;
+  const float row_y = height - 74 * scale;  /* the buttons' centre line */
+  const float bar_y = height - 136 * scale; /* the seek bar's */
+
+  /* Title, and what the focused control is or does. */
+  const jf_player_state state = jf_player_state_get();
+  const char *hint =
+      state == JF_LOADING  ? "Loading..."
+      : state == JF_FAILED ? jf_player_error()
+      : playback_row == 1
+          ? (playback_paused ? "Paused" : "")
+          : playback_hint(min_size(focus, PLAYBACK_BUTTON_COUNT - 1));
+  const float hint_size = 22 * scale;
+  const float hint_w = jf_renderer_measure(renderer, hint, hint_size);
+  loom_label(ctx,
+             (loom_rect){width - margin - hint_w, bar_y - 74 * scale,
+                         hint_w + 4, 30 * scale},
+             NULL, hint, state == JF_FAILED ? RED : DIM, hint_size);
+  loom_label(ctx,
+             (loom_rect){margin, bar_y - 84 * scale,
+                         width - margin * 2 - hint_w - 40 * scale, 44 * scale},
+             NULL,
+             ellipsize(playback_title, width - margin * 2 - hint_w - 40 * scale,
+                       34 * scale),
+             TEXT, 34 * scale);
+
+  /* The seek bar, between the elapsed time and the length. */
+  const int duration = jf_player_duration();
+  /* A release that never arrived ends a scrub all the same. */
+  if (scrubbing && now_ns() - scrub_moved_at > 600000000ull)
+    end_scrub();
+  const int position = scrubbing ? scrub_ms : jf_player_position();
+  const float time_size = 22 * scale, time_w = 74 * scale;
+  const char *elapsed = clock_text(position);
+  loom_label(ctx,
+             (loom_rect){margin + time_w -
+                             jf_renderer_measure(renderer, elapsed, time_size),
+                         bar_y - 14 * scale, time_w, 30 * scale},
+             NULL, elapsed, TEXT, time_size);
+  loom_label(ctx,
+             (loom_rect){width - margin - time_w, bar_y - 14 * scale, time_w,
+                         30 * scale},
+             NULL, duration > 0 ? clock_text(duration) : "--:--", DIM,
+             time_size);
+  const bool bar_focused = playback_row == 1;
+  const float bar_h = (bar_focused ? 8 : 5) * scale;
+  const loom_rect bar = {margin + time_w + 28 * scale, bar_y - bar_h / 2,
+                         width - 2 * (margin + time_w + 28 * scale), bar_h};
+  const float seen =
+      duration > 0 ? minf(maxf((float)position / duration, 0), 1) : 0;
+  const float head_x = bar.x + bar.w * seen;
+  if (bar_focused)
+    move_glow(head_x, bar_y);
+  const loom_rect bar_hit = {bar.x, bar_y - 24 * scale, bar.w, 48 * scale};
+  if (hovered(bar_hit)) {
+    if (pointer_moved)
+      playback_row = 1;
+    if (pointer_press && duration > 0)
+      jf_player_seek_to((int)((cursor_x - bar.x) / bar.w * duration));
+  }
+
+  /* Everything that glows is drawn after the glow. */
+  /* A button that went away (chapters or episodes) hands the focus back. */
+  if (focus >= PLAYBACK_BUTTON_COUNT || !button_shown(focus))
+    focus = PLAY_PAUSE_INDEX;
+  const size_t focused = focus;
+  float centres[PLAYBACK_BUTTON_COUNT];
+  const float step = 96 * scale;
+  /* Play/pause holds the middle; the shown buttons pack outwards from it. */
+  centres[PLAY_PAUSE_INDEX] = width / 2;
+  float left = width / 2, right = width / 2;
+  for (size_t index = PLAY_PAUSE_INDEX; index-- > 0;)
+    if (button_shown(index))
+      centres[index] = left -= step;
+  for (size_t index = PLAY_PAUSE_INDEX + 1; index < TRANSPORT_COUNT; index++)
+    if (button_shown(index))
+      centres[index] = right += step;
+  centres[TRANSPORT_COUNT] = width - margin - 24 * scale - step;
+  centres[TRANSPORT_COUNT + 1] = width - margin - 24 * scale;
+  if (!bar_focused)
+    move_glow(centres[focused], row_y);
+  const float glow_size = 180 * scale;
+  loom_label(ctx,
+             (loom_rect){glow_x.value - glow_size / 2,
+                         glow_y.value - glow_size / 2, glow_size, glow_size},
+             NULL, JF_ICON_GLOW_TEXT, glow, glow_size);
+
+  loom_fill(ctx, bar, NULL, track, bar_h / 2);
+  loom_fill(ctx, (loom_rect){bar.x, bar.y, bar.w * seen, bar.h}, NULL, ACCENT,
+            bar_h / 2);
+  const int *chapters = NULL;
+  const int chapter_count = duration > 0 ? jf_player_chapters(&chapters) : 0;
+  for (int i = 0; i < chapter_count; i++) {
+    if (chapters[i] <= 0 || chapters[i] >= duration)
+      continue;
+    const float x = bar.x + bar.w * chapters[i] / duration;
+    loom_fill(
+        ctx,
+        (loom_rect){x - 1.5f * scale, bar_y - 9 * scale, 3 * scale, 18 * scale},
+        NULL, position < chapters[i] ? mark : ACCENT, scale);
+  }
+  if (bar_focused) {
+    const float knob = 22 * scale;
+    loom_fill(ctx, (loom_rect){head_x - knob / 2, bar_y - knob / 2, knob, knob},
+              NULL, WHITE, knob / 2);
+  }
+
+  for (size_t index = 0; index < PLAYBACK_BUTTON_COUNT; index++) {
+    if (!button_shown(index))
+      continue;
+    const bool pause = playback_buttons[index].action == ACTION_PAUSE;
+    const float icon = (pause ? 64 : 46) * scale;
+    const loom_rect hit = {centres[index] - step / 2, row_y - step / 2, step,
+                           step};
+    const loom_rect at = {centres[index] - icon / 2, row_y - icon / 2, icon,
+                          icon};
+    const bool lit = !bar_focused && index == focused;
+    loom_label(ctx, at, NULL,
+               pause && playback_paused ? JF_ICON_PLAY
+                                        : playback_buttons[index].icon,
+               lit ? WHITE : TEXT, icon);
+    const char *number = playback_buttons[index].number;
+    if (number[0] != '\0') {
+      const float size = 15 * scale;
+      const float w = jf_renderer_measure(renderer, number, size);
+      loom_label(ctx,
+                 (loom_rect){centres[index] - w / 2,
+                             at.y + icon * 0.555f - size * 0.72f, w + 2,
+                             size * 1.4f},
+                 NULL, number, lit ? WHITE : TEXT, size);
     }
-    x = width - 64 * scale - 210 * scale;
-    for (size_t index = 7; index < PLAYBACK_BUTTON_COUNT; index++) {
-        const loom_rect rect = {x, panel.y + 96 * scale, 100 * scale, 48 * scale};
-        draw_button(ctx, rect, playback_buttons[index].label, index, scale);
-        x += 110 * scale;
+    const char *tag = playback_buttons[index].tag;
+    if (tag[0] != '\0') {
+      const float size = 16 * scale;
+      const float w = jf_renderer_measure(renderer, tag, size);
+      loom_label(
+          ctx,
+          (loom_rect){centres[index] - w / 2, at.y + icon, w + 2, size * 1.4f},
+          NULL, tag, lit ? WHITE : DIM, size);
     }
+    if (hovered(hit)) {
+      if (pointer_moved) {
+        focus = index;
+        playback_row = 0;
+      }
+      if (pointer_press) {
+        focus = index;
+        playback_row = 0;
+        activate_playback();
+      }
+    }
+  }
+
+  /* Fade and slide the whole of it with the one animation. */
+  const float drop = (1 - shown) * 60 * scale;
+  for (size_t i = first; i < ctx->count; i++) {
+    loom_command *c = &ctx->commands[i];
+    c->rect.y += drop;
+    uint8_t *alpha = c->kind == LOOM_RECTANGLE ? &c->rectangle.color[3]
+                     : c->kind == LOOM_BORDER  ? &c->border.color[3]
+                     : c->kind == LOOM_TEXT    ? &c->text.color[3]
+                                               : &c->image.tint[3];
+    *alpha = (uint8_t)(*alpha * shown);
+  }
 }
 
 /* The subtitle overlay sits under the transport chrome and over the video hole.
@@ -3166,9 +3715,27 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
  * changed. Runs on the subtitle tick, outside building the UI, so an unchanged
  * subtitle costs no frame. */
 static bool update_subtitles(void) {
-  const int media_ms = jf_player_media_ms();
+  const int media_ms = jf_player_subtitle_ms();
   if (media_ms < 0)
     return false;
+  if (jf_picsubs_ready()) {
+    /* Bitmap tracks: the picture is already pixels, and changes a few times a
+     * minute, so it is uploaded as it is and scaled by the draw. */
+    jf_picsubs_image picture;
+    if (!jf_picsubs_frame(media_ms, &picture))
+      return false;
+    const double started = thread_ms();
+    if (subtitle_texture != 0)
+      jf_renderer_destroy_texture(renderer, subtitle_texture);
+    subtitle_texture = picture.rgba != NULL
+                           ? jf_renderer_create_rgba_texture(
+                                 renderer, (uint32_t)picture.texture_w,
+                                 (uint32_t)picture.texture_h, picture.rgba)
+                           : 0;
+    phase_frame[PHASE_UPLOAD] = thread_ms() - started;
+    subtitle_rect = (loom_rect){picture.x, picture.y, picture.w, picture.h};
+    return true;
+  }
   jf_subs_image image;
   const bool changed = jf_subs_frame(media_ms, &image);
   const jf_subs_cost cost = jf_subs_last_cost();
@@ -3192,15 +3759,29 @@ static bool update_subtitles(void) {
   return changed;
 }
 
+static bool subtitles_active(void) {
+  return jf_subs_ready() || jf_picsubs_ready();
+}
+
 static void draw_subtitles(loom_context *ctx) {
-  if (!jf_subs_ready() && subtitle_texture != 0) {
+  /* Dialogue rises clear of the playback chrome while it is in. libass can
+   * tell dialogue from a sign placed over the picture; for a bitmap track,
+   * only a picture wholly in the bottom third is taken for dialogue. */
+  const float chrome_top = (float)gl_height * (1 - 200.0f / 1080);
+  const bool lift = !subtitle_picker && playback_chrome_wanted(now_ns());
+  jf_subs_keep_above(lift ? (int)chrome_top : INT_MAX);
+  if (!subtitles_active() && subtitle_texture != 0) {
     jf_renderer_destroy_texture(renderer, subtitle_texture);
     subtitle_texture = 0;
   }
   if (subtitle_texture == 0)
     return;
   static const float whole[4] = {0, 0, 1, 1};
-  loom_premultiplied(ctx, subtitle_rect, NULL, subtitle_texture, whole, WHITE);
+  loom_rect rect = subtitle_rect;
+  if (lift && jf_picsubs_ready() && rect.y > (float)gl_height * 2 / 3 &&
+      rect.y + rect.h > chrome_top)
+    rect.y -= (rect.y + rect.h - chrome_top) * chrome_motion.value;
+  loom_premultiplied(ctx, rect, NULL, subtitle_texture, whole, WHITE);
 }
 
 static void draw_licenses(loom_context *ctx, float width, float height,
@@ -3398,6 +3979,12 @@ static bool advance_animations(uint64_t now) {
   animated_float_update(&focus_cursor.y, now);
   animated_float_update(&focus_cursor.w, now);
   animated_float_update(&focus_cursor.h, now);
+  animated_float_update(&chrome_motion, now);
+  animated_float_update(&glow_x, now);
+  animated_float_update(&glow_y, now);
+  if (animated_float_running(&chrome_motion) ||
+      animated_float_running(&glow_x) || animated_float_running(&glow_y))
+    return true;
   for (size_t index = 0; index < ROW_COUNT; index++)
     animated_float_update(&row_offset_motion[index], now);
 
@@ -3490,6 +4077,7 @@ static void build_ui(loom_context *ctx)
     if (advance_animations(now_ns()))
       jf_window_frame_requested = true;
     pointer_press = false;
+    pointer_moved = false;
 }
 
 /* -------------------------------------------------------------------- main */
@@ -3519,7 +4107,7 @@ static bool next_deadline(uint64_t now, bool controls_visible, uint64_t *out)
             deadline = playback_controls_until;
         have = true;
     }
-    if (screen == SCREEN_PLAYBACK && jf_subs_ready()) {
+    if (screen == SCREEN_PLAYBACK && subtitles_active()) {
       if (!have || subtitle_tick < deadline)
         deadline = subtitle_tick;
       have = true;
@@ -3629,6 +4217,9 @@ static bool step_script(void)
     case 'r': key = 106; break;
     case 'o': key = 28; break;
     case 'b': key = jf_window_on_webos ? 412 : 158; break;
+    case 's':
+      key = KEY_SUBTITLE;
+      break;
     default: break;
     }
     if (key != 0)
@@ -3646,223 +4237,241 @@ static bool step_script(void)
     return false;
 }
 
-int main(void)
-{
-    for (size_t i = 0; i < ROW_COUNT; i++)
-        rows[i].cards = home_cards[i];
-    categories_row.cards = category_cards;
-    seasons_row.cards = seasons_cards;
-    episodes_row.cards = episodes_cards;
+int main(int argc, char **argv) {
+  for (size_t i = 0; i < ROW_COUNT; i++)
+    rows[i].cards = home_cards[i];
+  categories_row.cards = category_cards;
+  seasons_row.cards = seasons_cards;
+  episodes_row.cards = episodes_cards;
 
-    jf_session_device_id(&session);
-    jf_api_init();
-    snprintf(preferences_path, sizeof(preferences_path),
-             "%s/conf/preferences.ini", jf_store_root());
-    load_preferences();
-    log_to_file();
-    const bool restored = jf_session_load(&session);
+  jf_session_device_id(&session);
+  jf_api_init();
+  snprintf(preferences_path, sizeof(preferences_path),
+           "%s/conf/preferences.ini", jf_store_root());
+  load_preferences();
+  log_to_file();
+  const bool restored = jf_session_load(&session);
+  if (session.url[0] != '\0') {
+    set_text(server_url, sizeof(server_url), session.url);
+    set_text(server_name, sizeof(server_name), session.url);
+  }
+
+  jf_window_set_handler(on_event);
+  const char *appid = getenv("APPID");
+  if (!jf_window_init(appid != NULL ? appid : APP_ID, "Jellyfin", 0, 0))
+    return 1;
+  /* How the TV asks the app to close. Absent off-device, where nothing asks. */
+  if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
+    fprintf(stderr, "no webOS lifecycle\n");
+
+  glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
+  glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);
+
+  renderer = jf_renderer_create(NULL, 0, 0);
+  if (renderer == NULL) {
+    fprintf(stderr, "the UI renderer could not start\n");
+    return 1;
+  }
+  loom_context ctx;
+  loom_init(&ctx);
+  probe_overlay overlay;
+  probe_timer timer;
+  if (stats_overlay) {
+    probe_overlay_init(&overlay, text_vs, text_fs, (int)gl_width,
+                       (int)gl_height);
+    probe_timer_init(&timer);
+  }
+
+  if (!jf_fetcher_init(&fetcher, jf_window_wake)) {
+    fprintf(stderr, "no fetcher worker threads\n");
+    return 1;
+  }
+  jf_fetcher_set_session(&fetcher, &session);
+
+  /* A stored token skips straight to the home rows; JELLYFIN_ADDRESS makes a
+   * fresh install land on the sign-in screen without typing a URL on a TV. */
+  if (restored) {
+    depth = 0;
+    screen = SCREEN_HOME;
+    set_status("Signed in as %s", session.user_name);
+    load_home();
+  } else {
+    /* Development convenience, and the only way a script can sign in: the
+     * fields start filled from the environment. Nothing is read from there once
+     * a token is stored. */
+    const char *address = getenv("JELLYFIN_ADDRESS");
+    if (address != NULL) {
+      set_text(server_url, sizeof(server_url), address);
+      set_text(session.url, sizeof(session.url), address);
+      set_text(server_name, sizeof(server_name), address);
+      jf_fetcher_set_session(&fetcher, &session);
+    }
+    const char *user = getenv("JELLYFIN_USER");
+    if (user != NULL)
+      set_text(username, sizeof(username), user);
+    const char *secret = getenv("JELLYFIN_PASSWORD");
+    if (secret != NULL)
+      set_text(password, sizeof(password), secret);
     if (session.url[0] != '\0') {
-        set_text(server_url, sizeof(server_url), session.url);
-        set_text(server_name, sizeof(server_name), session.url);
-    }
-
-    jf_window_set_handler(on_event);
-    const char *appid = getenv("APPID");
-    if (!jf_window_init(appid != NULL ? appid : APP_ID, "Jellyfin", 0, 0))
-        return 1;
-    /* How the TV asks the app to close. Absent off-device, where nothing asks. */
-    if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
-        fprintf(stderr, "no webOS lifecycle\n");
-
-    glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
-    glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);
-
-    renderer = jf_renderer_create(NULL, 0, 0);
-    if (renderer == NULL) {
-        fprintf(stderr, "the UI renderer could not start\n");
-        return 1;
-    }
-    loom_context ctx;
-    loom_init(&ctx);
-    probe_overlay overlay;
-    probe_timer timer;
-    if (stats_overlay) {
-      probe_overlay_init(&overlay, text_vs, text_fs, (int)gl_width,
-                         (int)gl_height);
-      probe_timer_init(&timer);
-    }
-
-    if (!jf_fetcher_init(&fetcher, jf_window_wake)) {
-        fprintf(stderr, "no fetcher worker threads\n");
-        return 1;
-    }
-    jf_fetcher_set_session(&fetcher, &session);
-
-    /* A stored token skips straight to the home rows; JELLYFIN_ADDRESS makes a fresh
-     * install land on the sign-in screen without typing a URL on a TV. */
-    if (restored) {
-        depth = 0;
-        screen = SCREEN_HOME;
-        set_status("Signed in as %s", session.user_name);
-        load_home();
+      screen = SCREEN_AUTH;
     } else {
-        /* Development convenience, and the only way a script can sign in: the fields start
-         * filled from the environment. Nothing is read from there once a token is
-         * stored. */
-        const char *address = getenv("JELLYFIN_ADDRESS");
-        if (address != NULL) {
-            set_text(server_url, sizeof(server_url), address);
-            set_text(session.url, sizeof(session.url), address);
-            set_text(server_name, sizeof(server_name), address);
-            jf_fetcher_set_session(&fetcher, &session);
-        }
-        const char *user = getenv("JELLYFIN_USER");
-        if (user != NULL)
-            set_text(username, sizeof(username), user);
-        const char *secret = getenv("JELLYFIN_PASSWORD");
-        if (secret != NULL)
-            set_text(password, sizeof(password), secret);
-        if (session.url[0] != '\0') {
-            screen = SCREEN_AUTH;
-        } else {
-            restart_discovery();
-        }
+      restart_discovery();
+    }
+  }
+
+  const char *capture_path = getenv("UI_CAPTURE");
+  const char *requested_script = getenv("UI_SCRIPT");
+  script = requested_script != NULL ? requested_script : "";
+  /* Without a script, hold long enough for discovery's three timeouts. */
+  unsigned capture_after =
+      (capture_path != NULL && script[0] == '\0') ? 240 : 0;
+  bool controls_visible = false;
+  jf_player_state last_state = jf_player_state_get();
+  /* JF_PLAY=<item id>[@ms], or a "play" launch parameter of the same form
+   * (`ares-launch -p '{"play":"..."}'`), starts that item once signed in:
+   * timing a start on the TV without driving the UI there. */
+  const char *autoplay = getenv("JF_PLAY");
+  static char launch_play[64];
+  const char *param = argc > 1 ? strstr(argv[1], "\"play\":\"") : NULL;
+  if (autoplay == NULL && param != NULL &&
+      sscanf(param + 8, "%63[^\"]", launch_play) == 1)
+    autoplay = launch_play;
+
+  while (jf_window_poll()) {
+    pump();
+    if (autoplay != NULL && screen == SCREEN_HOME) {
+      char id[40];
+      long long at_ms = 0;
+      sscanf(autoplay, "%39[^@]@%lld", id, &at_ms);
+      start_playback(id, id, "", (uint64_t)at_ms * 10000ull);
+      autoplay = NULL;
+    }
+    const jf_player_state state = jf_player_state_get();
+    if (state != last_state) {
+      last_state = state;
+      if (screen == SCREEN_PLAYBACK)
+        jf_window_frame_requested = true;
+    }
+    const uint64_t now = now_ns();
+    const bool visible =
+        screen == SCREEN_PLAYBACK && playback_chrome_wanted(now);
+    if (visible != controls_visible) {
+      controls_visible = visible;
+      jf_window_frame_requested = true;
+    }
+    if (screen == SCREEN_PLAYBACK && subtitles_active() &&
+        now >= subtitle_tick) {
+      subtitle_tick = now + SUBTITLE_TICK_NS;
+      if (update_subtitles())
+        jf_window_frame_requested = true;
+    }
+    /* A finished script still has to reach its capture. */
+    const bool scripted_frame = script[script_at] != '\0' ||
+                                capture_after > 0 ||
+                                (script[0] != '\0' && capture_path != NULL);
+    if (!jf_window_drawable ||
+        (!jf_window_frame_requested && !jf_player_needs_frame() &&
+         !scripted_frame && !capture_requested)) {
+      uint64_t deadline = 0;
+      const bool have = next_deadline(now, controls_visible, &deadline);
+      jf_window_wait_timeout(wait_milliseconds(now_ns(), have, deadline));
+      continue;
     }
 
-    const char *capture_path = getenv("UI_CAPTURE");
-    const char *requested_script = getenv("UI_SCRIPT");
-    script = requested_script != NULL ? requested_script : "";
-    /* Without a script, hold long enough for discovery's three timeouts. */
-    unsigned capture_after = (capture_path != NULL && script[0] == '\0') ? 240 : 0;
-    bool controls_visible = false;
-    jf_player_state last_state = jf_player_state_get();
-
-    while (jf_window_poll()) {
-        pump();
-        const jf_player_state state = jf_player_state_get();
-        if (state != last_state) {
-            last_state = state;
-            if (screen == SCREEN_PLAYBACK)
-                jf_window_frame_requested = true;
-        }
-        const uint64_t now = now_ns();
-        const bool visible =
-            screen == SCREEN_PLAYBACK && (playback_paused || now < playback_controls_until);
-        if (visible != controls_visible) {
-            controls_visible = visible;
-            jf_window_frame_requested = true;
-        }
-        if (screen == SCREEN_PLAYBACK && jf_subs_ready() &&
-            now >= subtitle_tick) {
-          subtitle_tick = now + SUBTITLE_TICK_NS;
-          if (update_subtitles())
-            jf_window_frame_requested = true;
-        }
-        /* A finished script still has to reach its capture. */
-        const bool scripted_frame = script[script_at] != '\0' ||
-                                    capture_after > 0 ||
-                                    (script[0] != '\0' && capture_path != NULL);
-        if (!jf_window_drawable ||
-            (!jf_window_frame_requested && !jf_player_needs_frame() && !scripted_frame &&
-             !capture_requested)) {
-            uint64_t deadline = 0;
-            const bool have = next_deadline(now, controls_visible, &deadline);
-            jf_window_wait_timeout(wait_milliseconds(now_ns(), have, deadline));
-            continue;
-        }
-
-        if (stats_overlay) {
-          probe_timer_begin(&timer);
-          jf_window_frame_requested = true;
-        }
-        glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
-        if (screen == SCREEN_PLAYBACK && !jf_player_embedded())
-            glClearColor(0, 0, 0, 0); /* Starfish owns the webOS video plane. */
-        else
-            glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
-        if (screen == SCREEN_PLAYBACK)
-            jf_player_render(gl_width, gl_height);
-        if (jf_window_frame_requested || scripted_frame) {
-            jf_window_frame_requested = false;
-            const double started = thread_ms();
-            build_ui(&ctx);
-            phase_frame[PHASE_UI] = thread_ms() - started;
-        }
-        const double draw_started = thread_ms();
-        jf_renderer_draw(renderer, ctx.commands, ctx.count, (float)gl_width, (float)gl_height);
-        phase_frame[PHASE_DRAW] = thread_ms() - draw_started;
-        if (stats_overlay) {
-          char line[PROBE_OVERLAY_COLS + 1];
-          probe_overlay_clear(&overlay);
-          snprintf(line, sizeof(line), "cpu  %6.2f ms", timer.cpu_ms);
-          probe_overlay_line(&overlay, 0, line);
-          snprintf(line, sizeof(line), "gpu %s%6.2f ms",
-                   timer.mode == PROBE_GPU_FINISH ? "*" : " ", timer.gpu_ms);
-          probe_overlay_line(&overlay, 1, line);
-          snprintf(line, sizeof(line), "%5.1f fps %zu inst",
-                   timer.frame_ms > 0 ? 1000.0 / timer.frame_ms : 0.0,
-                   jf_renderer_instances(renderer));
-          probe_overlay_line(&overlay, 2, line);
-          snprintf(line, sizeof(line), "%u draws %.1fx",
-                   jf_renderer_batches(renderer),
-                   jf_renderer_covered(renderer) /
-                       ((double)gl_width * gl_height));
-          probe_overlay_line(&overlay, 3, line);
-          /* The rest are the worst frame of the last second, which is what a
-           * stutter is. */
-          for (int i = 0; i < PHASE_COUNT; i++)
-            if (phase_frame[i] > phase_peak[i])
-              phase_peak[i] = phase_frame[i];
-          static uint64_t window_started;
-          if (now_ns() - window_started >= 1000000000ull) {
-            window_started = now_ns();
-            memcpy(phase_shown, phase_peak, sizeof(phase_peak));
-            memset(phase_peak, 0, sizeof(phase_peak));
-            runs_shown = runs_peak;
-            runs_peak = 0;
-            fprintf(stderr,
-                    "peak ms: ui %.2f  ass %.2f  composite %.2f (%u runs)  "
-                    "upload %.2f  "
-                    "draw %.2f\n",
-                    phase_shown[PHASE_UI], phase_shown[PHASE_ASS],
-                    phase_shown[PHASE_COMPOSITE], runs_shown,
-                    phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
-          }
-          snprintf(line, sizeof(line), "ui   %6.2f ms", phase_shown[PHASE_UI]);
-          probe_overlay_line(&overlay, 4, line);
-          snprintf(line, sizeof(line), "ass  %6.2f ms", phase_shown[PHASE_ASS]);
-          probe_overlay_line(&overlay, 5, line);
-          snprintf(line, sizeof(line), "comp %6.2f ms %4u",
-                   phase_shown[PHASE_COMPOSITE], runs_shown);
-          probe_overlay_line(&overlay, 6, line);
-          snprintf(line, sizeof(line), "up %5.2f gl %5.2f",
-                   phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
-          probe_overlay_line(&overlay, 7, line);
-          memset(phase_frame, 0, sizeof(phase_frame));
-          glEnable(GL_BLEND);
-          probe_overlay_draw(&overlay);
-          probe_timer_end(&timer);
-        }
-
-        if (script[0] != '\0' && step_script() && capture_path != NULL && capture_after == 0)
-            capture_after = SCRIPT_BEAT;
-        if (capture_after > 0 && --capture_after == 0)
-            capture_requested = true;
-        if (capture_requested) {
-            capture_frame(capture_path != NULL ? capture_path : "jellyfin-capture.ppm");
-            capture_requested = false;
-            if (capture_path != NULL)
-                jf_window_running = false;
-        }
-        jf_window_swap();
+    if (stats_overlay) {
+      probe_timer_begin(&timer);
+      jf_window_frame_requested = true;
+    }
+    glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
+    if (screen == SCREEN_PLAYBACK && !jf_player_embedded())
+      glClearColor(0, 0, 0, 0); /* Starfish owns the webOS video plane. */
+    else
+      glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (screen == SCREEN_PLAYBACK)
+      jf_player_render(gl_width, gl_height);
+    if (jf_window_frame_requested || scripted_frame) {
+      jf_window_frame_requested = false;
+      const double started = thread_ms();
+      build_ui(&ctx);
+      phase_frame[PHASE_UI] = thread_ms() - started;
+    }
+    const double draw_started = thread_ms();
+    jf_renderer_draw(renderer, ctx.commands, ctx.count, (float)gl_width,
+                     (float)gl_height);
+    phase_frame[PHASE_DRAW] = thread_ms() - draw_started;
+    if (stats_overlay) {
+      char line[PROBE_OVERLAY_COLS + 1];
+      probe_overlay_clear(&overlay);
+      snprintf(line, sizeof(line), "cpu  %6.2f ms", timer.cpu_ms);
+      probe_overlay_line(&overlay, 0, line);
+      snprintf(line, sizeof(line), "gpu %s%6.2f ms",
+               timer.mode == PROBE_GPU_FINISH ? "*" : " ", timer.gpu_ms);
+      probe_overlay_line(&overlay, 1, line);
+      snprintf(line, sizeof(line), "%5.1f fps %zu inst",
+               timer.frame_ms > 0 ? 1000.0 / timer.frame_ms : 0.0,
+               jf_renderer_instances(renderer));
+      probe_overlay_line(&overlay, 2, line);
+      snprintf(line, sizeof(line), "%u draws %.1fx",
+               jf_renderer_batches(renderer),
+               jf_renderer_covered(renderer) / ((double)gl_width * gl_height));
+      probe_overlay_line(&overlay, 3, line);
+      /* The rest are the worst frame of the last second, which is what a
+       * stutter is. */
+      for (int i = 0; i < PHASE_COUNT; i++)
+        if (phase_frame[i] > phase_peak[i])
+          phase_peak[i] = phase_frame[i];
+      static uint64_t window_started;
+      if (now_ns() - window_started >= 1000000000ull) {
+        window_started = now_ns();
+        memcpy(phase_shown, phase_peak, sizeof(phase_peak));
+        memset(phase_peak, 0, sizeof(phase_peak));
+        runs_shown = runs_peak;
+        runs_peak = 0;
+        fprintf(stderr,
+                "peak ms: ui %.2f  ass %.2f  composite %.2f (%u runs)  "
+                "upload %.2f  "
+                "draw %.2f\n",
+                phase_shown[PHASE_UI], phase_shown[PHASE_ASS],
+                phase_shown[PHASE_COMPOSITE], runs_shown,
+                phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
+      }
+      snprintf(line, sizeof(line), "ui   %6.2f ms", phase_shown[PHASE_UI]);
+      probe_overlay_line(&overlay, 4, line);
+      snprintf(line, sizeof(line), "ass  %6.2f ms", phase_shown[PHASE_ASS]);
+      probe_overlay_line(&overlay, 5, line);
+      snprintf(line, sizeof(line), "comp %6.2f ms %4u",
+               phase_shown[PHASE_COMPOSITE], runs_shown);
+      probe_overlay_line(&overlay, 6, line);
+      snprintf(line, sizeof(line), "up %5.2f gl %5.2f",
+               phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
+      probe_overlay_line(&overlay, 7, line);
+      memset(phase_frame, 0, sizeof(phase_frame));
+      glEnable(GL_BLEND);
+      probe_overlay_draw(&overlay);
+      probe_timer_end(&timer);
     }
 
-    jf_player_deinit();
-    jf_fetcher_deinit(&fetcher);
-    loom_destroy(&ctx);
-    jf_renderer_destroy(renderer);
-    jf_luna_deinit();
-    jf_window_deinit();
-    return 0;
+    if (script[0] != '\0' && step_script() && capture_path != NULL &&
+        capture_after == 0)
+      capture_after = SCRIPT_BEAT;
+    if (capture_after > 0 && --capture_after == 0)
+      capture_requested = true;
+    if (capture_requested) {
+      capture_frame(capture_path != NULL ? capture_path
+                                         : "jellyfin-capture.ppm");
+      capture_requested = false;
+      if (capture_path != NULL)
+        jf_window_running = false;
+    }
+    jf_window_swap();
+  }
+
+  jf_player_deinit();
+  jf_fetcher_deinit(&fetcher);
+  loom_destroy(&ctx);
+  jf_renderer_destroy(renderer);
+  jf_luna_deinit();
+  jf_window_deinit();
+  return 0;
 }

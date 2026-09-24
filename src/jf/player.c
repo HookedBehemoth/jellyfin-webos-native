@@ -34,6 +34,7 @@
 #include "clock.h"
 #include "demux.h"
 #include "packet_queue.h"
+#include "picsubs.h"
 #include "smp.h"
 #include "smp_payload.h"
 #include "smp_segment.h"
@@ -76,6 +77,10 @@ static atomic_int position_ms;
 static atomic_int stream_base_ms;
 static atomic_bool seek_pending;
 static int seek_to_ms;
+/* What the UI shows from a seek's request until playback reaches its target,
+ * -1 when none: a static seek resumes at the keyframe before the target, and
+ * the old position lingers until the new segment has a clock. */
+static atomic_int held_position = -1;
 
 static pthread_mutex_t segment_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* StarfishMediaAPIs is one C++ object; feeds and state changes must not enter it
@@ -95,26 +100,59 @@ static char uri[MAX_URI + 1];
 static char fallback[MAX_URI + 1];
 static int read_video = -1;
 static int read_audio = -1;
-/* Which subtitle stream the reader has open, and which the UI has asked for.
- * The reader owns the demuxer, so a selection made on the render thread is a
- * request it picks up between packets rather than a call into FFmpeg from
- * somewhere else. */
-static int read_subs = -1;
-static atomic_int wanted_subs = -1;
-/* Filled once, before the session reports JF_PLAYING, and read by the UI from
- * then on. */
-#define MAX_SUB_TRACKS 16
-static struct {
-  int stream;
-  char name[96];
-} sub_tracks[MAX_SUB_TRACKS];
-static atomic_int sub_track_count;
+/* Subtitle tracks, from the server's playback info. The UI selects; the
+ * reader decodes the selected track from the container when it can, and the
+ * loader thread fetches the server's whole copy of a text track. Each
+ * selection gets a serial, so either can tell when it has been overtaken. */
+#define MAX_SUB_TRACKS 32
+static pthread_mutex_t tracks_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t tracks_changed = PTHREAD_COND_INITIALIZER;
+static jf_player_track sub_tracks[MAX_SUB_TRACKS];
+static int sub_track_count;
+/* The two sources of the list: the server's, and the container's own streams,
+ * which catch a track the server's scan predates. */
+static jf_player_track server_tracks[MAX_SUB_TRACKS],
+    container_tracks[MAX_SUB_TRACKS];
+static int server_track_count, container_track_count;
+static int selected_track = -1;
+static uint64_t selection;
+/* The selection the reader last acted on. */
+static uint64_t read_selection;
+/* Every bitmap track, decoded all along; see picsubs.h. Set before the reader
+ * starts. */
+static bool bitmap_streams[JF_DEMUX_SUB_STREAMS];
+/* Every text track's decoder is open too, but only the selected one is
+ * decoded - except while the picker is up, when all are, so a switch finds the
+ * lines already running; see jf_subs_feed. */
+static bool text_streams[JF_DEMUX_SUB_STREAMS];
+static atomic_int read_text = -1;
+static atomic_bool previewing;
 static atomic_uint subtitle_lines_fed;
+/* Whether the source is the server's transcode, which carries no subtitles. */
+static atomic_bool source_transcoded;
+/* Where on the item's timeline the segment's zero is. */
+static atomic_llong timeline_origin_ms;
 static uint32_t frame_width = 1920, frame_height = 1080;
 /* The picture subtitles are laid out over, which the TV fits into the frame. */
 static int video_width = 1920, video_height = 1080;
 static double video_frame_ms;
 static int audio_rate = 48000;
+/* The original's audio streams, listed as the session opens it. A switch is a
+ * seek to where playback is with the other stream's decoder: the reader runs
+ * seconds ahead, so anything gentler plays the old language for that long. */
+#define MAX_AUDIO_TRACKS 16
+static struct {
+  int stream;
+  char name[96];
+} audio_tracks[MAX_AUDIO_TRACKS];
+static atomic_int audio_track_count;
+static atomic_int audio_track = -1;
+/* The one the session decodes; the session thread's own. */
+static int played_audio_track = -1;
+static atomic_int duration_ms;
+#define MAX_CHAPTERS 64
+static int chapter_ms[MAX_CHAPTERS];
+static atomic_int chapter_count;
 static const char *window_id = "";
 static atomic_uint transcode_sequence;
 
@@ -138,10 +176,34 @@ static void set_error(const char *message)
 
 jf_player_state jf_player_state_get(void) { return (jf_player_state)atomic_load(&playback_state); }
 const char *jf_player_error(void) { return error_text; }
-int jf_player_position(void) { return atomic_load(&position_ms); }
+/* The item's own clock, but a seek's target from its request until playback
+ * gets there, so the bar neither jumps back while the seek lands nor while the
+ * keyframe before the target plays. */
+int jf_player_position(void) {
+  if (atomic_load(&seek_pending))
+    return seek_to_ms;
+  int held = atomic_load(&held_position);
+  const int now = jf_player_subtitle_ms();
+  if (held >= 0) {
+    if (now < held)
+      return held;
+    atomic_compare_exchange_strong(&held_position, &held, -1);
+  }
+  return now >= 0 ? now : atomic_load(&position_ms);
+}
 bool jf_player_embedded(void) { return false; }
+#ifdef JF_HOST_VIDEO
+bool jf_player_needs_frame(void) { return smp_host_frame_due(); }
+void jf_player_render(uint32_t width, uint32_t height) {
+  smp_host_render(width, height);
+}
+#else
 bool jf_player_needs_frame(void) { return false; } /* Starfish presents independently. */
 void jf_player_render(uint32_t width, uint32_t height) { (void)width; (void)height; }
+#endif
+
+/* Monotonic milliseconds, matching the subtitle log's `t=`. */
+static long long timing_ms(void) { return (long long)(jf_now_ns() / 1000000); }
 
 static bool flowing(void)
 {
@@ -479,53 +541,150 @@ static void *audio_thread(void *unused)
     return NULL;
 }
 
-/* Hand one dialogue line to libass on the segment timeline the clock and both
- * feed threads use, so a subtitle lands with the frame and the sound it belongs
- * to. */
-static void subtitle_line(void *user, const char *ass_line, int64_t start_ms,
-                          int64_t duration_ms) {
-  (void)user;
-  int64_t start = start_ms - clock_pts_origin / 1000000LL;
-  if (start < 0) {
-    /* A line that straddles the start of a re-cut stream still has the rest of
-     * its time to run. */
-    duration_ms += start;
-    start = 0;
+/* The server's tracks, then any in the container it does not list; appended,
+ * so an index the UI already holds stays put. The server's embedded tracks are
+ * the container's in the same order, which is how they pair up: its indices
+ * count files beside the video first.
+ * ponytail: pairs with the container's decodable subtitle streams only, so an
+ * undecodable one ahead of the rest would shift them. tracks_lock held. */
+static void merge_tracks(void) {
+  sub_track_count = !jf_player_subtitles ? 0 : server_track_count;
+  memcpy(sub_tracks, server_tracks,
+         (size_t)sub_track_count * sizeof(*sub_tracks));
+  int paired = 0;
+  for (int j = 0; j < sub_track_count; j++) {
+    sub_tracks[j].stream = -1;
+    if (!sub_tracks[j].external && paired < container_track_count)
+      sub_tracks[j].stream = container_tracks[paired++].stream;
   }
-  if (duration_ms <= 0)
-    return;
-  const unsigned seen = atomic_fetch_add(&subtitle_lines_fed, 1);
-  if (seen == 0 || seen % 100 == 0)
-    fprintf(stderr, "Subtitle line #%u at %lldms for %lldms: %s\n", seen + 1,
-            (long long)start, (long long)duration_ms, ass_line);
-  jf_subs_feed(ass_line, (int)strlen(ass_line), start, duration_ms);
+  for (int i = paired; jf_player_subtitles && i < container_track_count &&
+                       sub_track_count < MAX_SUB_TRACKS;
+       i++)
+    sub_tracks[sub_track_count++] = container_tracks[i];
+  if (selected_track >= sub_track_count)
+    selected_track = -1;
 }
 
-/* Act on a track change requested from the UI. Reader thread only. */
+/* Hand one dialogue line to libass on the item's timeline, which for the
+ * container's own tracks is the container's. `user` is the stream. */
+static void subtitle_line(void *user, const char *ass_line, int64_t start_ms,
+                          int64_t duration_ms) {
+  if (atomic_fetch_add(&subtitle_lines_fed, 1) == 0)
+    fprintf(stderr, "t=%lld Subtitle line #1 at %lldms for %lldms: %s\n",
+            (long long)(jf_now_ns() / 1000000), (long long)start_ms,
+            (long long)duration_ms, ass_line);
+  jf_subs_feed(*(const int *)user, ass_line, (int)strlen(ass_line), start_ms,
+               duration_ms);
+}
+
+static void subtitle_picture(void *user, int64_t start_ms, int64_t duration_ms,
+                             int x, int y, int w, int h, int stream,
+                             int canvas_w, int canvas_h, uint8_t *rgba) {
+  (void)user;
+  jf_picsubs_feed(start_ms, duration_ms, x, y, w, h, stream, canvas_w, canvas_h,
+                  rgba);
+}
+
+/* The bitmap track to draw, straight from whoever changed the selection: its
+ * pictures are already being decoded, so this needs neither the reader - which
+ * sits blocked while paused - nor the loader. tracks_lock held. */
+static void select_pictures(void) {
+  const jf_player_track *track =
+      selected_track >= 0 ? &sub_tracks[selected_track] : NULL;
+  jf_picsubs_select(track != NULL && !track->text && track->stream >= 0 &&
+                            !atomic_load(&source_transcoded)
+                        ? track->stream
+                        : -1);
+}
+
+/* Act on a track change requested from the UI: decode a text track from the
+ * container if it is in there, as the immediate source until the loader has
+ * the server's copy. Reader thread only. */
 static void apply_subtitle_track(void *demux) {
-  const int wanted = atomic_load(&wanted_subs);
-  if (wanted == read_subs)
+  pthread_mutex_lock(&tracks_lock);
+  const uint64_t wanted = selection;
+  const int track = selected_track;
+  const jf_player_track chosen =
+      track >= 0 ? sub_tracks[track] : (jf_player_track){0};
+  pthread_mutex_unlock(&tracks_lock);
+  if (wanted == read_selection)
     return;
-  read_subs = wanted;
-  jf_subs_close();
-  jf_demux_subtitle_stop(demux);
-  if (wanted < 0) {
-    fprintf(stderr, "Subtitles off\n");
+  read_selection = wanted;
+  atomic_store(&read_text, -1);
+  if (track < 0 || !chosen.text || chosen.stream < 0 ||
+      chosen.stream >= JF_DEMUX_SUB_STREAMS || !text_streams[chosen.stream] ||
+      atomic_load(&source_transcoded))
     return;
-  }
+  /* Reopening only restarts a text decoder, which keeps no state between
+   * packets, and is what hands back its header. */
   const char *header = NULL;
-  int header_size = 0;
-  if (!jf_demux_subtitle_open(demux, wanted, &header, &header_size) ||
-      !jf_subs_open(header, header_size, (int)frame_width, (int)frame_height,
-                    video_width, video_height, video_frame_ms)) {
-    fprintf(stderr, "Subtitles: stream %d could not be opened\n", wanted);
-    jf_demux_subtitle_stop(demux);
-    read_subs = -1;
-    atomic_store(&wanted_subs, -1);
+  int header_size = 0, canvas_w = 0, canvas_h = 0;
+  if (jf_demux_subtitle_open(demux, chosen.stream, &header, &header_size,
+                             &canvas_w, &canvas_h) != 1 ||
+      !jf_subs_open(wanted, chosen.stream, header, header_size)) {
+    fprintf(stderr, "Subtitles: stream %d is not a text track\n",
+            chosen.stream);
     return;
   }
-  fprintf(stderr, "Subtitles on: stream %d, %d bytes of header\n", wanted,
-          header_size);
+  atomic_store(&read_text, chosen.stream);
+  /* The UI only polls subtitles while some are open, and may be asleep until
+   * its next deadline - seconds off when the controls are up. */
+  jf_window_wake();
+  fprintf(stderr, "t=%lld Subtitles: decoding stream %d (server's %d)\n",
+          (long long)(jf_now_ns() / 1000000), chosen.stream, chosen.index);
+}
+
+/* Fetches the server's copy of each selected text track: every line, so a seek
+ * or a switch finds the ones already running, and the only source there is
+ * for a file beside the video or a transcode. */
+static int fetch_cancelled(void *serial) {
+  pthread_mutex_lock(&tracks_lock);
+  const bool stale = selection != *(const uint64_t *)serial;
+  pthread_mutex_unlock(&tracks_lock);
+  return stale || !atomic_load(&running);
+}
+
+static void *subtitle_loader(void *unused) {
+  (void)unused;
+  uint64_t done = 0;
+  pthread_mutex_lock(&tracks_lock);
+  while (atomic_load(&running)) {
+    if (selection == done) {
+      pthread_cond_wait(&tracks_changed, &tracks_lock);
+      continue;
+    }
+    uint64_t serial = done = selection;
+    const int track = selected_track;
+    const jf_player_track chosen =
+        track >= 0 ? sub_tracks[track] : (jf_player_track){0};
+    pthread_mutex_unlock(&tracks_lock);
+
+    if (track < 0 || !chosen.text || chosen.url[0] == '\0') {
+      jf_subs_close(serial);
+    } else {
+      char *data = NULL;
+      size_t size = 0;
+      const int64_t started = jf_now_ns();
+      if (jf_demux_fetch(chosen.url, &data, &size, fetch_cancelled, &serial)) {
+        const int64_t fetched = jf_now_ns();
+        const bool ok = jf_subs_open_file(serial, data, size);
+        jf_window_wake();
+        fprintf(
+            stderr,
+            "t=%lld Subtitles: stream %d from the server, %zu bytes in %d ms, "
+            "parsed in %d ms%s\n",
+            (long long)(jf_now_ns() / 1000000), chosen.index, size,
+            ns_to_ms(fetched - started), ns_to_ms(jf_now_ns() - fetched),
+            ok ? "" : " - not used");
+      } else if (!fetch_cancelled(&serial)) {
+        fprintf(stderr, "Subtitles: the server has no copy of stream %d\n",
+                chosen.index);
+      }
+    }
+    pthread_mutex_lock(&tracks_lock);
+  }
+  pthread_mutex_unlock(&tracks_lock);
+  return NULL;
 }
 
 /* Demux ahead of playback, decoding audio on the way, until a queue is full. */
@@ -537,18 +696,14 @@ static void *reader_thread(void *demux)
     int64_t pts = 0;
     while (flowing() && jf_demux_next(demux, &packet, &size, &stream, &pts)) {
       apply_subtitle_track(demux);
-      if (stream == read_subs && read_subs >= 0) {
-        /* Straight to libass rather than through a queue: the events carry
-         * their own timeline and the renderer picks from it by time.
-         *
-         * Not before the origin is known, though. It is set below, by the first
-         * video or audio packet, and rebasing against a zero origin would place
-         * the line at its absolute container time - half an hour out, on a
-         * resume. A subtitle ahead of the segment's first frame is already
-         * partly in the past; dropping it costs one line at the start of a
-         * segment. */
-        if (atomic_load(&clock_origin_ready))
-          jf_demux_subtitle_decode(demux, subtitle_line, NULL);
+      if (stream >= 0 && stream < JF_DEMUX_SUB_STREAMS &&
+          (bitmap_streams[stream] ||
+           (text_streams[stream] &&
+            (stream == atomic_load(&read_text) || atomic_load(&previewing))))) {
+        /* Straight to the renderer rather than through a queue: the events
+         * carry their own times, on the container's timeline. */
+        jf_demux_subtitle_decode(demux, subtitle_line, subtitle_picture,
+                                 &stream);
         continue;
       }
         if ((stream != read_video && stream != read_audio) || size <= 0)
@@ -565,6 +720,12 @@ static void *reader_thread(void *demux)
         }
         if (!atomic_load(&clock_origin_ready)) {
             clock_pts_origin = pts;
+            /* A transcode is numbered from where it was cut; the container's
+             * own timeline is the item's. */
+            atomic_store(&timeline_origin_ms,
+                         atomic_load(&source_transcoded)
+                             ? (long long)atomic_load(&stream_base_ms)
+                             : (long long)(pts / 1000000LL));
             atomic_store(&clock_origin_ready, true);
         }
         /* Both buffers belong to the demuxer and die on the next read. */
@@ -607,8 +768,11 @@ static void run_segment(void *demux)
         const int64_t pts = pace(chunk.pts, VIDEO_FEED_AHEAD_NS);
         const bool fed = feed_retrying(chunk.bytes, (size_t)chunk.size, pts);
         if (atomic_exchange(&first_video_feed, false))
-            fprintf(stderr, "Starfish first video feed: raw=%.3fs pts=%.3fs bytes=%d\n",
-                    (double)chunk.pts / 1e9, (double)pts / 1e9, chunk.size);
+          fprintf(stderr,
+                  "t=%lld Starfish first video feed: raw=%.3fs pts=%.3fs "
+                  "bytes=%d\n",
+                  timing_ms(), (double)chunk.pts / 1e9, (double)pts / 1e9,
+                  chunk.size);
         free(chunk.bytes);
         if (!fed) {
             if (flowing())
@@ -647,6 +811,25 @@ static void play_session_id(char *out, size_t out_len)
              (unsigned long long)((stamp ^ ((uint64_t)sequence << 32)) & 0x0000ffffffffffffULL));
 }
 
+/* The transcode's audio, by the server's number for the chosen stream. The
+ * server numbers files beside the video first; the subtitle list says how many.
+ * ponytail: an audio file beside the video would shift it too, and is not
+ * counted - PlaybackInfo's audio streams would say. */
+static const char *audio_parameter(void) {
+  static char parameter[40];
+  parameter[0] = '\0';
+  if (played_audio_track < 0)
+    return parameter;
+  int external = 0;
+  pthread_mutex_lock(&tracks_lock);
+  for (int i = 0; i < server_track_count; i++)
+    external += server_tracks[i].external;
+  pthread_mutex_unlock(&tracks_lock);
+  snprintf(parameter, sizeof(parameter), "&AudioStreamIndex=%d",
+           audio_tracks[played_audio_track].stream + external);
+  return parameter;
+}
+
 static bool open_audio_stream(void *demux, int index)
 {
     int rate = 0;
@@ -670,8 +853,9 @@ static bool reopen_at(void *demux, int target_ms, bool transcoded)
          * case-insensitive, but older Jellyfin servers route the lower-case spelling
          * through the opaque stream-options map instead of binding it to
          * VideoRequestDto.StartTimeTicks. */
-        written = snprintf(url, sizeof(url), "%s&PlaySessionId=%s&StartTimeTicks=%lld",
-                           fallback, id, (long long)target_ms * 10000LL);
+        written = snprintf(
+            url, sizeof(url), "%s&PlaySessionId=%s&StartTimeTicks=%lld%s",
+            fallback, id, (long long)target_ms * 10000LL, audio_parameter());
     else
         written = snprintf(url, sizeof(url), "%s&StartTimeTicks=%lld", uri,
                            (long long)target_ms * 10000LL);
@@ -687,6 +871,9 @@ static bool reopen_at(void *demux, int target_ms, bool transcoded)
     /* A re-cut stream is a new stream, and nothing promises it numbers its tracks the way
      * the last one did. */
     const bool had_audio = read_audio >= 0;
+    const int wanted_audio = !transcoded && played_audio_track >= 0
+                                 ? audio_tracks[played_audio_track].stream
+                                 : -1;
     read_video = -1;
     read_audio = -1;
     const int count = jf_demux_stream_count(demux);
@@ -696,14 +883,19 @@ static bool reopen_at(void *demux, int target_ms, bool transcoded)
             continue;
         if (read_video < 0 && kind == 0 && codec != 0)
             read_video = i;
-        if (read_audio < 0 && kind == 1 && had_audio)
-            read_audio = i;
+        if (kind == 1 && had_audio && (read_audio < 0 || i == wanted_audio))
+          read_audio = i;
     }
     if (read_video < 0)
         return false;
-    /* The subtitle track is re-opened by the reader, which sees the request as
-     * a change because the decoder went with the old source. */
-    read_subs = -1;
+    /* The subtitle decoders went with the old source. */
+    for (int i = 0; i < JF_DEMUX_SUB_STREAMS; i++) {
+      const char *header = NULL;
+      int header_size = 0, canvas_w = 0, canvas_h = 0;
+      if (bitmap_streams[i] || text_streams[i])
+        jf_demux_subtitle_open(demux, i, &header, &header_size, &canvas_w,
+                               &canvas_h);
+    }
     jf_demux_video_open(demux, read_video);
     /* The decoder went with the old source. */
     if (read_audio >= 0 && !open_audio_stream(demux, read_audio))
@@ -715,13 +907,26 @@ static bool reopen_at(void *demux, int target_ms, bool transcoded)
  * reader and both feed threads are already joined and the queues and clock are ours. */
 static void seek_to(void *demux, int target_ms, bool transcoded)
 {
-    /* The source timestamps are rebased to zero for every segment. */
+  /* The source timestamps are rebased to zero for every segment. Nothing fed
+   * since the segment began - a resume, straight after the load - means
+   * nothing to flush, and a flush that early is worse than none: an H.265
+   * pipeline still connecting its sink refuses it and then rejects every
+   * feed. */
+  if (atomic_load(&fed_video_ms) >= 0) {
     pipeline_pause();
     if (!pipeline_flush(0))
-        fprintf(stderr, "SMP flush refused\n");
+      fprintf(stderr, "SMP flush refused\n");
     if (!pipeline_begin_segment(0))
-        fprintf(stderr, "SMP segment restart refused: %s\n", jf_starfish_segment_error());
+      fprintf(stderr, "SMP segment restart refused: %s\n",
+              jf_starfish_segment_error());
+  }
     jf_audio_flush();
+    const int wanted_audio = atomic_load(&audio_track);
+    const bool switch_audio = wanted_audio >= 0 &&
+                              wanted_audio != played_audio_track &&
+                              read_audio >= 0;
+    if (switch_audio)
+      played_audio_track = wanted_audio;
 
     /* A live transcode has no byte ranges. av_seek_frame nevertheless reports success for
      * it, but positions FFmpeg at byte zero; always ask Jellyfin to create a new segment
@@ -738,7 +943,13 @@ static void seek_to(void *demux, int target_ms, bool transcoded)
         atomic_store(&running, false);
         return;
     }
-    jf_subs_flush();
+    /* A reopen chose the stream itself; a seek in place keeps the decoder. The
+     * output format is fixed, so ALSA stays as it is. */
+    int rate = 0;
+    if (switch_audio && !transcoded &&
+        read_audio != audio_tracks[wanted_audio].stream &&
+        jf_demux_audio_open(demux, audio_tracks[wanted_audio].stream, &rate))
+      read_audio = audio_tracks[wanted_audio].stream;
     atomic_store(&stream_base_ms, target_ms);
     /* The first packet after the seek re-anchors the timeline. */
     atomic_store(&clock_origin_ready, false);
@@ -752,16 +963,41 @@ static void *session(void *unused)
 {
     (void)unused;
     void *demux = NULL;
+    pthread_t loader;
+    bool have_loader = false;
 
     if (!smp_open()) {
         set_error(smp_shim_error());
         goto done;
     }
+    fprintf(stderr, "t=%lld session: opening the source\n", timing_ms());
     demux = jf_demux_open(uri);
+    fprintf(stderr, "t=%lld session: source open\n", timing_ms());
     if (demux == NULL) {
         set_error("FFmpeg could not open the Jellyfin stream");
         goto done;
     }
+
+    /* From the original, which a transcode would hide: its length, chapters and
+     * every audio stream. */
+    atomic_store(&duration_ms, jf_demux_duration_ms(demux));
+    atomic_store(&chapter_count,
+                 jf_demux_chapters(demux, chapter_ms, MAX_CHAPTERS));
+    int audio_count = 0;
+    for (int i = 0;
+         i < jf_demux_stream_count(demux) && audio_count < MAX_AUDIO_TRACKS;
+         i++) {
+      int kind = 0, candidate = 0, w = 0, h = 0;
+      if (!jf_demux_stream(demux, i, &kind, &candidate, &w, &h) || kind != 1)
+        continue;
+      audio_tracks[audio_count].stream = i;
+      jf_demux_stream_name(demux, i, audio_tracks[audio_count].name,
+                           (int)sizeof(audio_tracks[audio_count].name));
+      audio_count++;
+    }
+    played_audio_track = audio_count > 0 && jf_player_audio ? 0 : -1;
+    atomic_store(&audio_track, played_audio_track);
+    atomic_store(&audio_track_count, played_audio_track >= 0 ? audio_count : 0);
 
     /* Before anything is read: a 10-bit or above-High source will never decode, so swap to
      * the transcode URL while the demuxer is still fresh and let the discovery below run
@@ -787,7 +1023,7 @@ static void *session(void *unused)
     }
 
     int video_stream = -1, audio_stream = -1, codec = 0, width = 0, height = 0;
-    int subtitle_count = 0;
+    int subtitle_streams = 0;
     const int count = jf_demux_stream_count(demux);
     for (int i = 0; i < count; i++) {
         int kind = 0, candidate = 0, w = 0, h = 0;
@@ -802,40 +1038,36 @@ static void *session(void *unused)
         }
         if (audio_stream < 0 && kind == 1)
             audio_stream = i;
-        /* AVMEDIA_TYPE_SUBTITLE. Bitmap tracks are filtered out by the open
-         * below, but listing them and failing on selection is worse than not
-         * offering them. */
-        if (kind == 3 && subtitle_count < MAX_SUB_TRACKS) {
-          const char *header = NULL;
-          int header_size = 0;
-          if (jf_demux_subtitle_open(demux, i, &header, &header_size)) {
-            sub_tracks[subtitle_count].stream = i;
-            jf_demux_stream_name(demux, i, sub_tracks[subtitle_count].name,
-                                 (int)sizeof(sub_tracks[subtitle_count].name));
-            subtitle_count++;
-          }
+        if (kind != 3) /* AVMEDIA_TYPE_SUBTITLE */
+          continue;
+        subtitle_streams++;
+        const char *header = NULL;
+        int header_size = 0, canvas_w = 0, canvas_h = 0;
+        const int decodable = jf_demux_subtitle_open(
+            demux, i, &header, &header_size, &canvas_w, &canvas_h);
+        /* Every decoder stays open for the whole session. */
+        if (decodable == 2 && i < JF_DEMUX_SUB_STREAMS)
+          bitmap_streams[i] = true;
+        else if (decodable == 1 && i < JF_DEMUX_SUB_STREAMS)
+          text_streams[i] = true;
+        else
+          jf_demux_subtitle_stop(demux, i);
+        if (decodable != 0 && container_track_count < MAX_SUB_TRACKS) {
+          jf_player_track *track = &container_tracks[container_track_count++];
+          *track = (jf_player_track){i, false, decodable == 1, "", "", i};
+          jf_demux_stream_name(demux, i, track->name, (int)sizeof(track->name));
         }
     }
-    jf_demux_subtitle_stop(demux);
-    atomic_store(&sub_track_count, subtitle_count);
-    for (int i = 0; i < subtitle_count; i++)
-      fprintf(stderr, "Jellyfin subtitle track %d: stream %d, %s\n", i,
-              sub_tracks[i].stream, sub_tracks[i].name);
-    /* Off keeps the reader off the subtitle path entirely, which is the A/B
-     * test when playback itself misbehaves. */
-    if (!jf_player_subtitles) {
-      atomic_store(&sub_track_count, 0);
-      subtitle_count = 0;
-    }
-    /* On by default when the container has one, which is what every other
-     * player does; the Subtitles button cycles through the rest and back to
-     * off. */
-    if (subtitle_count > 0)
-      atomic_store(&wanted_subs, sub_tracks[0].stream);
+    atomic_store(&source_transcoded, transcoded);
+    pthread_mutex_lock(&tracks_lock);
+    merge_tracks();
+    pthread_mutex_unlock(&tracks_lock);
     /* Typeset tracks name the fonts the release attached; without them every
      * style falls back to the one default face, at its own metrics. */
+    const long long fonts_from = timing_ms();
     int font_count = 0;
-    for (int i = 0; subtitle_count > 0 && i < count; i++) {
+    for (int i = 0; subtitle_streams > 0 && jf_player_subtitles && i < count;
+         i++) {
       const char *name = NULL;
       const uint8_t *data = NULL;
       int size = 0;
@@ -845,8 +1077,10 @@ static void *session(void *unused)
       }
     }
     if (font_count > 0)
-      fprintf(stderr, "Jellyfin subtitles: %d attached font(s)\n", font_count);
-    fprintf(stderr, "Jellyfin subtitles: %d text track(s)\n", subtitle_count);
+      fprintf(
+          stderr,
+          "t=%lld Jellyfin subtitles: %d attached font(s) added in %lld ms\n",
+          timing_ms(), font_count, timing_ms() - fonts_from);
     if (!jf_player_audio)
       audio_stream = -1;
     if (video_stream < 0 || width <= 0 || height <= 0) {
@@ -867,6 +1101,13 @@ static void *session(void *unused)
     jf_demux_video_fps(demux, video_stream, &fps_num, &fps_den);
     video_frame_ms =
         fps_num > 0 && fps_den > 0 ? 1000.0 * fps_den / fps_num : 0;
+    jf_subs_geometry((int)frame_width, (int)frame_height, video_width,
+                     video_height, video_frame_ms);
+    jf_picsubs_open((int)frame_width, (int)frame_height, video_width,
+                    video_height);
+    pthread_mutex_lock(&tracks_lock);
+    select_pictures();
+    pthread_mutex_unlock(&tracks_lock);
 
     static const char *const codec_names[] = {"", "H264", "H265", "VP9", "AV1"};
     smp_video_params params = {APP_ID, window_id, codec_names[codec], width, height,
@@ -903,9 +1144,11 @@ static void *session(void *unused)
         set_error("Starfish could not establish the initial media segment");
         goto done;
     }
-    fprintf(stderr, "Starfish segment established at 0ns\n");
+    fprintf(stderr, "t=%lld Starfish segment established at 0ns\n",
+            timing_ms());
     reset_segment_timeline();
     set_state(JF_PLAYING);
+    have_loader = pthread_create(&loader, NULL, subtitle_loader, NULL) == 0;
 
     while (atomic_load(&running)) {
         pthread_mutex_lock(&segment_mutex);
@@ -917,6 +1160,10 @@ static void *session(void *unused)
          * slow reopen stays pending for the next iteration. */
         if (atomic_exchange(&seek_pending, false)) {
             const int target = seek_to_ms;
+            /* The reader is joined, so nothing reads the old segment's clock
+             * after this: the position holds at the target until the new one
+             * has its own. */
+            atomic_store(&clock_origin_ready, false);
             pthread_mutex_unlock(&segment_mutex);
             seek_to(demux, target, transcoded);
             continue;
@@ -935,11 +1182,15 @@ static void *session(void *unused)
 done:
     atomic_store(&running, false);
     atomic_store(&segment_flowing, false);
+    if (have_loader) {
+      pthread_mutex_lock(&tracks_lock);
+      pthread_cond_broadcast(&tracks_changed);
+      pthread_mutex_unlock(&tracks_lock);
+      pthread_join(loader, NULL);
+    }
     jf_audio_close();
     jf_subs_release();
-    atomic_store(&sub_track_count, 0);
-    atomic_store(&wanted_subs, -1);
-    read_subs = -1;
+    jf_picsubs_close();
     if (demux != NULL)
         jf_demux_close(demux);
     smp_unload();
@@ -971,10 +1222,21 @@ bool jf_player_play(const char *stream_uri, const char *transcode_uri,
 
     frame_width = width;
     frame_height = height;
-    atomic_store(&sub_track_count, 0);
-    atomic_store(&wanted_subs, -1);
+    pthread_mutex_lock(&tracks_lock);
+    sub_track_count = server_track_count = container_track_count = 0;
+    selected_track = -1;
+    selection++;
+    pthread_mutex_unlock(&tracks_lock);
     atomic_store(&subtitle_lines_fed, 0);
-    read_subs = -1;
+    read_selection = 0;
+    memset(bitmap_streams, 0, sizeof(bitmap_streams));
+    memset(text_streams, 0, sizeof(text_streams));
+    atomic_store(&read_text, -1);
+    atomic_store(&previewing, false);
+    atomic_store(&audio_track_count, 0);
+    atomic_store(&audio_track, -1);
+    atomic_store(&duration_ms, 0);
+    atomic_store(&chapter_count, 0);
 
     const int rect[4] = {0, 0, (int)width, (int)height};
     window_id = jf_window_export_video(rect, rect);
@@ -994,6 +1256,7 @@ bool jf_player_play(const char *stream_uri, const char *transcode_uri,
     atomic_store(&paused, false);
     seek_to_ms = start_position_ms > 0 ? start_position_ms : 0;
     atomic_store(&seek_pending, seek_to_ms > 0);
+    atomic_store(&held_position, seek_to_ms > 0 ? seek_to_ms : -1);
     atomic_store(&position_ms, seek_to_ms);
     atomic_store(&stream_base_ms, seek_to_ms);
     atomic_store(&running, true);
@@ -1024,16 +1287,57 @@ void jf_player_resume(void)
         maybe_start_pipeline();
 }
 
+static void request_seek_locked(int target) {
+  const int duration = atomic_load(&duration_ms);
+  if (duration > 0 && target > duration - 1000)
+    target = duration - 1000;
+  seek_to_ms = target < 0 ? 0 : target;
+  atomic_store(&held_position, seek_to_ms);
+  atomic_store(&seek_pending, true);
+  interrupt_segment_locked();
+}
+
 void jf_player_seek(int delta_seconds)
 {
     pthread_mutex_lock(&segment_mutex);
-    if (atomic_load(&running)) {
-        int target = atomic_load(&position_ms) + delta_seconds * 1000;
-        seek_to_ms = target < 0 ? 0 : target;
-        atomic_store(&seek_pending, true);
-        interrupt_segment_locked();
-    }
+    /* Presses faster than the seek lands add up rather than repeat. */
+    if (atomic_load(&running))
+      request_seek_locked(jf_player_position() + delta_seconds * 1000);
     pthread_mutex_unlock(&segment_mutex);
+}
+
+void jf_player_seek_to(int target_ms) {
+  pthread_mutex_lock(&segment_mutex);
+  if (atomic_load(&running))
+    request_seek_locked(target_ms);
+  pthread_mutex_unlock(&segment_mutex);
+}
+
+int jf_player_duration(void) { return atomic_load(&duration_ms); }
+
+int jf_player_chapters(const int **starts_ms) {
+  *starts_ms = chapter_ms;
+  return atomic_load(&chapter_count);
+}
+
+int jf_player_audio_count(void) { return atomic_load(&audio_track_count); }
+
+const char *jf_player_audio_name(int track) {
+  return track >= 0 && track < atomic_load(&audio_track_count)
+             ? audio_tracks[track].name
+             : "";
+}
+
+int jf_player_audio_current(void) { return atomic_load(&audio_track); }
+
+void jf_player_audio_select(int track) {
+  if (track < 0 || track >= atomic_load(&audio_track_count) ||
+      atomic_exchange(&audio_track, track) == track)
+    return;
+  pthread_mutex_lock(&segment_mutex);
+  if (atomic_load(&running))
+    request_seek_locked(jf_player_position());
+  pthread_mutex_unlock(&segment_mutex);
 }
 
 void jf_player_stop(void)
@@ -1043,34 +1347,66 @@ void jf_player_stop(void)
     set_state(JF_IDLE);
 }
 
-int jf_player_subtitle_count(void) { return atomic_load(&sub_track_count); }
+void jf_player_subtitle_tracks(const jf_player_track *tracks, int count,
+                               int selected) {
+  pthread_mutex_lock(&tracks_lock);
+  server_track_count = count < MAX_SUB_TRACKS ? count : MAX_SUB_TRACKS;
+  memcpy(server_tracks, tracks, (size_t)server_track_count * sizeof(*tracks));
+  /* Empty when subtitles are turned off in the settings: the A/B test for
+   * playback itself misbehaving. */
+  selected_track = selected;
+  merge_tracks();
+  select_pictures();
+  selection++;
+  pthread_cond_broadcast(&tracks_changed);
+  pthread_mutex_unlock(&tracks_lock);
+}
 
+int jf_player_subtitle_count(void) {
+  pthread_mutex_lock(&tracks_lock);
+  const int count = sub_track_count;
+  pthread_mutex_unlock(&tracks_lock);
+  return count;
+}
+
+/* Unlocked, for the UI to draw from: the server's list is set on the UI
+ * thread, and the container's merge only rewrites an entry with the same bytes
+ * or appends past the count the UI last saw. */
 const char *jf_player_subtitle_name(int track) {
-  if (track < 0 || track >= atomic_load(&sub_track_count))
-    return "";
-  return sub_tracks[track].name;
+  return track >= 0 && track < sub_track_count ? sub_tracks[track].name : "";
+}
+
+int jf_player_subtitle_stream(int track) {
+  return track >= 0 && track < sub_track_count ? sub_tracks[track].index : -1;
 }
 
 int jf_player_subtitle_current(void) {
-  const int stream = atomic_load(&wanted_subs);
-  const int count = atomic_load(&sub_track_count);
-  for (int i = 0; i < count; i++)
-    if (sub_tracks[i].stream == stream)
-      return i;
-  return -1;
+  pthread_mutex_lock(&tracks_lock);
+  const int track = selected_track;
+  pthread_mutex_unlock(&tracks_lock);
+  return track;
 }
 
 void jf_player_subtitle_select(int track) {
-  const int count = atomic_load(&sub_track_count);
-  atomic_store(&wanted_subs,
-               track >= 0 && track < count ? sub_tracks[track].stream : -1);
-  /* Nothing else to do: the reader applies it between packets, and the overlay
-   * is cleared by the close that follows. */
+  pthread_mutex_lock(&tracks_lock);
+  const int chosen = track >= 0 && track < sub_track_count ? track : -1;
+  if (chosen != selected_track) {
+    selected_track = chosen;
+    select_pictures();
+    selection++;
+    pthread_cond_broadcast(&tracks_changed);
+  }
+  pthread_mutex_unlock(&tracks_lock);
+  /* Nothing else to do: the reader and the loader pick it up. */
 }
 
-int jf_player_media_ms(void) {
+void jf_player_subtitle_preview(bool on) { atomic_store(&previewing, on); }
+
+int jf_player_subtitle_ms(void) {
   const int64_t pts = jf_clock_pts();
-  return pts == JF_CLOCK_NONE ? -1 : (int)(pts / 1000000LL);
+  if (pts == JF_CLOCK_NONE || !atomic_load(&clock_origin_ready))
+    return -1;
+  return (int)(atomic_load(&timeline_origin_ms) + pts / 1000000LL);
 }
 
 void jf_player_deinit(void)
