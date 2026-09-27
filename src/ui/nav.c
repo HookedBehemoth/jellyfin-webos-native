@@ -198,8 +198,12 @@ static void scroll_to(nav *ui, nav_state *state, float target) {
   state->from = state->value;
   state->target = target;
   state->started_at = animate ? ui->now : 0;
-  if (!animate)
+  /* This frame was laid out at the old offset: without an animation to keep
+   * frames coming, ask for the one that shows the new offset. */
+  if (!animate) {
     state->value = target;
+    ui->acted = true;
+  }
 }
 
 static float scroll_limit(const nav_scroll_frame *scroll) {
