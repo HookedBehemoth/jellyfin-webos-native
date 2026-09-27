@@ -2,6 +2,7 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include <hb-ft.h>
 
 #include <math.h>
 #include <stddef.h>
@@ -10,15 +11,17 @@
 #include <string.h>
 
 #include "../platform/os.h"
+#include "font_index.h"
+#include "msdf.h"
 
-#define GUTTER 1
-#define MAX_FACES 8
+#define MAX_FACES 32
 #define TABLE_CAPACITY                                                         \
-  4096 /* power of two; ~2k glyphs before it is half full */
+  16384 /* power of two; ~8k glyphs, a CJK track, at half full */
 
-/* Open addressing keyed by codepoint. A miss is cached too - an unsupported
- * character must not be re-rasterised every frame - so entries carry `found`.
- */
+/* Open addressing keyed by codepoint, or for shaped text by face and glyph
+ * index (GLYPH_KEY). A miss is cached too - an unsupported character must not
+ * be re-rasterised every frame - so entries carry `found`. */
+#define GLYPH_KEY(face, index) (0x80000000u | (uint32_t)(face) << 20 | (index))
 typedef struct {
   uint32_t codepoint;
   bool occupied;
@@ -29,8 +32,11 @@ typedef struct {
 struct jf_atlas {
   FT_Library library;
   FT_Face faces[MAX_FACES];
+  const char *face_paths[MAX_FACES];
+  hb_font_t *shapers[MAX_FACES]; /* made on first use */
   size_t face_count;
-  bool fallbacks_loaded;
+  /* Distance-field scratch, rewound after every glyph. */
+  jf_arena scratch;
   const char *primary_path;
   skyline packer;
   uint16_t max_size;
@@ -80,26 +86,14 @@ static bool add_face(jf_atlas *atlas, const char *path) {
   FT_Face face;
   if (FT_New_Face(atlas->library, path, 0, &face) != 0)
     return false;
-  if (FT_Set_Pixel_Sizes(face, 0, (FT_UInt)JF_ATLAS_BASE_PX) != 0) {
+  if (FT_Set_Pixel_Sizes(face, 0, (FT_UInt)JF_ATLAS_BASE_PX) != 0 ||
+      !FT_IS_SCALABLE(face)) {
     FT_Done_Face(face);
     return false;
   }
+  atlas->face_paths[atlas->face_count] = path;
   atlas->faces[atlas->face_count++] = face;
   return true;
-}
-
-static void load_fallbacks(jf_atlas *atlas) {
-  if (atlas->fallbacks_loaded)
-    return;
-  atlas->fallbacks_loaded = true;
-  size_t count = 0;
-  const char *const *paths = jf_os_font_fallbacks(&count);
-  for (size_t i = 0; i < count; i++) {
-    if (atlas->primary_path != NULL &&
-        strcmp(paths[i], atlas->primary_path) == 0)
-      continue;
-    add_face(atlas, paths[i]);
-  }
 }
 
 /* -------------------------------------------------------------- glyph cache */
@@ -115,65 +109,58 @@ static entry *slot_for(jf_atlas *atlas, uint32_t codepoint) {
   return NULL;
 }
 
-/* Pack one coverage bitmap into the atlas. */
-static bool pack(jf_atlas *atlas, const uint8_t *bitmap, unsigned width,
-                 unsigned height, int pitch, float advance, float off_x,
-                 float off_y, jf_glyph *out) {
+/* Pack one RGBA field into the atlas. */
+static bool pack(jf_atlas *atlas, const uint8_t *rgba, unsigned width,
+                 unsigned height, float advance, float off_x, float off_y,
+                 jf_glyph *out) {
   if (width == 0 ||
       height == 0) { /* space and friends: real advance, no pixels */
     *out = (jf_glyph){{0, 0, 0, 0}, advance, 0, 0};
     return true;
   }
 
-  const uint16_t padded_w = (uint16_t)(width + 2 * GUTTER);
-  const uint16_t padded_h = (uint16_t)(height + 2 * GUTTER);
-  /* A transparent gutter, not the edge-replicated one an MSDF needs: these are
-   * coverage values, so bilinear sampling at a glyph's edge must fall to zero
-   * rather than smear whichever neighbour got packed next to it. */
-  uint8_t *padded = calloc((size_t)padded_w * padded_h, 1);
-  if (padded == NULL)
-    return false;
-  for (unsigned row = 0; row < height; row++)
-    memcpy(padded + ((size_t)(row + GUTTER) * padded_w + GUTTER),
-           bitmap + (ptrdiff_t)row * pitch, width);
-
+  /* The field already fades to "far outside" at its border, so the gutter
+   * the packer leaves - zero, the same thing - is all the padding it needs. */
   skyline_region region;
-  while (!skyline_alloc(&atlas->packer, padded_w, padded_h, &region)) {
-    if (atlas->packer.size >= atlas->max_size) {
-      free(padded);
+  while (!skyline_alloc(&atlas->packer, (uint16_t)width, (uint16_t)height,
+                        &region)) {
+    if (atlas->packer.size >= atlas->max_size)
       return false;
-    }
     const uint32_t doubled = (uint32_t)atlas->packer.size * 2;
     const uint16_t next =
         doubled < atlas->max_size ? (uint16_t)doubled : atlas->max_size;
-    if (!skyline_enlarge(&atlas->packer, next)) {
-      free(padded);
+    if (!skyline_enlarge(&atlas->packer, next))
       return false;
-    }
   }
-  skyline_blit(&atlas->packer, region, padded, padded_w);
-  free(padded);
-
-  region.x = (uint16_t)(region.x + GUTTER);
-  region.y = (uint16_t)(region.y + GUTTER);
-  region.w = (uint16_t)(region.w - 2 * GUTTER);
-  region.h = (uint16_t)(region.h - 2 * GUTTER);
+  skyline_blit(&atlas->packer, region, rgba, (size_t)width * SKYLINE_BPP);
   *out = (jf_glyph){region, advance, off_x, off_y};
   return true;
 }
 
-/* Rasterise one codepoint from one face into the atlas. */
+/* One codepoint's field from one face into the atlas. Unhinted, since it is
+ * drawn at every size but this one. */
+static bool rasterise_index(jf_atlas *atlas, FT_Face face, FT_UInt index,
+                            jf_glyph *out) {
+  if (FT_Load_Glyph(face, index, FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP) != 0)
+    return false;
+  const FT_GlyphSlot slot = face->glyph;
+  /* A colour-bitmap face (emoji) has no outline to measure. */
+  if (slot->format != FT_GLYPH_FORMAT_OUTLINE)
+    return false;
+  jf_msdf field;
+  const bool ok = jf_msdf_generate(atlas->library, &slot->outline,
+                                   JF_ATLAS_RANGE, &atlas->scratch, &field) &&
+                  pack(atlas, field.rgba, (unsigned)field.width,
+                       (unsigned)field.height, (float)slot->advance.x / 64.0f,
+                       (float)field.left, (float)field.top, out);
+  jf_arena_rewind(&atlas->scratch);
+  return ok;
+}
+
 static bool rasterise(jf_atlas *atlas, FT_Face face, uint32_t codepoint,
                       jf_glyph *out) {
   const FT_UInt index = FT_Get_Char_Index(face, codepoint);
-  if (index == 0)
-    return false;
-  if (FT_Load_Glyph(face, index, FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL) != 0)
-    return false;
-  const FT_GlyphSlot slot = face->glyph;
-  return pack(atlas, slot->bitmap.buffer, slot->bitmap.width, slot->bitmap.rows,
-              slot->bitmap.pitch, (float)slot->advance.x / 64.0f,
-              (float)slot->bitmap_left, (float)-slot->bitmap_top, out);
+  return index != 0 && rasterise_index(atlas, face, index, out);
 }
 
 /* ------------------------------------------------------------------- icons */
@@ -262,27 +249,36 @@ static float icon_distance(uint32_t codepoint, float x, float y) {
   return INFINITY;
 }
 
+/* Icons are distances already, so they go into all four channels as they are.
+ * The glow is coverage instead, drawn as it is (see JF_ICON_GLOW). */
 static bool rasterise_icon(jf_atlas *atlas, uint32_t codepoint, jf_glyph *out) {
-  enum { SIZE = (int)JF_ATLAS_BASE_PX };
-  uint8_t bitmap[SIZE * SIZE];
-  const float unit = 24.0f / SIZE;
+  enum {
+    PAD = (int)(JF_ATLAS_RANGE / 2),
+    SIZE = (int)JF_ATLAS_BASE_PX + 2 * PAD
+  };
+  static uint8_t bitmap[SIZE * SIZE * 4];
+  const float unit = 24.0f / JF_ATLAS_BASE_PX;
   for (int row = 0; row < SIZE; row++)
     for (int column = 0; column < SIZE; column++) {
-      const float x = (column + 0.5f) * unit, y = (row + 0.5f) * unit;
-      float coverage;
+      const float x = (column - PAD + 0.5f) * unit;
+      const float y = (row - PAD + 0.5f) * unit;
+      float value;
       if (codepoint == JF_ICON_GLOW) {
         /* A soft disc falling to nothing at the edge of the square. */
         const float r = fminf(hypotf(x - 12, y - 12) / 12, 1);
-        coverage = powf(1 - r * r, 2.5f);
+        value = powf(1 - r * r, 2.5f);
       } else {
-        coverage =
-            fminf(fmaxf(0.5f - icon_distance(codepoint, x, y) / unit, 0), 1);
+        value = -icon_distance(codepoint, x, y) / unit / JF_ATLAS_RANGE + 0.5f;
+        value = fminf(fmaxf(value, 0), 1);
       }
-      bitmap[row * SIZE + column] = (uint8_t)lrintf(coverage * 255);
+      memset(&bitmap[(row * SIZE + column) * 4], (int)lrintf(value * 255), 4);
     }
   /* One em square with its top at the label's top. */
-  return pack(atlas, bitmap, SIZE, SIZE, SIZE, SIZE, 0, -(float)SIZE, out);
+  return pack(atlas, bitmap, SIZE, SIZE, JF_ATLAS_BASE_PX, -PAD,
+              -JF_ATLAS_BASE_PX - PAD, out);
 }
+
+int jf_atlas_face_for(jf_atlas *atlas, uint32_t codepoint);
 
 static void ensure(jf_atlas *atlas, uint32_t codepoint) {
   entry *slot = slot_for(atlas, codepoint);
@@ -294,17 +290,65 @@ static void ensure(jf_atlas *atlas, uint32_t codepoint) {
     slot->found = rasterise_icon(atlas, codepoint, &slot->glyph);
     return;
   }
-  slot->found = atlas->face_count > 0 &&
-                rasterise(atlas, atlas->faces[0], codepoint, &slot->glyph);
-  if (slot->found)
+  if ((codepoint & 0x80000000u) != 0) {
+    const size_t face = (codepoint >> 20) & 0x7ff;
+    slot->found = face < atlas->face_count &&
+                  rasterise_index(atlas, atlas->faces[face],
+                                  codepoint & 0xfffff, &slot->glyph);
     return;
-  load_fallbacks(atlas);
-  for (size_t i = 1; i < atlas->face_count; i++) {
+  }
+  for (size_t i = 0; i < atlas->face_count; i++)
     if (rasterise(atlas, atlas->faces[i], codepoint, &slot->glyph)) {
       slot->found = true;
       return;
     }
+  const int face = jf_atlas_face_for(atlas, codepoint);
+  if (face >= 0)
+    slot->found = rasterise(atlas, atlas->faces[face], codepoint, &slot->glyph);
+}
+
+int jf_atlas_face_for(jf_atlas *atlas, uint32_t codepoint) {
+  for (size_t i = 0; i < atlas->face_count; i++)
+    if (FT_Get_Char_Index(atlas->faces[i], codepoint) != 0)
+      return (int)i;
+  /* A script none of the faces so far has: whichever installed font does
+   * joins them. Controls and the like are in no font; not worth a lookup. */
+  if (codepoint < 0x20)
+    return -1;
+  const char *path = jf_font_for(codepoint);
+  if (path == NULL)
+    return -1;
+  for (size_t i = 0; i < atlas->face_count; i++)
+    if (strcmp(atlas->face_paths[i], path) == 0)
+      return -1; /* has it by its map, and still not by its face */
+  return add_face(atlas, path) ? (int)atlas->face_count - 1 : -1;
+}
+
+bool jf_atlas_face_has(jf_atlas *atlas, int face, uint32_t codepoint) {
+  return face >= 0 && (size_t)face < atlas->face_count &&
+         FT_Get_Char_Index(atlas->faces[face], codepoint) != 0;
+}
+
+hb_font_t *jf_atlas_shaper(jf_atlas *atlas, int face) {
+  if (face < 0 || (size_t)face >= atlas->face_count)
+    return NULL;
+  if (atlas->shapers[face] == NULL) {
+    atlas->shapers[face] = hb_ft_font_create_referenced(atlas->faces[face]);
+    /* The same unhinted outlines the fields are made from. */
+    hb_ft_font_set_load_flags(atlas->shapers[face],
+                              FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP);
   }
+  return atlas->shapers[face];
+}
+
+const jf_glyph *jf_atlas_glyph_index(jf_atlas *atlas, int face,
+                                     uint32_t index) {
+  if (face < 0 || index > 0xfffff)
+    return NULL;
+  const uint32_t key = GLYPH_KEY(face, index);
+  ensure(atlas, key);
+  const entry *slot = slot_for(atlas, key);
+  return slot != NULL && slot->occupied && slot->found ? &slot->glyph : NULL;
 }
 
 /* ------------------------------------------------------------------ public */
@@ -338,23 +382,27 @@ jf_atlas *jf_atlas_create(void) {
     free(atlas);
     return NULL;
   }
-  if (!skyline_init(&atlas->packer, 512)) {
+  if (!skyline_init(&atlas->packer, 1024)) {
     jf_atlas_destroy(atlas);
     return NULL;
   }
   for (uint32_t cp = 32; cp < 127; cp++)
     ensure(atlas, cp);
-  atlas->packer.dirty = true;
+  skyline_touch(&atlas->packer, 0, atlas->packer.size);
   return atlas;
 }
 
 void jf_atlas_destroy(jf_atlas *atlas) {
   if (atlas == NULL)
     return;
-  for (size_t i = 0; i < atlas->face_count; i++)
+  for (size_t i = 0; i < atlas->face_count; i++) {
+    if (atlas->shapers[i] != NULL)
+      hb_font_destroy(atlas->shapers[i]);
     FT_Done_Face(atlas->faces[i]);
+  }
   FT_Done_FreeType(atlas->library);
   skyline_destroy(&atlas->packer);
+  jf_arena_destroy(&atlas->scratch);
   free(atlas);
 }
 
@@ -368,6 +416,11 @@ const uint8_t *jf_atlas_pixels(const jf_atlas *atlas) {
   return atlas->packer.data;
 }
 bool jf_atlas_dirty(const jf_atlas *atlas) { return atlas->packer.dirty; }
+void jf_atlas_dirty_rows(const jf_atlas *atlas, uint16_t *top,
+                         uint16_t *bottom) {
+  *top = atlas->packer.dirty_top;
+  *bottom = atlas->packer.dirty_bottom;
+}
 void jf_atlas_clear_dirty(jf_atlas *atlas) { atlas->packer.dirty = false; }
 
 void jf_atlas_prepare(jf_atlas *atlas, const char *text) {

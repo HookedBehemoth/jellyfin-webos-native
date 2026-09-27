@@ -46,6 +46,19 @@ typedef struct {
   float width[4];
 } loom_mask;
 
+/* Text drawn with the subtitle shader instead of the plain one: an outline
+ * from the glyph's true distance, faux bold by dilating the field, and faux
+ * italic by shearing the quad. Must outlive the frame, like the text. A fill
+ * of alpha 0 draws only the outline, which is how neighbouring glyphs'
+ * outlines stay behind every fill. */
+typedef struct {
+  loom_color outline;
+  float outline_width; /* screen pixels; 0 for none */
+  float weight; /* screen pixels the glyph is dilated by, and twice that is
+                   added to every advance */
+  float slant;  /* horizontal shift per pixel above the quad's bottom */
+} loom_text_style;
+
 typedef struct {
   loom_rect rect;
   loom_rect clip;
@@ -69,6 +82,7 @@ typedef struct {
       const char *contents;
       loom_color color;
       float size;
+      const loom_text_style *style; /* NULL for UI text */
     } text;
     struct {
       float uv[4];
@@ -105,6 +119,9 @@ void loom_stroke(loom_context *ctx, loom_rect rect, const loom_rect *clip,
                  const loom_color color, float width, float radius);
 void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip,
                 const char *contents, const loom_color color, float size);
+void loom_label_styled(loom_context *ctx, loom_rect rect, const loom_rect *clip,
+                       const char *contents, const loom_color color, float size,
+                       const loom_text_style *style);
 void loom_image(loom_context *ctx, loom_rect rect, const loom_rect *clip,
                 const float uv[4], const loom_color tint, float radius);
 /* Same, from a texture the application owns rather than the default one. */

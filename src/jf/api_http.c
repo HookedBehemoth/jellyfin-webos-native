@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "../platform/os.h"
 
@@ -87,6 +88,8 @@ static http_result send_request(CURL *curl, jf_arena *arena,
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  if (payload == NULL && strcmp(method, "GET") != 0)
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
   if (payload != NULL) {
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload);
@@ -762,6 +765,240 @@ static http_result execute(CURL *curl, const jf_session *session,
                         &size);
   }
 
+  case JF_JOB_DELAYS:
+  case JF_JOB_SAVE_DELAYS: {
+    char user[128];
+    jf_url_escape(user, sizeof(user), session->user_id);
+    snprintf(url, sizeof(url),
+             "%s/DisplayPreferences/subtitle-delays?userId=%s&client=%s",
+             jf_session_base(session, base, sizeof(base)), user,
+             JF_CLIENT_NAME);
+    if (task->job == JF_JOB_SAVE_DELAYS)
+      return send_request(curl, arena, session, "POST", url,
+                          task->body != NULL ? task->body : "{}", &body, &size);
+    result = send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+    if (result != HTTP_OK)
+      return result;
+    json_object *root = json_tokener_parse((const char *)body), *prefs = NULL;
+    if (root != NULL &&
+        json_object_object_get_ex(root, "CustomPrefs", &prefs) &&
+        json_object_is_type(prefs, json_type_object)) {
+      const size_t count = (size_t)json_object_object_length(prefs);
+      task->keys = jf_arena_alloc(arena, (count + 1) * sizeof(*task->keys));
+      task->values = jf_arena_alloc(arena, (count + 1) * sizeof(*task->values));
+      json_object_object_foreach(prefs, key, value) {
+        if (task->keys == NULL || task->values == NULL ||
+            !json_object_is_type(value, json_type_string))
+          continue;
+        task->keys[task->pair_count] = jf_arena_strdup(arena, key);
+        task->values[task->pair_count++] =
+            jf_arena_strdup(arena, json_object_get_string(value));
+      }
+    }
+    json_object_put(root);
+    return HTTP_OK;
+  }
+
+  case JF_JOB_SUBTITLE_SEARCH: {
+    char id[256], language[64];
+    jf_url_escape(id, sizeof(id), task->a);
+    jf_url_escape(language, sizeof(language), task->b);
+    snprintf(url, sizeof(url), "%s/Items/%s/RemoteSearch/Subtitles/%s",
+             jf_session_base(session, base, sizeof(base)), id, language);
+    result = send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+    if (result != HTTP_OK)
+      return result;
+    json_object *root = json_tokener_parse((const char *)body);
+    if (root == NULL || !json_object_is_type(root, json_type_array)) {
+      json_object_put(root);
+      return HTTP_STATUS;
+    }
+    const size_t count = json_object_array_length(root);
+    task->remote = jf_arena_alloc(arena, (count + 1) * sizeof(*task->remote));
+    for (size_t i = 0; task->remote != NULL && i < count; i++) {
+      json_object *item = json_object_array_get_idx(root, i);
+      jf_remote_subtitle *out = &task->remote[task->remote_count];
+      out->id = json_string(arena, item, "Id");
+      out->name = json_string(arena, item, "Name");
+      out->provider = json_string(arena, item, "ProviderName");
+      out->format = json_string(arena, item, "Format");
+      double downloads = 0;
+      json_number(item, "DownloadCount", &downloads);
+      out->downloads = (int)downloads;
+      if (out->id != NULL)
+        task->remote_count++;
+    }
+    json_object_put(root);
+    return task->remote != NULL ? HTTP_OK : HTTP_REQUEST_FAILED;
+  }
+
+  case JF_JOB_SUBTITLE_DOWNLOAD: {
+    char id[256], subtitle[512];
+    jf_url_escape(id, sizeof(id), task->a);
+    jf_url_escape(subtitle, sizeof(subtitle), task->b);
+    snprintf(url, sizeof(url), "%s/Items/%s/RemoteSearch/Subtitles/%s",
+             jf_session_base(session, base, sizeof(base)), id, subtitle);
+    return send_request(curl, arena, session, "POST", url, "", &body, &size);
+  }
+
+  case JF_JOB_SUBTITLE_SOURCES: {
+    snprintf(url, sizeof(url), "%s/Packages",
+             jf_session_base(session, base, sizeof(base)));
+    result = send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+    if (result != HTTP_OK)
+      return result;
+    json_object *packages = json_tokener_parse((const char *)body);
+    snprintf(url, sizeof(url), "%s/Plugins",
+             jf_session_base(session, base, sizeof(base)));
+    result = send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+    json_object *plugins =
+        result == HTTP_OK ? json_tokener_parse((const char *)body) : NULL;
+    if (!json_object_is_type(packages, json_type_array) ||
+        !json_object_is_type(plugins, json_type_array)) {
+      json_object_put(packages);
+      json_object_put(plugins);
+      return result != HTTP_OK ? result : HTTP_STATUS;
+    }
+    const size_t count = json_object_array_length(packages);
+    task->sources = jf_arena_alloc(arena, (count + 1) * sizeof(*task->sources));
+    for (size_t i = 0; task->sources != NULL && i < count; i++) {
+      json_object *package = json_object_array_get_idx(packages, i);
+      const char *category = json_string(arena, package, "category");
+      const char *guid = json_string(arena, package, "guid");
+      if (category == NULL || strcasecmp(category, "Subtitles") != 0)
+        continue;
+      /* Subtitle Extract is in the category but only copies embedded
+       * subtitles out to files: nothing to download from. */
+      if (guid != NULL && strncasecmp(guid, "cd893c24", 8) == 0)
+        continue;
+      jf_subtitle_source *out = &task->sources[task->source_count++];
+      *out =
+          (jf_subtitle_source){json_string(arena, package, "name"),
+                               json_string(arena, package, "guid"), NULL, NULL};
+      /* Installed plugins carry the package's guid as their id, which the
+       * server writes without dashes or with them. */
+      for (size_t j = 0;
+           out->guid != NULL && j < json_object_array_length(plugins); j++) {
+        json_object *plugin = json_object_array_get_idx(plugins, j);
+        const char *id = json_string(arena, plugin, "Id");
+        bool same = id != NULL;
+        for (const char *a = id, *b = out->guid; same && (*a || *b);) {
+          if (*a == '-') {
+            a++;
+            continue;
+          }
+          if (*b == '-') {
+            b++;
+            continue;
+          }
+          same = (*a | 0x20) == (*b | 0x20);
+          a++, b++;
+        }
+        if (!same)
+          continue;
+        out->version = json_string(arena, plugin, "Version");
+        out->status = json_string(arena, plugin, "Status");
+        out->guid = id; /* the form /Plugins/{id} takes */
+        break;
+      }
+    }
+    json_object_put(packages);
+    json_object_put(plugins);
+    return task->sources != NULL ? HTTP_OK : HTTP_REQUEST_FAILED;
+  }
+
+  case JF_JOB_SOURCE_INSTALL: {
+    char name[256], guid[128];
+    jf_url_escape(name, sizeof(name), task->a);
+    jf_url_escape(guid, sizeof(guid), task->b);
+    snprintf(url, sizeof(url), "%s/Packages/Installed/%s?assemblyGuid=%s",
+             jf_session_base(session, base, sizeof(base)), name, guid);
+    return send_request(curl, arena, session, "POST", url, "", &body, &size);
+  }
+
+  case JF_JOB_SOURCE_TOGGLE: {
+    char id[128], version[64];
+    jf_url_escape(id, sizeof(id), task->a);
+    jf_url_escape(version, sizeof(version), task->b);
+    snprintf(url, sizeof(url), "%s/Plugins/%s/%s/%s",
+             jf_session_base(session, base, sizeof(base)), id, version,
+             task->start ? "Enable" : "Disable");
+    return send_request(curl, arena, session, "POST", url, "", &body, &size);
+  }
+
+  case JF_JOB_ADD_REPOSITORY: {
+    /* The manifest has to match the server's version, or what it offers
+     * will not load. */
+    snprintf(url, sizeof(url), "%s/System/Info/Public",
+             jf_session_base(session, base, sizeof(base)));
+    result = send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+    if (result != HTTP_OK)
+      return result;
+    json_object *info = json_tokener_parse((const char *)body);
+    const char *version = json_string(arena, info, "Version");
+    json_object_put(info);
+    unsigned major = 0, minor = 0;
+    if (version == NULL || sscanf(version, "%u.%u", &major, &minor) != 2)
+      return HTTP_STATUS;
+    char manifest[256];
+    snprintf(manifest, sizeof(manifest),
+             "https://raw.githubusercontent.com/josdion/subbuzz/master/repo/"
+             "jellyfin_%u.%u.json",
+             major, minor);
+
+    snprintf(url, sizeof(url), "%s/Repositories",
+             jf_session_base(session, base, sizeof(base)));
+    result = send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+    if (result != HTTP_OK)
+      return result;
+    json_object *repositories = json_tokener_parse((const char *)body);
+    if (!json_object_is_type(repositories, json_type_array)) {
+      json_object_put(repositories);
+      return HTTP_STATUS;
+    }
+    /* Written back whole: the endpoint replaces the list. */
+    for (size_t i = 0; i < json_object_array_length(repositories); i++) {
+      const char *known =
+          json_string(arena, json_object_array_get_idx(repositories, i), "Url");
+      if (known != NULL && strstr(known, "josdion/subbuzz") != NULL) {
+        json_object_put(repositories);
+        return HTTP_OK;
+      }
+    }
+    json_object *entry = json_object_new_object();
+    json_object_object_add(entry, "Name", json_object_new_string("subbuzz"));
+    json_object_object_add(entry, "Url", json_object_new_string(manifest));
+    json_object_object_add(entry, "Enabled", json_object_new_boolean(1));
+    json_object_array_add(repositories, entry);
+    const char *payload_json = jf_arena_strdup(
+        arena,
+        json_object_to_json_string_ext(repositories, JSON_C_TO_STRING_PLAIN));
+    json_object_put(repositories);
+    return send_request(curl, arena, session, "POST", url, payload_json, &body,
+                        &size);
+  }
+
+  case JF_JOB_RESTART:
+    snprintf(url, sizeof(url), "%s/System/Restart",
+             jf_session_base(session, base, sizeof(base)));
+    return send_request(curl, arena, session, "POST", url, "", &body, &size);
+
+  case JF_JOB_SUBTITLE_CHECK:
+    jf_subtitle_url(session, task->a, task->b, (int)task->start, url,
+                    sizeof(url));
+    result = send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+    return result != HTTP_OK ? result : size > 0 ? HTTP_OK : HTTP_STATUS;
+
+  case JF_JOB_SUBTITLE_DELETE: {
+    char id[256], index[32];
+    jf_url_escape(id, sizeof(id), task->a);
+    jf_url_escape(index, sizeof(index), task->b);
+    snprintf(url, sizeof(url), "%s/Videos/%s/Subtitles/%s",
+             jf_session_base(session, base, sizeof(base)), id, index);
+    return send_request(curl, arena, session, "DELETE", url, NULL, &body,
+                        &size);
+  }
+
   case JF_JOB_PLAYBACK_INFO: {
     char id[256];
     jf_url_escape(id, sizeof(id), task->a);
@@ -815,6 +1052,9 @@ static http_result parse_playback_info(jf_arena *arena, const char *body,
           sub->title = "Subtitles";
         sub->external = json_flag(stream, "IsExternal");
         sub->text = json_flag(stream, "IsTextSubtitleStream");
+        const char *codec = json_string(arena, stream, "Codec");
+        sub->styled = codec != NULL && (strcasecmp(codec, "ass") == 0 ||
+                                        strcasecmp(codec, "ssa") == 0);
       }
     }
   }

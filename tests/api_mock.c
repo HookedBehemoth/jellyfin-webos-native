@@ -8,9 +8,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define JOBS (JF_JOB_ENCODING + 1)
+#define JOBS (JF_JOB_ADD_REPOSITORY + 1)
 
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+/* What the server keeps: the delays last saved, and whether a subtitle was
+ * downloaded, which lists one more file beside the video. */
+static char saved_delays[1024];
+static bool downloaded;
+static unsigned listed_after;
+/* The subtitle sources, as the official repository has them: OpenSubtitles,
+ * not installed until asked to be; and subbuzz once its repository is added.
+ * NULL is not installed. */
+static const char *opensubtitles_status;
+static const char *subbuzz_status;
+static bool subbuzz_listed;
 static pthread_cond_t released = PTHREAD_COND_INITIALIZER,
                       left = PTHREAD_COND_INITIALIZER;
 static struct {
@@ -35,8 +46,16 @@ void mock_reset(void) {
     drain((jf_job)job);
   }
   memset(rules, 0, sizeof(rules));
+  saved_delays[0] = '\0';
+  downloaded = false;
+  listed_after = 0;
+  opensubtitles_status = NULL;
+  subbuzz_status = NULL;
+  subbuzz_listed = false;
   pthread_mutex_unlock(&mutex);
 }
+
+const char *mock_saved_delays(void) { return saved_delays; }
 
 void mock_fail(jf_job job, int status, unsigned count) {
   pthread_mutex_lock(&mutex);
@@ -310,13 +329,85 @@ static const char *answer(const jf_session *session, jf_task *task) {
     jf_playback_info *info = &task->playback;
     info->media_source_id = jf_arena_strdup(arena, task->a);
     info->default_subtitle = -1;
-    info->subtitles = jf_arena_alloc(arena, 3 * sizeof(*info->subtitles));
+    info->subtitles = jf_arena_alloc(arena, 4 * sizeof(*info->subtitles));
+    /* A download sorts first among the files, as a server's might. */
+    if (listed_after > 0)
+      listed_after--;
+    else if (downloaded)
+      info->subtitles[info->subtitle_count++] =
+          (jf_subtitle_stream){1, "Thai - Downloaded", true, true, false};
     for (int i = 0; i < 3; i++)
-      info->subtitles[i] =
-          (jf_subtitle_stream){i + 2, titles[i], i == 0, i < 2};
-    info->subtitle_count = 3;
+      info->subtitles[info->subtitle_count++] =
+          (jf_subtitle_stream){i + 2, titles[i], i == 0, i < 2, i == 1};
     return NULL;
   }
+  case JF_JOB_DELAYS: {
+    /* The one pair a save leaves behind, as `"key":"ms"`. */
+    char key[128];
+    int ms = 0;
+    if (sscanf(saved_delays, "%*[^{]{%*[^{]{\"%127[^\"]\":\"%d", key, &ms) != 2)
+      return NULL;
+    task->keys = jf_arena_alloc(arena, sizeof(*task->keys));
+    task->values = jf_arena_alloc(arena, sizeof(*task->values));
+    task->keys[0] = jf_arena_strdup(arena, key);
+    char value[16];
+    snprintf(value, sizeof(value), "%d", ms);
+    task->values[0] = jf_arena_strdup(arena, value);
+    task->pair_count = 1;
+    return NULL;
+  }
+  case JF_JOB_SAVE_DELAYS:
+    snprintf(saved_delays, sizeof(saved_delays), "%s",
+             task->body != NULL ? task->body : "");
+    return NULL;
+  case JF_JOB_SUBTITLE_SEARCH: {
+    task->remote = jf_arena_alloc(arena, 2 * sizeof(*task->remote));
+    task->remote[0] = (jf_remote_subtitle){"os-1", "Show.S01E01.WEB.srt",
+                                           "Open Subtitles", "srt", 1200};
+    task->remote[1] = (jf_remote_subtitle){"os-2", "Show.S01E01.HDTV.srt",
+                                           "Open Subtitles", "srt", 30};
+    task->remote_count = 2;
+    return NULL;
+  }
+  case JF_JOB_SUBTITLE_DOWNLOAD:
+    /* Listed only after a few asks, as a server refreshing the item in the
+     * background lists it. */
+    downloaded = true;
+    listed_after = 3;
+    return NULL;
+  case JF_JOB_SUBTITLE_SOURCES:
+    task->sources = jf_arena_alloc(arena, 2 * sizeof(*task->sources));
+    task->sources[task->source_count++] = (jf_subtitle_source){
+        "Open Subtitles", "4b9ed42f518548b598036ff2989014c4",
+        opensubtitles_status != NULL ? "1.0.0.0" : NULL, opensubtitles_status};
+    if (subbuzz_listed)
+      task->sources[task->source_count++] = (jf_subtitle_source){
+          "subbuzz", "5aeab01b2ef845c6bb6b16ce9cb268d4",
+          subbuzz_status != NULL ? "10.11.0.0" : NULL, subbuzz_status};
+    return NULL;
+  case JF_JOB_SOURCE_INSTALL:
+    /* As the server: installed, loaded at the next restart. */
+    *(strcmp(task->a, "subbuzz") == 0 ? &subbuzz_status
+                                      : &opensubtitles_status) = "Restart";
+    return NULL;
+  case JF_JOB_SOURCE_TOGGLE:
+    *(strncmp(task->a, "5aeab01b", 8) == 0 ? &subbuzz_status
+                                           : &opensubtitles_status) =
+        task->start ? "Restart" : "Disabled";
+    return NULL;
+  case JF_JOB_ADD_REPOSITORY:
+    subbuzz_listed = true;
+    return NULL;
+  case JF_JOB_RESTART:
+    return NULL;
+  case JF_JOB_SUBTITLE_CHECK:
+    return downloaded ? NULL : "ClientError";
+  case JF_JOB_SUBTITLE_DELETE:
+    /* Only the download is a file the mock can delete. */
+    if (!downloaded || strcmp(task->b, "1") != 0)
+      return "ClientError";
+    downloaded = false;
+    return NULL;
   case JF_JOB_ENCODING:
     task->encoding = (jf_server_transcode){.known = true, .codecs = ","};
     return NULL;

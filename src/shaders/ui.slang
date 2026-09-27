@@ -3,9 +3,9 @@
 // ONE sampler, deliberately. There is no bindless texture support here, so the
 // renderer batches until the bound texture changes and then flushes; a sampler
 // per texture would cap the UI at however many slots the shader declared.
-// Glyphs are 8-bit coverage in .r, images are colour in .rgb.
+// Glyphs are MTSDF (see ui/msdf.h), images are colour in .rgb.
 //
-// FIVE fragment entry points, one per kind of instance, instead of one shader
+// SEVERAL fragment entry points, one per kind of instance, instead of one shader
 // branching on a per-instance mode. The renderer already flushes on a binding
 // change, so the program is just another part of that state and costs nothing
 // extra to switch. Measured on Mali-G52 at 1080p: the branchy version spent
@@ -20,6 +20,8 @@
 // means fully clipped instances (most of a virtual list) cost nothing.
 
 uniform float2 viewport;
+// The subtitle shader's outline, per batch: every glyph of a subtitle shares it.
+uniform float4 outlineColor;
 Sampler2D atlas;
 
 struct VSIn {
@@ -28,7 +30,10 @@ struct VSIn {
     float4 uv : TEXCOORD0;
     float4 color : COLOR;
     float4 clip : CLIP; // x0, y0, x1, y1
-    float4 shape : SHAPE; // radius, border width, unused, unused
+    // Shapes: radius, border width, unused, unused. Glyphs: screen pixels per
+    // unit of field, dilation in pixels, slant, and outline width in pixels
+    // (or 1 for coverage drawn as it is, in the plain shader).
+    float4 shape : SHAPE;
     // Edge fade, per top/bottom/left/right: the distance into it, in fade widths, is
     // position * scale - offset with the position mirrored for bottom and right.
     float4 maskScale : MASKSCALE;
@@ -52,14 +57,16 @@ VSOut vsUi(VSIn v) {
     float2 lo = max(v.rect.xy, v.clip.xy);
     float2 hi = max(lo, min(v.rect.xy + v.rect.zw, v.clip.zw));
     float2 pixel = lerp(lo, hi, v.corner);
+    // Faux italic: a shear about the quad's bottom, 0 for everything else.
+    float2 placed = float2(pixel.x + (v.rect.y + v.rect.w - pixel.y) * v.shape.z, pixel.y);
 
     // Where that landed inside the original rect, so UVs and the rounded-corner
     // distance still refer to the whole shape.
     float2 t = (pixel - v.rect.xy) / max(v.rect.zw, float2(1e-6, 1e-6));
 
     VSOut o;
-    o.pos = float4(pixel.x / viewport.x * 2.0 - 1.0,
-                   1.0 - pixel.y / viewport.y * 2.0, 0.0, 1.0);
+    o.pos = float4(placed.x / viewport.x * 2.0 - 1.0,
+                   1.0 - placed.y / viewport.y * 2.0, 0.0, 1.0);
     o.uv = lerp(v.uv.xy, v.uv.zw, t);
     o.color = v.color;
     o.local = pixel - v.rect.xy;
@@ -124,11 +131,33 @@ float4 fsBorder(VSOut i) : SV_Target {
     return float4(i.color.rgb, masked(i, i.color.a * alpha));
 }
 
+float median3(float3 t) {
+    return max(min(t.r, t.g), min(max(t.r, t.g), t.b));
+}
+
+// The field's median, sharp at any size: the pixel range comes from the CPU,
+// which knows the scale, so there is no screen-space derivative to take.
 [shader("fragment")]
 float4 fsGlyph(VSOut i) : SV_Target {
-    // Rasterised coverage, so the glyph is the texel: no distance field to
-    // decode and no screen-space derivative to take.
-    return float4(i.color.rgb, masked(i, i.color.a * atlas.Sample(i.uv).r));
+    float4 t = atlas.Sample(i.uv);
+    float alpha = clamp((median3(t.rgb) - 0.5) * i.shape.x + 0.5, 0.0, 1.0);
+    alpha = lerp(alpha, t.a, i.shape.w); // the glow, which is coverage
+    return float4(i.color.rgb, masked(i, i.color.a * alpha));
+}
+
+// Subtitles: the fill from the median, dilated for bold, over an outline from
+// the true distance in alpha, which rounds its corners where the median's
+// would be mitred.
+[shader("fragment")]
+float4 fsSubtitle(VSOut i) : SV_Target {
+    float4 t = atlas.Sample(i.uv);
+    float fill = clamp((median3(t.rgb) - 0.5) * i.shape.x + 0.5 + i.shape.y, 0.0, 1.0);
+    float edge = clamp((t.a - 0.5) * i.shape.x + 0.5 + i.shape.y + i.shape.w, 0.0, 1.0);
+    float front = fill * i.color.a;
+    float back = edge * outlineColor.a * (1.0 - front);
+    float alpha = front + back;
+    float3 rgb = (i.color.rgb * front + outlineColor.rgb * back) / max(alpha, 1.0 / 255.0);
+    return float4(rgb, masked(i, alpha));
 }
 
 [shader("fragment")]

@@ -66,17 +66,14 @@ static const char *const candidates[] = {
     "C:/Windows/Fonts/tahoma.ttf",
 };
 
-static const char *const fallbacks[] = {
-    "C:/Windows/Fonts/seguisym.ttf",
-    "C:/Windows/Fonts/arial.ttf",
-};
+static const char *const font_dirs[] = {"C:/Windows/Fonts"};
 
 const char *const *jf_os_font_candidates(size_t *count) {
   *count = sizeof(candidates) / sizeof(*candidates);
   return candidates;
 }
 
-const char *const *jf_os_font_fallbacks(size_t *count) {
-  *count = sizeof(fallbacks) / sizeof(*fallbacks);
-  return fallbacks;
+const char *const *jf_os_font_dirs(size_t *count) {
+  *count = sizeof(font_dirs) / sizeof(*font_dirs);
+  return font_dirs;
 }

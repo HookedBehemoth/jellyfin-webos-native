@@ -110,7 +110,27 @@ typedef struct {
   const char *title; /* DisplayTitle: language, name, codec */
   bool external;
   bool text;
+  bool styled; /* ASS or SSA: text libass draws as the script styles it */
 } jf_subtitle_stream;
+
+/* A subtitle a provider on the server offers for an item. */
+typedef struct {
+  const char *id;
+  const char *name;
+  const char *provider;
+  const char *format;
+  int downloads;
+} jf_remote_subtitle;
+
+/* A subtitle provider plugin, installed or only offered. `status` is the
+ * server's: Active, Disabled, Restart, Malfunctioned, NotSupported...; NULL
+ * when not installed. */
+typedef struct {
+  const char *name;
+  const char *guid;
+  const char *version; /* installed, or NULL */
+  const char *status;
+} jf_subtitle_source;
 
 typedef struct {
   const char *media_source_id;
@@ -202,6 +222,33 @@ typedef enum {
   /* The server's hardware transcoding; refused unless the user is an
    * administrator. */
   JF_JOB_ENCODING,
+  /* The user's subtitle delays, kept on the server as this client's display
+   * preferences, so they follow the user; and `body` written back. */
+  JF_JOB_DELAYS,
+  JF_JOB_SAVE_DELAYS,
+  /* Subtitle providers' results for item `a` in language `b`, and result `b`
+   * downloaded to the server beside item `a`. */
+  JF_JOB_SUBTITLE_SEARCH,
+  JF_JOB_SUBTITLE_DOWNLOAD,
+  /* The file beside item `a` for its subtitle stream `b`, deleted. */
+  JF_JOB_SUBTITLE_DELETE,
+  /* Item `a`'s subtitle stream `start` of media source `b`, fetched as the
+   * player would, to know it can be read: a download is listed before the
+   * server can necessarily serve it. */
+  JF_JOB_SUBTITLE_CHECK,
+  /* The subtitle providers the server's plugin repositories offer, and which
+   * of them are installed (/Packages and /Plugins, category "Subtitles"). */
+  JF_JOB_SUBTITLE_SOURCES,
+  /* Package `a` (guid `b`) installed; plugin `a` at version `b` enabled or,
+   * with `start` 0, disabled; and the server restarted, which is what either
+   * waits for. All need an administrator. */
+  JF_JOB_SOURCE_INSTALL,
+  JF_JOB_SOURCE_TOGGLE,
+  JF_JOB_RESTART,
+  /* subbuzz's plugin repository added to the server's, in the manifest for
+   * its version: one plugin that searches many subtitle sites, where the
+   * official repository has only OpenSubtitles. */
+  JF_JOB_ADD_REPOSITORY,
 } jf_job;
 
 typedef enum { JF_IMAGE_PRIMARY, JF_IMAGE_BACKDROP } jf_image_kind;
@@ -247,6 +294,15 @@ typedef struct {
   bool has_image;
   jf_playback_info playback;
   jf_server_transcode encoding;
+  /* JF_JOB_DELAYS' preferences, and JF_JOB_SAVE_DELAYS' JSON to send, both in
+   * the arena. */
+  const char **keys, **values;
+  size_t pair_count;
+  const char *body;
+  jf_remote_subtitle *remote;
+  size_t remote_count;
+  jf_subtitle_source *sources;
+  size_t source_count;
   /* Every item's blurhash, JF_BLUR_COLUMNS cells to a row, ready to go into
    * the UI's atlas in one upload. NULL when no item has one. */
   uint8_t *blur;

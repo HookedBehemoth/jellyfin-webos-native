@@ -77,6 +77,44 @@ bool jf_subs_frame(int64_t media_ms, jf_subs_image *out);
  * the bottom move; signs positioned over the picture stay where they are. */
 void jf_subs_keep_above(int y);
 
+/* ------------------------------------------------------------ plain text
+ *
+ * A track converted from SRT and friends has nothing libass adds, so the UI
+ * draws it itself, as plain text with its own styling; a real ASS track can be
+ * asked to go the same way. While a track is plain, libass renders nothing and
+ * jf_subs_frame hands back an empty image. */
+
+/* Every ASS track plain too, not only converted ones. */
+void jf_subs_force_plain(bool on);
+/* Whether the open track is drawn as plain text. */
+bool jf_subs_plain(void);
+
+/* Markers in stripped text, each a byte of its own. */
+#define JF_SUBS_BOLD_ON '\x01'
+#define JF_SUBS_BOLD_OFF '\x02'
+#define JF_SUBS_ITALIC_ON '\x03'
+#define JF_SUBS_ITALIC_OFF '\x04'
+
+/* One event's Text field without its override blocks and drawings: \N is a
+ * newline, \n and \h spaces, and bold and italic become the markers above
+ * unless `styles` is false. NUL-terminated in `out`; returns its length. */
+size_t jf_subs_strip(const char *text, char *out, size_t size, bool styles);
+/* The stripped text of every line of the open track showing at `media_ms`, in
+ * start order, one line per event. Empty with nothing showing. */
+size_t jf_subs_text(int64_t media_ms, char *out, size_t size, bool styles);
+
+/* How libass draws a styled track, for the settings plain text has too:
+ * dialogue scaled by `font_scale`, and placed `margin` (a fraction of the
+ * picture) from the bottom edge, or from the top when `top`. Signs placed over
+ * the picture stay where the script puts them. */
+void jf_subs_style(double font_scale, double margin, bool top);
+
+/* The delay that best lines the open track up with another text track of the
+ * container, from the lines both have around the playback position: what a
+ * track cut for another release is off by. False without enough lines in
+ * common to tell. Positive: the track should show later. */
+bool jf_subs_suggest_delay(int64_t *delay_ms);
+
 /* What rendering the frame now shown cost its background thread, in CPU time.
  */
 typedef struct {

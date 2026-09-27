@@ -78,8 +78,9 @@ void loom_stroke(loom_context *ctx, loom_rect rect, const loom_rect *clip,
   c->border.radius = radius;
 }
 
-void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip,
-                const char *contents, const loom_color color, float size) {
+void loom_label_styled(loom_context *ctx, loom_rect rect, const loom_rect *clip,
+                       const char *contents, const loom_color color, float size,
+                       const loom_text_style *style) {
   loom_command *c = append(ctx, rect, clip);
   if (c == NULL)
     return;
@@ -87,6 +88,12 @@ void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip,
   c->text.contents = contents;
   memcpy(c->text.color, color, sizeof(loom_color));
   c->text.size = size;
+  c->text.style = style;
+}
+
+void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip,
+                const char *contents, const loom_color color, float size) {
+  loom_label_styled(ctx, rect, clip, contents, color, size, NULL);
 }
 
 static loom_command *image(loom_context *ctx, loom_rect rect,

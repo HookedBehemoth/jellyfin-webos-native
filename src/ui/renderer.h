@@ -33,6 +33,9 @@ void jf_renderer_draw(jf_renderer *renderer, const loom_command *commands,
                       size_t count, float width, float height);
 
 float jf_renderer_measure(jf_renderer *renderer, const char *text, float size);
+/* Styled text is shaped (see loom_text_style): its width, faux bold and all. */
+float jf_renderer_measure_styled(jf_renderer *renderer, const char *text,
+                                 float size, const loom_text_style *style);
 jf_atlas *jf_renderer_atlas(jf_renderer *renderer);
 
 /* A texture of its own for one image.

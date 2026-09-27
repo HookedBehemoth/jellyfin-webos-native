@@ -61,11 +61,10 @@ static const char *const candidates[] = {
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 };
 
-static const char *const fallbacks[] = {
-    "/usr/share/fonts/DroidSansFallback.ttf",
-    "/usr/share/fonts/DroidSans.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+/* The TV keeps all of its faces flat in the first. */
+static const char *const font_dirs[] = {
+    "/usr/share/fonts",
+    "/usr/local/share/fonts",
 };
 
 const char *const *jf_os_font_candidates(size_t *count) {
@@ -73,7 +72,7 @@ const char *const *jf_os_font_candidates(size_t *count) {
   return candidates;
 }
 
-const char *const *jf_os_font_fallbacks(size_t *count) {
-  *count = sizeof(fallbacks) / sizeof(*fallbacks);
-  return fallbacks;
+const char *const *jf_os_font_dirs(size_t *count) {
+  *count = sizeof(font_dirs) / sizeof(*font_dirs);
+  return font_dirs;
 }

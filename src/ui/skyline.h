@@ -2,15 +2,16 @@
  * Skyline binary packing, after
  * http://clb.demon.fi/projects/even-more-rectangle-bin-packing
  *
- * One 8-bit channel, because the only thing packed here is glyph coverage. The
- * Zig original carried a depth parameter for RGBA atlases that this program
- * never had.
+ * Four bytes a texel, because the only thing packed here is glyph distance
+ * fields: three channels of MSDF and the true distance.
  */
 #pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#define SKYLINE_BPP 4
 
 typedef struct {
   uint16_t x, y, w, h;
@@ -22,8 +23,10 @@ typedef struct {
   uint16_t size;
   size_t used;
   uint8_t *data;
-  /* The renderer clears this once it has uploaded the texture. */
+  /* The renderer clears this once it has uploaded the texture. Rows
+   * [dirty_top, dirty_bottom) are what changed since. */
   bool dirty;
+  uint16_t dirty_top, dirty_bottom;
 } skyline;
 
 bool skyline_init(skyline *packer, uint16_t size);
@@ -33,7 +36,10 @@ void skyline_destroy(skyline *packer);
  * carry an implicit one-pixel spacing, so two allocations never touch. */
 bool skyline_alloc(skyline *packer, uint16_t w, uint16_t h,
                    skyline_region *out);
+/* `stride` in bytes. */
 bool skyline_blit(skyline *packer, skyline_region region, const uint8_t *data,
                   size_t stride);
+/* Marks rows [top, bottom) as changed. */
+void skyline_touch(skyline *packer, uint16_t top, uint16_t bottom);
 /* Power of two, larger than the current size. */
 bool skyline_enlarge(skyline *packer, uint16_t size);

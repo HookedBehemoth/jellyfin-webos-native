@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -33,6 +34,7 @@
 #include "../platform/gl.h"
 #include "../platform/luna.h"
 #include "../platform/window.h"
+#include "../ui/font_index.h"
 #include "../ui/glyph_atlas.h"
 #include "../ui/loom.h"
 #include "../ui/nav.h"
@@ -101,6 +103,49 @@ static char preferences_path[576];
 static char ui_font[512];
 static char audio_device[64] = "default";
 
+/* How subtitles look. The plain-text renderer takes all of it; libass takes
+ * the size, margin and side (see jf_subs_style). Colours are indices into
+ * `swatches`, sizes in pixels at 1080 rows. */
+typedef struct {
+  const char *name;
+  loom_color color;
+} swatch;
+static const swatch swatches[] = {
+    {"White", {255, 255, 255, 255}},   {"Yellow", {255, 226, 64, 255}},
+    {"Cyan", {96, 220, 255, 255}},     {"Green", {120, 232, 120, 255}},
+    {"Magenta", {240, 112, 232, 255}}, {"Red", {240, 92, 92, 255}},
+    {"Grey", {176, 176, 176, 255}},    {"Black", {0, 0, 0, 255}},
+};
+#define SWATCH_COUNT (int)(sizeof(swatches) / sizeof(swatches[0]))
+
+static struct {
+  int color, outline_color;
+  bool outline;
+  int outline_width;
+  bool ignore_inline;
+  int size_percent; /* added to 100 */
+  int margin_percent;
+  bool top;
+  bool plain_ass;
+  int search_language; /* index into search_languages */
+} sub_style = {0, 7, true, 3, false, 0, 5, false, false, 0};
+
+static int clampi(int value, int lo, int hi) {
+  return value < lo ? lo : value > hi ? hi : value;
+}
+
+static void apply_subtitle_style(void) {
+  sub_style.color = clampi(sub_style.color, 0, SWATCH_COUNT - 1);
+  sub_style.outline_color =
+      clampi(sub_style.outline_color, 0, SWATCH_COUNT - 1);
+  sub_style.outline_width = clampi(sub_style.outline_width, 1, 6);
+  sub_style.size_percent = clampi(sub_style.size_percent, -50, 150);
+  sub_style.margin_percent = clampi(sub_style.margin_percent, 0, 40);
+  jf_subs_force_plain(sub_style.plain_ass);
+  jf_subs_style(1 + sub_style.size_percent / 100.0,
+                sub_style.margin_percent / 100.0, sub_style.top);
+}
+
 static bool is(const cfg_reader *reader, const char *section, const char *key) {
   return strcmp(reader->section, section) == 0 && strcmp(reader->key, key) == 0;
 }
@@ -125,6 +170,26 @@ static void load_preferences(void) {
       jf_player_subtitles = cfg_bool(&reader, jf_player_subtitles);
     else if (is(&reader, "playback", "audio_device"))
       snprintf(audio_device, sizeof(audio_device), "%s", cfg_text(&reader));
+    else if (is(&reader, "subtitles", "color"))
+      sub_style.color = cfg_int(&reader, sub_style.color);
+    else if (is(&reader, "subtitles", "outline"))
+      sub_style.outline = cfg_bool(&reader, sub_style.outline);
+    else if (is(&reader, "subtitles", "outline_width"))
+      sub_style.outline_width = cfg_int(&reader, sub_style.outline_width);
+    else if (is(&reader, "subtitles", "outline_color"))
+      sub_style.outline_color = cfg_int(&reader, sub_style.outline_color);
+    else if (is(&reader, "subtitles", "ignore_inline_styles"))
+      sub_style.ignore_inline = cfg_bool(&reader, sub_style.ignore_inline);
+    else if (is(&reader, "subtitles", "size_percent"))
+      sub_style.size_percent = cfg_int(&reader, sub_style.size_percent);
+    else if (is(&reader, "subtitles", "margin_percent"))
+      sub_style.margin_percent = cfg_int(&reader, sub_style.margin_percent);
+    else if (is(&reader, "subtitles", "top"))
+      sub_style.top = cfg_bool(&reader, sub_style.top);
+    else if (is(&reader, "subtitles", "search_language"))
+      sub_style.search_language = cfg_int(&reader, 0);
+    else if (is(&reader, "subtitles", "plain_ass"))
+      sub_style.plain_ass = cfg_bool(&reader, sub_style.plain_ass);
     else if (is(&reader, "log", "keys"))
       jf_window_log_keys = cfg_bool(&reader, jf_window_log_keys);
     else if (is(&reader, "log", "window"))
@@ -136,6 +201,7 @@ static void load_preferences(void) {
   jf_atlas_font = ui_font[0] != '\0' ? ui_font : NULL;
   jf_subs_font = jf_atlas_font;
   jf_player_audio_device = audio_device;
+  apply_subtitle_style();
 }
 
 static void save_preferences(void) {
@@ -153,6 +219,21 @@ static void save_preferences(void) {
   cfg_write_bool(&writer, "audio", jf_player_audio);
   cfg_write_bool(&writer, "subtitles", jf_player_subtitles);
   cfg_write_text(&writer, "audio_device", audio_device);
+  cfg_section(&writer, "subtitles");
+  cfg_comment(&writer,
+              "colours: 0 white, 1 yellow, 2 cyan, 3 green, 4 magenta, "
+              "5 red, 6 grey, 7 black");
+  cfg_write_int(&writer, "color", sub_style.color);
+  cfg_write_bool(&writer, "outline", sub_style.outline);
+  cfg_write_int(&writer, "outline_width", sub_style.outline_width);
+  cfg_write_int(&writer, "outline_color", sub_style.outline_color);
+  cfg_write_bool(&writer, "ignore_inline_styles", sub_style.ignore_inline);
+  cfg_write_int(&writer, "size_percent", sub_style.size_percent);
+  cfg_write_int(&writer, "margin_percent", sub_style.margin_percent);
+  cfg_write_bool(&writer, "top", sub_style.top);
+  cfg_comment(&writer, "draw styled ASS tracks as plain text too");
+  cfg_write_bool(&writer, "plain_ass", sub_style.plain_ass);
+  cfg_write_int(&writer, "search_language", sub_style.search_language);
   cfg_section(&writer, "log");
   cfg_write_bool(&writer, "keys", jf_window_log_keys);
   cfg_write_bool(&writer, "window", jf_window_log_events);
@@ -813,6 +894,99 @@ static nav_id picker_return_focus;
 /* The picker's first frame puts the focus on the current track: its rows do
  * not exist until then, and nav falls back off a focus nothing declares. */
 static bool picker_focus_pending;
+/* The appearance panel, which right on a plain-text track in the picker
+ * opens. It stands in for the picker, over the picture, so every change shows
+ * on the line it changes. */
+static bool subtitle_settings;
+/* Per player track: whether it is text, and ASS the script styles; and what
+ * its delay is saved under. */
+#define KNOWN_TRACKS 32
+static bool track_text[KNOWN_TRACKS], track_styled[KNOWN_TRACKS],
+    track_external[KNOWN_TRACKS];
+static char track_key[KNOWN_TRACKS][80];
+/* Milliseconds a track is shown late by: tracks cut for another release are
+ * off by their own amount. Kept on the server as this client's display
+ * preferences (JF_JOB_DELAYS), so they follow the user from TV to TV; read
+ * at the first playback, written when the panel closes on a change. */
+#define SAVED_DELAYS 256
+static struct {
+  char key[80];
+  int ms;
+} saved_delays[SAVED_DELAYS];
+static size_t saved_delay_count;
+static bool delays_asked, delays_changed;
+/* Deleting takes a second OK on the row, which this remembers. */
+static bool delete_armed;
+/* The list refreshed after a delete, which shows the track gone and none
+ * selected. */
+static bool awaiting_delete;
+/* The subtitle search panel (see open_subtitle_search). */
+#define SEARCH_RESULTS 48
+
+/* A download, from the request to a track the player can read. The server
+ * saves the file at once but lists it only once a background refresh of the
+ * item gets there, so the list is asked for again until it has it; then the
+ * file is fetched as the player would, and only then is it selected. */
+typedef enum {
+  DOWNLOAD_NONE,
+  DOWNLOAD_FETCHING, /* the server getting it from the provider */
+  DOWNLOAD_LISTING,  /* waiting for the server to list it */
+  DOWNLOAD_CHECKING, /* reading it back */
+  DOWNLOAD_SELECTING /* the list that selects it, on its way */
+} download_phase;
+#define DOWNLOAD_POLL_NS 1000000000ull
+#define DOWNLOAD_POLLS 30
+/* PLAYBACK_INFO's tag for a look at the list that changes nothing. */
+#define DOWNLOAD_POLL_TAG 1
+
+static struct {
+  bool open, searching;
+  download_phase phase;
+  uint64_t poll_at;
+  unsigned polls;
+  bool poll_in_flight;
+  /* The tracks before the download, so the new one can be told apart. */
+  char before[KNOWN_TRACKS][80];
+  int before_count;
+  char error[160];
+  bool error_is_warning; /* yellow, a thing to do, rather than red */
+  size_t count;
+  struct {
+    char id[256], name[160], detail[96];
+  } results[SEARCH_RESULTS];
+} search;
+
+/* The subtitle sources panel: every provider the server's repositories
+ * offer, installed or not, each installable and switchable. Changes take
+ * effect when the server restarts, which a row offers once one is pending. */
+#define SOURCES 16
+static struct {
+  bool open, loading, loaded, restart_armed;
+  /* Switched this session: turning one off waits for a restart too, though
+   * the server calls it plain Disabled. */
+  bool changed;
+  bool adding; /* the repository being added */
+  char note[160];
+  bool note_is_error;
+  /* A package being installed, looked for in the list until it shows. */
+  char installing[96]; /* a name, as items' */
+  uint64_t poll_at;
+  unsigned polls;
+  size_t count;
+  struct {
+    char name[96], guid[64], version[32], status[24];
+    bool busy;
+  } items[SOURCES];
+} sources;
+static void search_failed(const jf_task *task);
+static void sources_failed(const jf_task *task);
+static void sources_done(const jf_task *task);
+static void poll_sources(void);
+static void search_done(const jf_task *task);
+static void search_listed(const jf_playback_info *info);
+static void poll_download(void);
+static nav_id picker_row_id(size_t row);
+static size_t track_row(int track);
 static bool playback_paused;
 static screen_id playback_return_screen;
 static nav_id playback_return_focus;
@@ -1112,6 +1286,9 @@ static bool reauthenticate(void) {
 
 static void sign_out(void) {
   auth_generation++;
+  /* The next user's delays are their own. */
+  saved_delay_count = 0;
+  delays_asked = false;
   session.token[0] = '\0';
   session.user_id[0] = '\0';
   session.user_name[0] = '\0';
@@ -1173,12 +1350,39 @@ static const char *job_name(jf_job job) {
     return "adjacent";
   case JF_JOB_ENCODING:
     return "encoding";
+  case JF_JOB_DELAYS:
+    return "delays";
+  case JF_JOB_SAVE_DELAYS:
+    return "save_delays";
+  case JF_JOB_SUBTITLE_SEARCH:
+    return "subtitle_search";
+  case JF_JOB_SUBTITLE_DOWNLOAD:
+    return "subtitle_download";
+  case JF_JOB_SUBTITLE_DELETE:
+    return "subtitle_delete";
+  case JF_JOB_SUBTITLE_CHECK:
+    return "subtitle_check";
+  case JF_JOB_SUBTITLE_SOURCES:
+    return "subtitle_sources";
+  case JF_JOB_SOURCE_INSTALL:
+    return "source_install";
+  case JF_JOB_SOURCE_TOGGLE:
+    return "source_toggle";
+  case JF_JOB_RESTART:
+    return "restart";
+  case JF_JOB_ADD_REPOSITORY:
+    return "add_repository";
   }
   return "?";
 }
 
 static void on_failure(jf_task *task) {
   fprintf(stderr, "%s failed: %s\n", job_name(task->job), task->error);
+  /* A look at the list for a download: that flow's own to retry. */
+  if (task->job == JF_JOB_PLAYBACK_INFO && task->tag == DOWNLOAD_POLL_TAG) {
+    search_failed(task);
+    return;
+  }
   switch (task->job) {
   /* A missing poster is normal - plenty of items have none - so it marks the
    * slot done and leaves the placeholder card showing. The id stays, so the
@@ -1277,6 +1481,28 @@ static void on_failure(jf_task *task) {
    * transcode from a software one, and says less. */
   case JF_JOB_ENCODING:
     server_transcode.known = false;
+    break;
+  case JF_JOB_DELAYS:
+    /* None saved yet is a 404 on some servers: nothing to restore. */
+    break;
+  case JF_JOB_SAVE_DELAYS:
+    delays_changed = true; /* again at the next close */
+    set_error("Could not save the subtitle delay: %s", task->error);
+    break;
+  case JF_JOB_SUBTITLE_SEARCH:
+  case JF_JOB_SUBTITLE_DOWNLOAD:
+  case JF_JOB_SUBTITLE_CHECK:
+    search_failed(task);
+    break;
+  case JF_JOB_SUBTITLE_SOURCES:
+  case JF_JOB_SOURCE_INSTALL:
+  case JF_JOB_SOURCE_TOGGLE:
+  case JF_JOB_RESTART:
+  case JF_JOB_ADD_REPOSITORY:
+    sources_failed(task);
+    break;
+  case JF_JOB_SUBTITLE_DELETE:
+    set_error("Could not delete the subtitle: %s", task->error);
     break;
   default:
     set_error("%s failed: %s", job_name(task->job), task->error);
@@ -1408,6 +1634,44 @@ static void consume(jf_task *task) {
     server_transcode = task->encoding;
     break;
 
+  case JF_JOB_DELAYS:
+    /* What this playback already changed wins over what was saved. */
+    for (size_t i = 0; i < task->pair_count; i++) {
+      bool known = false;
+      for (size_t j = 0; j < saved_delay_count && !known; j++)
+        known = strcmp(saved_delays[j].key, task->keys[i]) == 0;
+      if (known || saved_delay_count == SAVED_DELAYS)
+        continue;
+      set_text(saved_delays[saved_delay_count].key, sizeof(saved_delays[0].key),
+               task->keys[i]);
+      saved_delays[saved_delay_count++].ms = atoi(task->values[i]);
+    }
+    break;
+  case JF_JOB_SAVE_DELAYS:
+    break;
+  case JF_JOB_SUBTITLE_SEARCH:
+  case JF_JOB_SUBTITLE_DOWNLOAD:
+  case JF_JOB_SUBTITLE_CHECK:
+    search_done(task);
+    break;
+  case JF_JOB_SUBTITLE_SOURCES:
+  case JF_JOB_SOURCE_INSTALL:
+  case JF_JOB_SOURCE_TOGGLE:
+  case JF_JOB_RESTART:
+  case JF_JOB_ADD_REPOSITORY:
+    sources_done(task);
+    break;
+  case JF_JOB_SUBTITLE_DELETE: {
+    /* Gone from the server: its list, asked again, no longer has it. */
+    awaiting_delete = true;
+    jf_task *info = request(JF_JOB_PLAYBACK_INFO, 0);
+    if (info != NULL) {
+      set_text(info->a, sizeof(info->a), playback_item_id);
+      jf_fetcher_start(&fetcher, info);
+    }
+    break;
+  }
+
   case JF_JOB_SEASONS:
     if (strcmp(task->a, detail.id) != 0)
       return;
@@ -1434,7 +1698,11 @@ static void consume(jf_task *task) {
   case JF_JOB_PLAYBACK_PROGRESS:
     break;
   case JF_JOB_PLAYBACK_INFO:
-    if (strcmp(task->a, playback_item_id) == 0)
+    if (strcmp(task->a, playback_item_id) != 0)
+      break;
+    if (task->tag == DOWNLOAD_POLL_TAG)
+      search_listed(&task->playback);
+    else
       use_playback_info(&task->playback);
     break;
   case JF_JOB_ADJACENT:
@@ -1472,6 +1740,8 @@ static void pump(void) {
       jf_fetcher_start(&fetcher, task);
     }
   }
+  poll_download();
+  poll_sources();
   if (screen == SCREEN_PLAYBACK && !playback_paused &&
       playback_item_id[0] != '\0' && jf_player_state_get() == JF_PLAYING &&
       now_ns() >= playback_progress_at) {
@@ -1803,18 +2073,45 @@ static void report_playback(jf_job job) {
 
 /* The server's subtitle streams, with its pick for the user's preferences
  * selected. */
+/* What a track's delay is saved under, and how a new one is told from the
+ * ones before it. Not the server's index: files beside the video are numbered
+ * first, so a download would shift every embedded track's. `embedded` counts
+ * the embedded tracks so far. */
+static void stream_key(const jf_subtitle_stream *stream, int *embedded,
+                       char out[80]) {
+  if (!stream->external) {
+    snprintf(out, 80, "%.40s:e%d", playback_item_id, (*embedded)++);
+    return;
+  }
+  /* Files beside the video come in whatever order the server lists them,
+   * which a download changes: by name, kept to characters a JSON key takes as
+   * they are. */
+  int at = snprintf(out, 80, "%.40s:x:", playback_item_id);
+  for (const char *c = stream->title; *c != '\0' && at + 1 < 80; c++)
+    out[at++] =
+        (*c >= '0' && *c <= '9') || ((*c | 0x20) >= 'a' && (*c | 0x20) <= 'z')
+            ? *c
+            : '_';
+  out[at] = '\0';
+}
+
 static void use_playback_info(const jf_playback_info *info) {
   set_text(playback_source_id, sizeof(playback_source_id),
            info->media_source_id);
-  static jf_player_track tracks[32];
-  int count = 0, selected = -1;
-  for (size_t i = 0; i < info->subtitle_count && count < 32; i++) {
+  static jf_player_track tracks[KNOWN_TRACKS];
+  int count = 0, selected = -1, embedded = 0;
+  memset(track_key, 0, sizeof(track_key));
+  for (size_t i = 0; i < info->subtitle_count && count < KNOWN_TRACKS; i++) {
     const jf_subtitle_stream *stream = &info->subtitles[i];
     /* A bitmap file beside the video has no source here: the server
      * converts only text, and it is not in the container. */
     if (!stream->text && stream->external)
       continue;
     jf_player_track *track = &tracks[count];
+    track_text[count] = stream->text;
+    track_styled[count] = stream->styled;
+    track_external[count] = stream->external;
+    stream_key(stream, &embedded, track_key[count]);
     *track = (jf_player_track){
         stream->index, stream->external, stream->text, "", "", -1};
     set_text(track->name, sizeof(track->name), stream->title);
@@ -1824,6 +2121,34 @@ static void use_playback_info(const jf_playback_info *info) {
     if (stream->index == info->default_subtitle)
       selected = count;
     count++;
+  }
+  /* A track just deleted: none selected, and back in the picker on "off". */
+  if (awaiting_delete) {
+    awaiting_delete = false;
+    selected = -1;
+    set_status("Subtitle deleted");
+    if (subtitle_settings) {
+      subtitle_settings = false;
+      subtitle_picker = true;
+      nav_focus(&ui, picker_row_id(track_row(-1)));
+    }
+  }
+  /* A download just landed: the track that was not there before. */
+  if (search.phase == DOWNLOAD_SELECTING) {
+    search.phase = DOWNLOAD_NONE;
+    for (int i = 0; i < count; i++) {
+      bool known = false;
+      for (int j = 0; j < search.before_count && !known; j++)
+        known = strcmp(search.before[j], track_key[i]) == 0;
+      if (!known)
+        selected = i;
+    }
+    /* Back in the picker on it: focus is the selection there. */
+    if (search.open) {
+      search.open = false;
+      subtitle_picker = true;
+      nav_focus(&ui, picker_row_id(track_row(selected)));
+    }
   }
   jf_player_subtitle_tracks(tracks, count, selected);
   fprintf(stderr, "Playback info: %d subtitle track(s), default stream %d\n",
@@ -1858,6 +2183,11 @@ static void start_playback(const char *id, const char *title,
   set_text(playback_item_id, sizeof(playback_item_id), id);
   set_text(playback_source_id, sizeof(playback_source_id), id);
   subtitle_picker = false;
+  subtitle_settings = false;
+  search.open = false;
+  sources.open = false;
+  if (!delays_asked)
+    delays_asked = (simple(JF_JOB_DELAYS), true);
   jf_task *info = request(JF_JOB_PLAYBACK_INFO, 0);
   if (info != NULL) {
     set_text(info->a, sizeof(info->a), id);
@@ -1899,12 +2229,22 @@ static nav_id picker_row_id(size_t row) {
   return nav_child(nav_str("subtitles"), nav_int(row));
 }
 
-/* Row 0 is off, row i + 1 the player's track i. */
+/* Row 0 downloads more, row 1 is off, row t + 2 the player's track t. */
+static size_t track_row(int track) { return (size_t)(track + 2); }
+
+static bool track_is_text(int track) {
+  return track >= 0 && track < KNOWN_TRACKS && track_text[track];
+}
+static bool track_is_ass(int track) {
+  return track_is_text(track) && track_styled[track];
+}
+/* Drawn by the app as plain text: text, and not ASS the script styles unless
+ * those are plain too. */
+static bool track_plain(int track) {
+  return track_is_text(track) && (!track_styled[track] || sub_style.plain_ass);
+}
+
 static void open_subtitle_picker(void) {
-  if (jf_player_subtitle_count() == 0) {
-    set_status("No subtitle tracks are available");
-    return;
-  }
   subtitle_picker = true;
   jf_player_subtitle_preview(true);
   picker_return_focus = ui.focus;
@@ -1918,17 +2258,713 @@ static void close_subtitle_picker(void) {
   nav_focus(&ui, picker_return_focus);
 }
 
+typedef enum {
+  SETTING_PLAIN_ASS,
+  SETTING_COLOR,
+  SETTING_OUTLINE,
+  SETTING_OUTLINE_WIDTH,
+  SETTING_OUTLINE_COLOR,
+  SETTING_INLINE,
+  SETTING_SIZE,
+  SETTING_MARGIN,
+  SETTING_SIDE,
+  SETTING_DELAY,
+  SETTING_SUGGEST,
+  SETTING_DELETE,
+  SETTING_COUNT
+} subtitle_setting;
+
+static nav_id setting_row_id(subtitle_setting row) {
+  return nav_child(nav_str("subtitle-settings"), nav_int(row));
+}
+
+/* The outline's own settings, drawn under it and only while it is on. */
+static bool setting_child(subtitle_setting row) {
+  return row == SETTING_OUTLINE_WIDTH || row == SETTING_OUTLINE_COLOR;
+}
+
+/* How the text looks, as opposed to when it shows. */
+static bool setting_is_style(subtitle_setting row) {
+  return row < SETTING_DELAY;
+}
+
+/* Whether a row is in the panel for the current track at all. */
+static bool setting_shown(subtitle_setting row) {
+  const int track = jf_player_subtitle_current();
+  if (row == SETTING_PLAIN_ASS)
+    return track_is_ass(track);
+  /* Only a file beside the video is the server's to delete. */
+  if (row == SETTING_DELETE)
+    return track >= 0 && track < KNOWN_TRACKS && track_external[track];
+  return !setting_child(row) || sub_style.outline;
+}
+
+/* Whether it does anything for the current track, else greyed out: a bitmap
+ * track is pictures, so no style applies; libass takes only the placement of
+ * styled ASS; and only lines can be matched to another track's. */
+static bool setting_enabled(subtitle_setting row) {
+  const int track = jf_player_subtitle_current();
+  if (row == SETTING_PLAIN_ASS || row == SETTING_DELAY || row == SETTING_DELETE)
+    return true;
+  if (row == SETTING_SUGGEST)
+    return track_is_text(track);
+  if (row == SETTING_SIZE || row == SETTING_MARGIN || row == SETTING_SIDE)
+    return track_is_text(track);
+  return track_plain(track);
+}
+
+/* The current track's delay, made on first use; NULL for a track with no
+ * key - off, or one only the container lists. */
+static int *current_delay(void) {
+  const int track = jf_player_subtitle_current();
+  if (track < 0 || track >= KNOWN_TRACKS || track_key[track][0] == '\0')
+    return NULL;
+  for (size_t i = 0; i < saved_delay_count; i++)
+    if (strcmp(saved_delays[i].key, track_key[track]) == 0)
+      return &saved_delays[i].ms;
+  if (saved_delay_count == SAVED_DELAYS)
+    return NULL;
+  snprintf(saved_delays[saved_delay_count].key, sizeof(saved_delays[0].key),
+           "%.79s", track_key[track]);
+  saved_delays[saved_delay_count].ms = 0;
+  return &saved_delays[saved_delay_count++].ms;
+}
+
+/* Every delay but zero, as the display preferences' custom settings. */
+static void save_delays(void) {
+  jf_task *task = request(JF_JOB_SAVE_DELAYS, 0);
+  if (task == NULL)
+    return;
+  size_t length = 0, capacity = 128 + saved_delay_count * 100;
+  char *body = jf_arena_alloc(&task->arena, capacity);
+  if (body == NULL) {
+    jf_fetcher_release(&fetcher, task);
+    return;
+  }
+  length += (size_t)snprintf(body, capacity,
+                             "{\"Id\":\"subtitle-delays\",\"Client\":\"%s\","
+                             "\"CustomPrefs\":{",
+                             JF_CLIENT_NAME);
+  bool first = true;
+  for (size_t i = 0; i < saved_delay_count; i++) {
+    if (saved_delays[i].ms == 0)
+      continue;
+    /* Keys are ids and digits: nothing in them needs escaping. */
+    length += (size_t)snprintf(body + length, capacity - length,
+                               "%s\"%s\":\"%d\"", first ? "" : ",",
+                               saved_delays[i].key, saved_delays[i].ms);
+    first = false;
+  }
+  snprintf(body + length, capacity - length, "}}");
+  task->body = body;
+  jf_fetcher_start(&fetcher, task);
+  delays_changed = false;
+}
+
+/* The panel keeps the picker's preview on: it is what gives the delay
+ * suggestion the other tracks' lines to compare. */
+static void open_subtitle_settings(void) {
+  subtitle_picker = false;
+  subtitle_settings = true;
+  for (int i = 0; i < SETTING_COUNT; i++)
+    if (setting_shown((subtitle_setting)i) &&
+        setting_enabled((subtitle_setting)i)) {
+      nav_focus(&ui, setting_row_id((subtitle_setting)i));
+      break;
+    }
+}
+
+static void close_subtitle_settings(void) {
+  subtitle_settings = false;
+  save_preferences();
+  if (delays_changed)
+    save_delays();
+  subtitle_picker = true;
+  nav_focus(&ui, picker_row_id(track_row(jf_player_subtitle_current())));
+}
+
+static void suggest_delay(void) {
+  int *delay = current_delay();
+  int64_t suggested = 0;
+  if (delay == NULL) {
+    set_status("Choose a track first");
+  } else if (jf_subs_suggest_delay(&suggested)) {
+    *delay = (int)suggested;
+    delays_changed = true;
+    set_status("Delay set to %+.1f s, matched to another track",
+               *delay / 1000.0);
+  } else {
+    set_status("Not enough lines in common with another track yet");
+  }
+}
+
+/* Rows OK (or a click) acts on: switches and actions. A value that steps is
+ * left and right's alone, so a stray click never nudges it. */
+static bool setting_is_toggle(subtitle_setting row) {
+  return row == SETTING_PLAIN_ASS || row == SETTING_OUTLINE ||
+         row == SETTING_INLINE || row == SETTING_SIDE ||
+         row == SETTING_SUGGEST || row == SETTING_DELETE;
+}
+
+static void delete_track(void) {
+  const int track = jf_player_subtitle_current();
+  jf_task *task = request(JF_JOB_SUBTITLE_DELETE, 0);
+  if (task == NULL)
+    return;
+  set_text(task->a, sizeof(task->a), playback_item_id);
+  snprintf(task->b, sizeof(task->b), "%d", jf_player_subtitle_stream(track));
+  jf_fetcher_start(&fetcher, task);
+  delete_armed = false;
+  set_status("Deleting %s", jf_player_subtitle_name(track));
+}
+
+/* Left and right change the row's value, OK toggles or acts. */
+static void change_setting(subtitle_setting row, int step) {
+  int *delay = current_delay();
+  switch (row) {
+  case SETTING_PLAIN_ASS:
+    sub_style.plain_ass = !sub_style.plain_ass;
+    break;
+  case SETTING_COLOR:
+    sub_style.color = (sub_style.color + step + SWATCH_COUNT) % SWATCH_COUNT;
+    break;
+  case SETTING_OUTLINE:
+    sub_style.outline = !sub_style.outline;
+    break;
+  case SETTING_OUTLINE_WIDTH:
+    sub_style.outline_width += step;
+    break;
+  case SETTING_OUTLINE_COLOR:
+    sub_style.outline_color =
+        (sub_style.outline_color + step + SWATCH_COUNT) % SWATCH_COUNT;
+    break;
+  case SETTING_INLINE:
+    sub_style.ignore_inline = !sub_style.ignore_inline;
+    break;
+  case SETTING_SIZE:
+    sub_style.size_percent += 10 * step;
+    break;
+  case SETTING_MARGIN:
+    sub_style.margin_percent += step;
+    break;
+  case SETTING_SIDE:
+    sub_style.top = !sub_style.top;
+    break;
+  case SETTING_DELAY:
+    if (delay != NULL) {
+      *delay = clampi(*delay + 100 * step, -60000, 60000);
+      delays_changed = true;
+    }
+    break;
+  case SETTING_SUGGEST:
+    suggest_delay();
+    break;
+  case SETTING_DELETE:
+    if (delete_armed)
+      delete_track();
+    else
+      delete_armed = true;
+    break;
+  case SETTING_COUNT:
+    break;
+  }
+  apply_subtitle_style();
+}
+
+static subtitle_setting focused_setting(void) {
+  for (int i = 0; i < SETTING_COUNT; i++)
+    if (ui.focus == setting_row_id((subtitle_setting)i))
+      return (subtitle_setting)i;
+  return SETTING_COUNT;
+}
+
+static void settings_key(uint32_t code) {
+  const subtitle_setting row = focused_setting();
+  if (jf_window_is_back_key(code) || code == KEY_SUBTITLE)
+    close_subtitle_settings();
+  else if (code == 103)
+    nav_move(&ui, NAV_UP);
+  else if (code == 108)
+    nav_move(&ui, NAV_DOWN);
+  else if ((code == 105 || code == 106) && !setting_is_toggle(row))
+    change_setting(row, code == 105 ? -1 : 1);
+  else if ((code == 105 || code == 106) && row != SETTING_SUGGEST &&
+           row != SETTING_DELETE)
+    change_setting(row, 1); /* a switch flips either way */
+  else if ((code == 28 || code == 96 || code == 352) && setting_is_toggle(row))
+    change_setting(row, 1);
+}
+
+/* ------------------------------------------------------ subtitle search
+ *
+ * The server's subtitle providers (OpenSubtitles and the like, set up by an
+ * administrator): results for a language, and one of them downloaded beside
+ * the video, after which the refreshed track list selects it. */
+
+static const struct {
+  const char *code, *name;
+} search_languages[] = {
+    {"eng", "English"},    {"ger", "German"},    {"fre", "French"},
+    {"spa", "Spanish"},    {"ita", "Italian"},   {"por", "Portuguese"},
+    {"dut", "Dutch"},      {"swe", "Swedish"},   {"nor", "Norwegian"},
+    {"dan", "Danish"},     {"fin", "Finnish"},   {"pol", "Polish"},
+    {"cze", "Czech"},      {"hun", "Hungarian"}, {"rum", "Romanian"},
+    {"gre", "Greek"},      {"rus", "Russian"},   {"ukr", "Ukrainian"},
+    {"tur", "Turkish"},    {"ara", "Arabic"},    {"heb", "Hebrew"},
+    {"hin", "Hindi"},      {"tha", "Thai"},      {"vie", "Vietnamese"},
+    {"ind", "Indonesian"}, {"jpn", "Japanese"},  {"kor", "Korean"},
+    {"chi", "Chinese"},
+};
+#define SEARCH_LANGUAGE_COUNT                                                  \
+  (int)(sizeof(search_languages) / sizeof(search_languages[0]))
+
+static nav_id search_row_id(size_t row) {
+  return nav_child(nav_str("subtitle-search"), nav_int(row));
+}
+
+static void start_search(void) {
+  sub_style.search_language =
+      clampi(sub_style.search_language, 0, SEARCH_LANGUAGE_COUNT - 1);
+  jf_task *task = request(JF_JOB_SUBTITLE_SEARCH, 0);
+  if (task == NULL)
+    return;
+  set_text(task->a, sizeof(task->a), playback_item_id);
+  set_text(task->b, sizeof(task->b),
+           search_languages[sub_style.search_language].code);
+  jf_fetcher_start(&fetcher, task);
+  search.searching = true;
+  search.count = 0;
+  search.error[0] = '\0';
+}
+
+/* The download panel's rows: its sources, the language - where the focus
+ * starts - and then the results. */
+#define SEARCH_ROW_SOURCES 0
+#define SEARCH_ROW_LANGUAGE 1
+#define SEARCH_ROW_RESULTS 2
+
+static void refresh_sources(void) {
+  jf_task *task = request(JF_JOB_SUBTITLE_SOURCES, 0);
+  if (task == NULL)
+    return;
+  jf_fetcher_start(&fetcher, task);
+  sources.loading = true;
+}
+
+static int sources_on(void) {
+  int on = 0;
+  for (size_t i = 0; i < sources.count; i++)
+    on += strcmp(sources.items[i].status, "Active") == 0;
+  return on;
+}
+
+static bool restart_pending(void) {
+  for (size_t i = 0; i < sources.count; i++)
+    if (strcmp(sources.items[i].status, "Restart") == 0)
+      return true;
+  return sources.changed;
+}
+
+/* The sources panel's rows: the sources, then the offer of more while
+ * subbuzz is not among them, then the restart while one is pending. */
+static bool offer_repository(void) {
+  if (!sources.loaded)
+    return false;
+  for (size_t i = 0; i < sources.count; i++)
+    if (strcasecmp(sources.items[i].name, "subbuzz") == 0)
+      return false;
+  return true;
+}
+static size_t repository_row(void) { return sources.count; }
+static size_t restart_row(void) {
+  return sources.count + (offer_repository() ? 1 : 0);
+}
+static size_t source_rows(void) {
+  return restart_row() + (restart_pending() ? 1 : 0);
+}
+
+static void add_repository(void) {
+  if (sources.adding)
+    return;
+  jf_task *task = request(JF_JOB_ADD_REPOSITORY, 0);
+  if (task == NULL)
+    return;
+  jf_fetcher_start(&fetcher, task);
+  sources.adding = true;
+  sources.note[0] = '\0';
+}
+
+static void open_subtitle_search(void) {
+  subtitle_picker = false;
+  search.open = true;
+  nav_focus(&ui, search_row_id(SEARCH_ROW_LANGUAGE));
+  refresh_sources();
+  start_search();
+}
+
+static void open_sources(void) {
+  search.open = false;
+  sources.open = true;
+  sources.note[0] = '\0';
+  sources.restart_armed = false;
+  nav_focus(&ui, nav_child(nav_str("subtitle-sources"), nav_int(0)));
+  refresh_sources();
+}
+
+static void close_sources(void) {
+  sources.open = false;
+  search.open = true;
+  nav_focus(&ui, search_row_id(SEARCH_ROW_SOURCES));
+  /* What was switched on may find what nothing did before. */
+  start_search();
+}
+
+static void sources_warn(bool error, const char *pattern, ...) {
+  va_list args;
+  va_start(args, pattern);
+  vsnprintf(sources.note, sizeof(sources.note), pattern, args);
+  va_end(args);
+  sources.note_is_error = error;
+}
+
+/* Install what is not there, switch what is. */
+static void activate_source(size_t index) {
+  if (index >= sources.count || sources.items[index].busy)
+    return;
+  const char *status = sources.items[index].status;
+  if (strcmp(status, "Malfunctioned") == 0 ||
+      strcmp(status, "NotSupported") == 0) {
+    sources_warn(true, "%s does not work on this server version",
+                 sources.items[index].name);
+    return;
+  }
+  const bool install = status[0] == '\0';
+  jf_task *task =
+      request(install ? JF_JOB_SOURCE_INSTALL : JF_JOB_SOURCE_TOGGLE, 0);
+  if (task == NULL)
+    return;
+  if (install) {
+    set_text(task->a, sizeof(task->a), sources.items[index].name);
+    set_text(task->b, sizeof(task->b), sources.items[index].guid);
+  } else {
+    set_text(task->a, sizeof(task->a), sources.items[index].guid);
+    set_text(task->b, sizeof(task->b), sources.items[index].version);
+    /* On, or on once the server restarts, switches off; anything else on. */
+    task->start =
+        strcmp(status, "Active") != 0 && strcmp(status, "Restart") != 0;
+  }
+  jf_fetcher_start(&fetcher, task);
+  sources.items[index].busy = true;
+  sources.note[0] = '\0';
+}
+
+static void restart_server(void) {
+  if (!sources.restart_armed) {
+    sources.restart_armed = true;
+    return;
+  }
+  sources.restart_armed = false;
+  simple(JF_JOB_RESTART);
+}
+
+static void sources_failed(const jf_task *task) {
+  if (task->job == JF_JOB_SUBTITLE_SOURCES) {
+    sources.loading = false;
+    sources_warn(true, "The server did not list its plugins: %s", task->error);
+    return;
+  }
+  for (size_t i = 0; i < sources.count; i++)
+    sources.items[i].busy = false;
+  sources.adding = false;
+  if (strcmp(task->error, "Unauthorized") == 0)
+    sources_warn(true, "Only an administrator can change subtitle sources");
+  else
+    sources_warn(true, "The server refused: %s", task->error);
+}
+
+static void sources_done(const jf_task *task) {
+  switch (task->job) {
+  case JF_JOB_SUBTITLE_SOURCES:
+    sources.loading = false;
+    sources.loaded = true;
+    sources.count = 0;
+    for (size_t i = 0; i < task->source_count && sources.count < SOURCES; i++) {
+      const jf_subtitle_source *from = &task->sources[i];
+      if (from->name == NULL || from->guid == NULL)
+        continue;
+      set_text(sources.items[sources.count].name, sizeof(sources.items[0].name),
+               from->name);
+      set_text(sources.items[sources.count].guid, sizeof(sources.items[0].guid),
+               from->guid);
+      set_text(sources.items[sources.count].version,
+               sizeof(sources.items[0].version),
+               from->version != NULL ? from->version : "");
+      set_text(sources.items[sources.count].status,
+               sizeof(sources.items[0].status),
+               from->status != NULL ? from->status : "");
+      sources.items[sources.count].busy =
+          sources.installing[0] != '\0' &&
+          strcmp(sources.installing, from->name) == 0 && from->status == NULL;
+      sources.count++;
+    }
+    if (sources.installing[0] != '\0') {
+      bool waiting = false;
+      for (size_t i = 0; i < sources.count; i++)
+        waiting |= sources.items[i].busy;
+      if (!waiting) {
+        sources.installing[0] = '\0';
+        sources_warn(false, "Installed: it works once the server restarts");
+      } else if (++sources.polls >= 30) {
+        sources.installing[0] = '\0';
+        sources_warn(true, "The server has not finished installing it");
+      }
+    }
+    return;
+  case JF_JOB_SOURCE_INSTALL:
+    /* Installing happens in the background: the list says when it is done. */
+    snprintf(sources.installing, sizeof(sources.installing), "%.95s", task->a);
+    sources.polls = 0;
+    sources.poll_at = now_ns();
+    return;
+  case JF_JOB_SOURCE_TOGGLE:
+    sources.changed = true;
+    sources_warn(false, "Changed: it takes effect once the server restarts");
+    refresh_sources();
+    return;
+  case JF_JOB_ADD_REPOSITORY:
+    sources.adding = false;
+    sources_warn(false, "Added: subbuzz can be installed now");
+    refresh_sources();
+    return;
+  case JF_JOB_RESTART:
+    sources_warn(false, "The server is restarting; playback stops");
+    return;
+  default:
+    return;
+  }
+}
+
+/* Looks at the list while an install finishes. From pump. */
+static void poll_sources(void) {
+  if (sources.installing[0] == '\0' || sources.loading ||
+      now_ns() < sources.poll_at)
+    return;
+  sources.poll_at = now_ns() + 1500000000ull;
+  refresh_sources();
+}
+
+static void activate_source_row(size_t row) {
+  if (row < sources.count)
+    activate_source(row);
+  else if (offer_repository() && row == repository_row())
+    add_repository();
+  else if (restart_pending() && row == restart_row())
+    restart_server();
+}
+
+static void sources_key(uint32_t code) {
+  size_t row = SIZE_MAX;
+  for (size_t i = 0; i < source_rows(); i++)
+    if (ui.focus == nav_child(nav_str("subtitle-sources"), nav_int(i)))
+      row = i;
+  if (jf_window_is_back_key(code))
+    close_sources();
+  else if (code == 103)
+    nav_move(&ui, NAV_UP);
+  else if (code == 108)
+    nav_move(&ui, NAV_DOWN);
+  else if (code == 28 || code == 96 || code == 352)
+    activate_source_row(row);
+}
+
+static void close_subtitle_search(void) {
+  search.open = false;
+  subtitle_picker = true;
+  nav_focus(&ui, picker_row_id(0));
+}
+
+static void download_result(size_t index) {
+  if (search.phase != DOWNLOAD_NONE || index >= search.count)
+    return;
+  jf_task *task = request(JF_JOB_SUBTITLE_DOWNLOAD, 0);
+  if (task == NULL)
+    return;
+  set_text(task->a, sizeof(task->a), playback_item_id);
+  set_text(task->b, sizeof(task->b), search.results[index].id);
+  jf_fetcher_start(&fetcher, task);
+  search.phase = DOWNLOAD_FETCHING;
+  search.error[0] = '\0';
+  search.before_count = 0;
+  for (int i = 0; i < KNOWN_TRACKS && track_key[i][0] != '\0'; i++)
+    snprintf(search.before[search.before_count++], sizeof(search.before[0]),
+             "%.79s", track_key[i]);
+}
+
+static void search_failed(const jf_task *task) {
+  if (task->job == JF_JOB_SUBTITLE_SEARCH) {
+    search.searching = false;
+    /* The server answers 404 for a provider that is not there, 403 for a
+     * user not allowed to manage subtitles. */
+    search.error_is_warning = sources.loaded && sources_on() == 0;
+    snprintf(search.error, sizeof(search.error), "%s",
+             strcmp(task->error, "Unauthorized") == 0
+                 ? "This user may not download subtitles"
+             : search.error_is_warning
+                 ? "No subtitle source is on: turn one on under Sources"
+                 : "No subtitle source answered");
+    return;
+  }
+  const bool poll = task->job == JF_JOB_PLAYBACK_INFO;
+  if (poll) {
+    /* One missed look is not the end: ask again at the next beat. */
+    search.poll_in_flight = false;
+    return;
+  }
+  search.phase = DOWNLOAD_NONE;
+  search.error_is_warning = false;
+  snprintf(search.error, sizeof(search.error), "%s: %s",
+           task->job == JF_JOB_SUBTITLE_CHECK
+               ? "The download is listed but cannot be read"
+           : strcmp(task->error, "Unauthorized") == 0
+               ? "This user may not download subtitles"
+               : "The download failed",
+           task->error);
+}
+
+/* A look at the list while waiting for the download: the new track, once
+ * there, is read back before anything changes. */
+static void search_listed(const jf_playback_info *info) {
+  search.poll_in_flight = false;
+  if (search.phase != DOWNLOAD_LISTING)
+    return;
+  int embedded = 0;
+  for (size_t i = 0; i < info->subtitle_count; i++) {
+    const jf_subtitle_stream *stream = &info->subtitles[i];
+    char key[80];
+    stream_key(stream, &embedded, key);
+    bool known = false;
+    for (int j = 0; j < search.before_count && !known; j++)
+      known = strcmp(search.before[j], key) == 0;
+    if (known || !stream->text)
+      continue;
+    jf_task *task = request(JF_JOB_SUBTITLE_CHECK, 0);
+    if (task == NULL)
+      return; /* the next look tries again */
+    set_text(task->a, sizeof(task->a), playback_item_id);
+    set_text(task->b, sizeof(task->b), info->media_source_id);
+    task->start = (uint32_t)stream->index;
+    jf_fetcher_start(&fetcher, task);
+    search.phase = DOWNLOAD_CHECKING;
+    return;
+  }
+  if (++search.polls >= DOWNLOAD_POLLS) {
+    search.phase = DOWNLOAD_NONE;
+    search.error_is_warning = false;
+    snprintf(search.error, sizeof(search.error),
+             "Downloaded, but the server has not listed it yet");
+  }
+}
+
+/* Asks for the list while a download waits to be listed. From pump. */
+static void poll_download(void) {
+  if (search.phase != DOWNLOAD_LISTING || search.poll_in_flight ||
+      now_ns() < search.poll_at)
+    return;
+  jf_task *info = request(JF_JOB_PLAYBACK_INFO, DOWNLOAD_POLL_TAG);
+  if (info == NULL)
+    return;
+  set_text(info->a, sizeof(info->a), playback_item_id);
+  jf_fetcher_start(&fetcher, info);
+  search.poll_in_flight = true;
+  search.poll_at = now_ns() + DOWNLOAD_POLL_NS;
+}
+
+static void search_done(const jf_task *task) {
+  if (task->job == JF_JOB_SUBTITLE_CHECK) {
+    /* Readable: the list that selects it, where use_playback_info finishes. */
+    search.phase = DOWNLOAD_SELECTING;
+    jf_task *info = request(JF_JOB_PLAYBACK_INFO, 0);
+    if (info != NULL) {
+      set_text(info->a, sizeof(info->a), playback_item_id);
+      jf_fetcher_start(&fetcher, info);
+    }
+    return;
+  }
+  if (task->job == JF_JOB_SUBTITLE_DOWNLOAD) {
+    search.phase = DOWNLOAD_LISTING;
+    search.polls = 0;
+    search.poll_at = now_ns();
+    poll_download();
+    return;
+  }
+  if (!search.searching || strcmp(task->a, playback_item_id) != 0 ||
+      strcmp(task->b, search_languages[sub_style.search_language].code) != 0)
+    return; /* an older language's */
+  search.searching = false;
+  search.count = 0;
+  for (size_t i = 0; i < task->remote_count && search.count < SEARCH_RESULTS;
+       i++) {
+    const jf_remote_subtitle *r = &task->remote[i];
+    set_text(search.results[search.count].id, sizeof(search.results[0].id),
+             r->id);
+    set_text(search.results[search.count].name, sizeof(search.results[0].name),
+             r->name != NULL ? r->name : r->id);
+    snprintf(search.results[search.count].detail,
+             sizeof(search.results[0].detail), "%s  %s  %d downloads",
+             r->provider != NULL ? r->provider : "",
+             r->format != NULL ? r->format : "", r->downloads);
+    search.count++;
+  }
+  search.error_is_warning = true;
+  if (search.count == 0)
+    snprintf(search.error, sizeof(search.error), "Nothing found in %s",
+             search_languages[sub_style.search_language].name);
+}
+
+static void search_key(uint32_t code) {
+  size_t row = SIZE_MAX;
+  for (size_t i = 0; i < SEARCH_ROW_RESULTS + search.count; i++)
+    if (ui.focus == search_row_id(i))
+      row = i;
+  const bool select = code == 28 || code == 96 || code == 352;
+  if (jf_window_is_back_key(code))
+    close_subtitle_search();
+  else if (code == 103)
+    nav_move(&ui, NAV_UP);
+  else if (code == 108)
+    nav_move(&ui, NAV_DOWN);
+  else if ((select || code == 106) && row == SEARCH_ROW_SOURCES)
+    open_sources();
+  else if ((code == 105 || code == 106) && row == SEARCH_ROW_LANGUAGE) {
+    sub_style.search_language =
+        (sub_style.search_language + (code == 105 ? -1 : 1) +
+         SEARCH_LANGUAGE_COUNT) %
+        SEARCH_LANGUAGE_COUNT;
+    save_preferences();
+    start_search();
+  } else if (select && row != SIZE_MAX && row >= SEARCH_ROW_RESULTS)
+    download_result(row - SEARCH_ROW_RESULTS);
+}
+
 /* The picker takes every key while it is up. The subtitle key goes round the
- * tracks. */
+ * tracks, and right on a track - the arrow - opens its appearance and timing.
+ * Focus is the selection, so that is the track showing. OK on the first row
+ * searches for more. */
 static void picker_key(uint32_t code) {
-  if (jf_window_is_back_key(code) || code == 28 || code == 96 || code == 352)
+  const bool on_search = ui.focus == picker_row_id(0);
+  if ((code == 28 || code == 96 || code == 352) && on_search)
+    open_subtitle_search();
+  else if (jf_window_is_back_key(code) || code == 28 || code == 96 ||
+           code == 352)
     close_subtitle_picker();
   else if (code == 103)
     nav_move(&ui, NAV_UP);
   else if (code == 108)
     nav_move(&ui, NAV_DOWN);
+  else if (code == 106 && !on_search && jf_player_subtitle_current() >= 0)
+    open_subtitle_settings();
   else if (code == KEY_SUBTITLE && !nav_move(&ui, NAV_DOWN))
-    nav_focus(&ui, picker_row_id(0));
+    nav_focus(&ui, picker_row_id(track_row(-1)));
 }
 
 /* Next is the first chapter starting after here; back is the start of this
@@ -2179,6 +3215,18 @@ static void on_key(uint32_t code, bool pressed, bool repeat) {
     return;
   }
   jf_window_frame_requested = true;
+  if (screen == SCREEN_PLAYBACK && subtitle_settings) {
+    settings_key(code);
+    return;
+  }
+  if (screen == SCREEN_PLAYBACK && search.open) {
+    search_key(code);
+    return;
+  }
+  if (screen == SCREEN_PLAYBACK && sources.open) {
+    sources_key(code);
+    return;
+  }
   if (screen == SCREEN_PLAYBACK && subtitle_picker) {
     picker_key(code);
     return;
@@ -3125,7 +4173,7 @@ static void draw_season(loom_context *ctx, float width, float height,
 static void draw_subtitle_picker(loom_context *ctx, float width, float height,
                                  float scale) {
   static const loom_color chrome = {8, 12, 20, 215};
-  const size_t rows = (size_t)jf_player_subtitle_count() + 1;
+  const size_t rows = track_row(jf_player_subtitle_count() - 1) + 1;
   const float row = 58 * scale, head = 64 * scale;
   const size_t visible = min_size(rows, 11);
   const loom_rect panel = {width - 620 * scale,
@@ -3136,14 +4184,14 @@ static void draw_subtitle_picker(loom_context *ctx, float width, float height,
              (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
                          36 * scale},
              &panel, "Subtitles", DIM, 22 * scale);
-  /* The choice stays in the middle, once there is room above it. */
   const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
+  /* Scrolled only once the focus reaches the last row in view. */
   const float scroll =
       nav_scroll_begin(&ui, nav_str("subtitles"), list, LOOM_VERTICAL,
-                       (float)rows * row, (float)(visible / 2) * row, 0);
+                       (float)rows * row, row, 0);
   if (picker_focus_pending) {
     picker_focus_pending = false;
-    nav_focus(&ui, picker_row_id((size_t)(jf_player_subtitle_current() + 1)));
+    nav_focus(&ui, picker_row_id(track_row(jf_player_subtitle_current())));
   }
   bool chosen_any = false;
   for (size_t i = 0; i < rows; i++) {
@@ -3152,26 +4200,384 @@ static void draw_subtitle_picker(loom_context *ctx, float width, float height,
                             panel.w - 24 * scale, row - 6 * scale};
     const unsigned flags = nav_item(&ui, nav_int(i), rect, list);
     const bool chosen = flags & NAV_FOCUSED;
+    const int track = (int)i - 2;
     /* Moving is choosing: the frame behind the picker shows the track at
      * once. A click closes it, as OK does. */
-    if (chosen && (int)i - 1 != jf_player_subtitle_current())
-      jf_player_subtitle_select((int)i - 1);
-    chosen_any |= (flags & NAV_ACTIVATED) != 0;
+    if (i > 0 && chosen && track != jf_player_subtitle_current())
+      jf_player_subtitle_select(track);
+    if (i == 0 && (flags & NAV_ACTIVATED))
+      open_subtitle_search();
+    else
+      chosen_any |= (flags & NAV_ACTIVATED) != 0;
     if (rect.y + rect.h <= list.y || rect.y >= list.y + list.h)
       continue;
     if (chosen)
       loom_fill(ctx, rect, &list, SELECTED, 10 * scale);
-    const char *name = i == 0 ? "Off" : jf_player_subtitle_name((int)i - 1);
+    const char *name = i == 0   ? "Download subtitles..."
+                       : i == 1 ? "Off"
+                                : jf_player_subtitle_name(track);
+    /* Every track has its appearance and timing to the right. */
+    const float arrow = track >= 0 ? 36 * scale : 0;
+    const float text_y = rect.y + (rect.h - 30 * scale) / 2;
     loom_label(ctx,
-               (loom_rect){rect.x + 16 * scale,
-                           rect.y + (rect.h - 30 * scale) / 2,
-                           rect.w - 32 * scale, 36 * scale},
-               &list, ellipsize(name, rect.w - 32 * scale, 22 * scale),
-               chosen ? WHITE : TEXT, 22 * scale);
+               (loom_rect){rect.x + 16 * scale, text_y,
+                           rect.w - 32 * scale - arrow, 36 * scale},
+               &list, ellipsize(name, rect.w - 32 * scale - arrow, 22 * scale),
+               chosen   ? WHITE
+               : i == 0 ? ACCENT
+                        : TEXT,
+               22 * scale);
+    if (track >= 0)
+      loom_label(ctx,
+                 (loom_rect){rect.x + rect.w - 34 * scale, text_y, 18 * scale,
+                             36 * scale},
+                 &list, ">", chosen ? WHITE : DIM, 22 * scale);
   }
   nav_scroll_end(&ui);
-  if (chosen_any)
+  if (chosen_any && subtitle_picker)
     close_subtitle_picker();
+}
+
+/* A row's label at the left and its value at the right, with arrows round a
+ * value left and right step, or an arrow to a submenu. */
+static void draw_value_row(loom_context *ctx, loom_rect rect,
+                           const loom_rect *clip, const char *label,
+                           const char *value, const loom_color value_ink,
+                           bool focused, bool steps, bool submenu,
+                           float scale) {
+  const float text_y = rect.y + (rect.h - 28 * scale) / 2;
+  loom_label(ctx, (loom_rect){rect.x + 16 * scale, text_y, rect.w, 32 * scale},
+             clip, label, focused ? WHITE : TEXT, 20 * scale);
+  const char *shown = focused && steps ? fmt("<  %s  >", value)
+                      : submenu        ? fmt("%s   >", value)
+                                       : value;
+  const float value_w = jf_renderer_measure(renderer, shown, 20 * scale);
+  loom_label(ctx,
+             (loom_rect){rect.x + rect.w - 16 * scale - value_w, text_y,
+                         value_w, 32 * scale},
+             clip, shown, focused ? WHITE : value_ink, 20 * scale);
+}
+
+/* A panel's note under its list: yellow for something to do, red for
+ * something that went wrong. */
+static void draw_note(loom_context *ctx, loom_rect panel, float y,
+                      const char *note, bool error, float scale) {
+  if (note[0] == '\0')
+    return;
+  loom_label(
+      ctx,
+      (loom_rect){panel.x + 28 * scale, y, panel.w - 56 * scale, 32 * scale},
+      &panel, ellipsize(note, panel.w - 56 * scale, 20 * scale),
+      error ? RED : YELLOW, 20 * scale);
+}
+
+static void draw_subtitle_search(loom_context *ctx, float width, float height,
+                                 float scale) {
+  static const loom_color chrome = {8, 12, 20, 225};
+  const size_t rows = SEARCH_ROW_RESULTS + search.count;
+  const float row = 64 * scale, head = 64 * scale;
+  const size_t visible = min_size(rows, 10);
+  const loom_rect panel = {width - 820 * scale,
+                           (height - head - 10 * row) / 2 - 40 * scale,
+                           760 * scale, head + 10 * row + 56 * scale};
+  loom_fill(ctx, panel, NULL, chrome, 16 * scale);
+  loom_label(ctx,
+             (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
+                         36 * scale},
+             &panel, "Download subtitles", DIM, 22 * scale);
+  const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
+  const float scroll =
+      nav_scroll_begin(&ui, nav_str("subtitle-search"), list, LOOM_VERTICAL,
+                       (float)rows * row, row, 0);
+  for (size_t i = 0; i < rows; i++) {
+    const loom_rect rect = {panel.x + 12 * scale,
+                            list.y + (float)i * row - scroll,
+                            panel.w - 24 * scale, row - 6 * scale};
+    const unsigned flags = nav_item(&ui, nav_int(i), rect, list);
+    if (flags & NAV_ACTIVATED) {
+      if (i == SEARCH_ROW_SOURCES)
+        open_sources();
+      else if (i >= SEARCH_ROW_RESULTS)
+        download_result(i - SEARCH_ROW_RESULTS);
+    }
+    if (rect.y + rect.h <= list.y || rect.y >= list.y + list.h)
+      continue;
+    const bool focused = flags & NAV_FOCUSED;
+    if (focused)
+      loom_fill(ctx, rect, &list, SELECTED, 10 * scale);
+    if (i == SEARCH_ROW_SOURCES) {
+      const int on = sources_on();
+      const bool none = sources.loaded && on == 0;
+      draw_value_row(ctx, rect, &list, "Sources",
+                     !sources.loaded ? "..."
+                     : none          ? "None on"
+                                     : fmt("%d on", on),
+                     none ? YELLOW : DIM, focused, false, true, scale);
+      continue;
+    }
+    if (i == SEARCH_ROW_LANGUAGE) {
+      draw_value_row(ctx, rect, &list, "Language",
+                     search_languages[sub_style.search_language].name, DIM,
+                     focused, true, false, scale);
+      continue;
+    }
+    const size_t r = i - SEARCH_ROW_RESULTS;
+    const float text_w = rect.w - 32 * scale;
+    loom_label(ctx,
+               (loom_rect){rect.x + 16 * scale, rect.y + 6 * scale, text_w,
+                           32 * scale},
+               &list, ellipsize(search.results[r].name, text_w, 20 * scale),
+               focused ? WHITE : TEXT, 20 * scale);
+    loom_label(ctx,
+               (loom_rect){rect.x + 16 * scale, rect.y + 34 * scale, text_w,
+                           28 * scale},
+               &list, ellipsize(search.results[r].detail, text_w, 16 * scale),
+               DIM, 16 * scale);
+  }
+  nav_scroll_end(&ui);
+  static const char *const phases[] = {
+      [DOWNLOAD_FETCHING] = "Downloading...",
+      [DOWNLOAD_LISTING] = "Waiting for the server to list it...",
+      [DOWNLOAD_CHECKING] = "Checking it can be read...",
+      [DOWNLOAD_SELECTING] = "Selecting it...",
+  };
+  const float note_y = panel.y + panel.h - 44 * scale;
+  if (search.phase != DOWNLOAD_NONE || search.searching)
+    loom_label(ctx,
+               (loom_rect){panel.x + 28 * scale, note_y, panel.w - 56 * scale,
+                           32 * scale},
+               &panel,
+               search.phase != DOWNLOAD_NONE ? phases[search.phase]
+                                             : "Searching...",
+               DIM, 20 * scale);
+  else
+    draw_note(ctx, panel, note_y, search.error, !search.error_is_warning,
+              scale);
+}
+
+static void draw_subtitle_sources(loom_context *ctx, float width, float height,
+                                  float scale) {
+  static const loom_color chrome = {8, 12, 20, 225};
+  static const loom_color armed = {150, 40, 40, 255};
+  const size_t rows = source_rows();
+  /* Moving off the restart row takes back its first press. */
+  if (ui.focus !=
+      nav_child(nav_str("subtitle-sources"), nav_int(restart_row())))
+    sources.restart_armed = false;
+  const float row = 58 * scale, head = 64 * scale;
+  const size_t visible = min_size(rows > 0 ? rows : 1, 9);
+  const loom_rect panel = {width - 720 * scale,
+                           (height - head - 9 * row) / 2 - 40 * scale,
+                           660 * scale, head + 9 * row + 56 * scale};
+  loom_fill(ctx, panel, NULL, chrome, 16 * scale);
+  loom_label(ctx,
+             (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
+                         36 * scale},
+             &panel, "Subtitle sources", DIM, 22 * scale);
+  const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
+  const float scroll =
+      nav_scroll_begin(&ui, nav_str("subtitle-sources"), list, LOOM_VERTICAL,
+                       (float)rows * row, row, 0);
+  for (size_t i = 0; i < rows; i++) {
+    const loom_rect rect = {panel.x + 12 * scale,
+                            list.y + (float)i * row - scroll,
+                            panel.w - 24 * scale, row - 6 * scale};
+    const unsigned flags = nav_item(&ui, nav_int(i), rect, list);
+    if (flags & NAV_ACTIVATED)
+      activate_source_row(i);
+    if (rect.y + rect.h <= list.y || rect.y >= list.y + list.h)
+      continue;
+    const bool focused = flags & NAV_FOCUSED;
+    if (i >= sources.count && restart_pending() && i == restart_row()) {
+      /* Restarting stops playback: red, and a second press, as deleting. */
+      if (focused)
+        loom_fill(ctx, rect, &list, sources.restart_armed ? armed : SELECTED,
+                  10 * scale);
+      draw_value_row(ctx, rect, &list, "Restart the server to apply",
+                     sources.restart_armed ? "Press again: playback stops" : "",
+                     WHITE, focused, false, false, scale);
+      continue;
+    }
+    if (focused)
+      loom_fill(ctx, rect, &list, SELECTED, 10 * scale);
+    if (i >= sources.count) {
+      draw_value_row(ctx, rect, &list, "Add more sources",
+                     sources.adding ? "Working..." : "subbuzz repository",
+                     ACCENT, focused, false, false, scale);
+      continue;
+    }
+    const char *status = sources.items[i].status;
+    const char *value;
+    loom_color ink;
+    if (sources.items[i].busy)
+      value = "Working...", memcpy(ink, DIM, sizeof(ink));
+    else if (status[0] == '\0')
+      value = "Install", memcpy(ink, ACCENT, sizeof(ink));
+    else if (strcmp(status, "Active") == 0)
+      value = "On", memcpy(ink, ACCENT, sizeof(ink));
+    else if (strcmp(status, "Disabled") == 0)
+      value = "Off", memcpy(ink, DIM, sizeof(ink));
+    else if (strcmp(status, "Restart") == 0)
+      value = "On after restart", memcpy(ink, YELLOW, sizeof(ink));
+    else
+      value = "Broken", memcpy(ink, RED, sizeof(ink));
+    draw_value_row(ctx, rect, &list, sources.items[i].name, value, ink, focused,
+                   false, false, scale);
+  }
+  nav_scroll_end(&ui);
+  const float note_y = panel.y + panel.h - 44 * scale;
+  if (sources.loading && sources.count == 0)
+    loom_label(ctx,
+               (loom_rect){panel.x + 28 * scale, note_y, panel.w, 32 * scale},
+               &panel, "Asking the server...", DIM, 20 * scale);
+  else if (sources.loaded && sources.count == 0 && sources.note[0] == '\0')
+    draw_note(ctx, panel, note_y,
+              "The server's plugin repositories offer no subtitle source",
+              false, scale);
+  else
+    draw_note(ctx, panel, note_y, sources.note, sources.note_is_error, scale);
+}
+
+static const char *setting_value(subtitle_setting row) {
+  const int *delay = current_delay();
+  switch (row) {
+  case SETTING_PLAIN_ASS:
+    return sub_style.plain_ass ? "Plain" : "Styled";
+  case SETTING_COLOR:
+    return swatches[sub_style.color].name;
+  case SETTING_OUTLINE:
+    return sub_style.outline ? "On" : "Off";
+  case SETTING_OUTLINE_WIDTH:
+    return fmt("%d px", sub_style.outline_width);
+  case SETTING_OUTLINE_COLOR:
+    return swatches[sub_style.outline_color].name;
+  case SETTING_INLINE:
+    return sub_style.ignore_inline ? "Ignore" : "Keep";
+  case SETTING_SIZE:
+    return fmt("%d%%", 100 + sub_style.size_percent);
+  case SETTING_MARGIN:
+    return fmt("%d%%", sub_style.margin_percent);
+  case SETTING_SIDE:
+    return sub_style.top ? "Top" : "Bottom";
+  case SETTING_DELAY:
+    return delay != NULL ? fmt("%+.1f s", *delay / 1000.0) : "-";
+  case SETTING_DELETE:
+    return delete_armed ? "Press again to delete" : "";
+  default:
+    return "";
+  }
+}
+
+static void draw_subtitle_settings(loom_context *ctx, float width, float height,
+                                   float scale) {
+  static const char *const labels[SETTING_COUNT] = {
+      [SETTING_PLAIN_ASS] = "Draw as plain text",
+      [SETTING_COLOR] = "Text colour",
+      [SETTING_OUTLINE] = "Outline",
+      [SETTING_OUTLINE_WIDTH] = "Width",
+      [SETTING_OUTLINE_COLOR] = "Colour",
+      [SETTING_INLINE] = "Bold and italic",
+      [SETTING_SIZE] = "Size",
+      [SETTING_MARGIN] = "Edge margin",
+      [SETTING_SIDE] = "Position",
+      [SETTING_DELAY] = "Delay",
+      [SETTING_SUGGEST] = "Match delay to another track",
+      [SETTING_DELETE] = "Delete subtitle file",
+  };
+  /* Moving off the delete row takes back the first OK. */
+  if (focused_setting() != SETTING_DELETE)
+    delete_armed = false;
+  static const loom_color chrome = {8, 12, 20, 215};
+  static const loom_color greyed = {110, 122, 138, 255};
+  subtitle_setting shown[SETTING_COUNT];
+  size_t rows = 0;
+  for (int i = 0; i < SETTING_COUNT; i++)
+    if (setting_shown((subtitle_setting)i))
+      shown[rows++] = (subtitle_setting)i;
+  const float row = 50 * scale, head = 64 * scale;
+  const size_t visible = min_size(rows, 13);
+  const loom_rect panel = {width - 660 * scale, 40 * scale, 600 * scale,
+                           head + visible * row + 16 * scale};
+  loom_fill(ctx, panel, NULL, chrome, 16 * scale);
+  loom_label(ctx,
+             (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
+                         36 * scale},
+             &panel, "Subtitle appearance and timing", DIM, 22 * scale);
+  const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
+  /* Scrolled only once the focus reaches the last row in view. */
+  const float scroll =
+      nav_scroll_begin(&ui, nav_str("subtitle-settings"), list, LOOM_VERTICAL,
+                       (float)rows * row, row, 0);
+  for (size_t r = 0; r < rows; r++) {
+    const subtitle_setting i = shown[r];
+    const bool child = setting_child(i);
+    const float indent = child ? 34 * scale : 0;
+    const loom_rect rect = {panel.x + 12 * scale,
+                            list.y + (float)r * row - scroll,
+                            panel.w - 24 * scale, row - 6 * scale};
+    const bool enabled = setting_enabled(i);
+    /* Greyed rows are not stops for the focus. */
+    const unsigned flags = enabled ? nav_item(&ui, nav_int(i), rect, list) : 0;
+    if ((flags & NAV_ACTIVATED) && setting_is_toggle(i))
+      change_setting(i, 1);
+    if (rect.y + rect.h <= list.y || rect.y >= list.y + list.h)
+      continue;
+    const bool focused = flags & NAV_FOCUSED;
+    const float mid = rect.y + rect.h / 2;
+    if (child) {
+      /* A tree line from the parent: down through every child and across to
+       * each, stopping at the last one's middle. */
+      const float x = rect.x + 26 * scale;
+      const bool last = r + 1 == rows || !setting_child(shown[r + 1]);
+      const float top = rect.y - 6 * scale;
+      const float bottom = last ? mid : rect.y + rect.h + 6 * scale;
+      loom_fill(ctx, (loom_rect){x, top, 2 * scale, bottom - top}, &list,
+                BORDER, 0);
+      loom_fill(ctx, (loom_rect){x, mid - scale, 16 * scale, 2 * scale}, &list,
+                BORDER, 0);
+    }
+    const loom_rect body = {rect.x + indent, rect.y, rect.w - indent, rect.h};
+    /* Deleting is red, and its row turns red while it waits for the OK that
+     * confirms it. */
+    static const loom_color armed = {150, 40, 40, 255};
+    const bool deleting = i == SETTING_DELETE;
+    if (focused)
+      loom_fill(ctx, body, &list, deleting && delete_armed ? armed : SELECTED,
+                10 * scale);
+    const float text_y = rect.y + (rect.h - 28 * scale) / 2;
+    const loom_color *ink = !enabled                    ? &greyed
+                            : deleting && !delete_armed ? &RED
+                            : focused                   ? &WHITE
+                                                        : &TEXT;
+    loom_label(ctx,
+               (loom_rect){body.x + 16 * scale, text_y, body.w, 32 * scale},
+               &list, labels[i], *ink, 20 * scale);
+    const char *value = setting_value(i);
+    if (value[0] == '\0')
+      continue;
+    /* Arrows on the focused row say left and right change it. */
+    const bool action = i == SETTING_SUGGEST || i == SETTING_DELETE;
+    const char *text = focused && !action ? fmt("<  %s  >", value) : value;
+    const float value_w = jf_renderer_measure(renderer, text, 20 * scale);
+    float value_x = rect.x + rect.w - 16 * scale - value_w;
+    loom_label(ctx, (loom_rect){value_x, text_y, value_w, 32 * scale}, &list,
+               text,
+               !enabled  ? greyed
+               : focused ? WHITE
+                         : DIM,
+               20 * scale);
+    if (i == SETTING_COLOR || i == SETTING_OUTLINE_COLOR) {
+      const int index =
+          i == SETTING_COLOR ? sub_style.color : sub_style.outline_color;
+      const float side = 22 * scale;
+      const loom_rect chip = {value_x - side - 10 * scale, mid - side / 2, side,
+                              side};
+      loom_fill(ctx, chip, &list, swatches[index].color, 5 * scale);
+      loom_stroke(ctx, chip, &list, BORDER, 1.5f * scale, 5 * scale);
+    }
+  }
+  nav_scroll_end(&ui);
+  (void)height;
 }
 
 static const char *clock_text(int ms) {
@@ -3225,6 +4631,18 @@ static const char *playback_hint(size_t index) {
  */
 static void draw_playback(loom_context *ctx, float width, float height,
                           float scale) {
+  if (subtitle_settings) {
+    draw_subtitle_settings(ctx, width, height, scale);
+    return;
+  }
+  if (search.open) {
+    draw_subtitle_search(ctx, width, height, scale);
+    return;
+  }
+  if (sources.open) {
+    draw_subtitle_sources(ctx, width, height, scale);
+    return;
+  }
   if (subtitle_picker) {
     draw_subtitle_picker(ctx, width, height, scale);
     return;
@@ -3421,10 +4839,17 @@ static void draw_playback(loom_context *ctx, float width, float height,
 /* Asks libass for the picture at the playback position, uploading it when it
  * changed. Runs on the subtitle tick, outside building the UI, so an unchanged
  * subtitle costs no frame. */
+/* The plain-text track's lines at the playback position, as jf_subs_text
+ * gives them. */
+static char plain_text[2048];
+
 static bool update_subtitles(void) {
-  const int media_ms = jf_player_subtitle_ms();
-  if (media_ms < 0)
+  const int *delay = current_delay();
+  const int played_ms = jf_player_subtitle_ms();
+  if (played_ms < 0)
     return false;
+  /* A track shown late is one whose times are behind the picture's. */
+  const int media_ms = played_ms - (delay != NULL ? *delay : 0);
   if (jf_picsubs_ready()) {
     /* Bitmap tracks: the picture is already pixels, and changes a few times a
      * minute, so it is uploaded as it is and scaled by the draw. */
@@ -3444,7 +4869,17 @@ static bool update_subtitles(void) {
     return true;
   }
   jf_subs_image image;
-  const bool changed = jf_subs_frame(media_ms, &image);
+  bool changed = jf_subs_frame(media_ms, &image);
+  if (jf_subs_plain()) {
+    char text[sizeof(plain_text)];
+    jf_subs_text(media_ms, text, sizeof(text), !sub_style.ignore_inline);
+    if (strcmp(text, plain_text) != 0) {
+      memcpy(plain_text, text, sizeof(text));
+      jf_window_frame_requested = true;
+    }
+  } else {
+    plain_text[0] = '\0';
+  }
   const jf_subs_cost cost = jf_subs_last_cost();
   phase_frame[PHASE_ASS] = cost.render_ms;
   phase_frame[PHASE_COMPOSITE] = cost.composite_ms;
@@ -3470,16 +4905,178 @@ static bool subtitles_active(void) {
   return jf_subs_ready() || jf_picsubs_ready();
 }
 
+/* A run of text in one style, laid out on one row of the plain renderer. */
+typedef struct {
+  const char *text;
+  float x, width;
+  int row;
+  uint8_t style; /* bit 0 bold, bit 1 italic */
+} text_run;
+
+/* Plain text, centred and wrapped over rows from the chosen edge. Runs split
+ * at spaces and style markers, and a row breaks between words, never inside
+ * one. */
+static void draw_plain_subtitles(loom_context *ctx, const char *text,
+                                 float bottom_limit) {
+  static char pool[4096];
+  static text_run runs[256];
+  /* Outlines, every one before any fill, and then the fills. */
+  static loom_text_style styles[4], fills[4];
+  const float unit = (float)gl_height / 1080;
+  const float size = 58 * unit * (1 + sub_style.size_percent / 100.0f);
+  const float line = size * 1.25f;
+  const float max_width = (float)gl_width * 0.84f;
+  for (int i = 0; i < 4; i++) {
+    const float weight = (i & 1) ? size * 0.035f : 0;
+    /* No wider than the field reaches past the glyph (see
+     * JF_ATLAS_RANGE), less the pixel the edge needs. */
+    const float reach =
+        JF_ATLAS_RANGE / 2 * size / JF_ATLAS_BASE_PX - 1 - weight;
+    const float outline =
+        sub_style.outline ? sub_style.outline_width * unit : 0;
+    styles[i] = (loom_text_style){{0, 0, 0, 0},
+                                  outline < reach ? outline : reach,
+                                  weight,
+                                  (i & 2) ? 0.2f : 0};
+    memcpy(styles[i].outline, swatches[sub_style.outline_color].color,
+           sizeof(loom_color));
+    fills[i] = (loom_text_style){{0, 0, 0, 0}, 0, weight, styles[i].slant};
+  }
+
+  /* Cut into runs, measuring each. */
+  size_t count = 0, used = 0;
+  uint8_t style = 0;
+  int row = 0;
+  float x = 0;
+  size_t word_start = 0; /* first run of the word being laid out */
+  float word_x = 0;
+  bool space_pending = false;
+  const float space =
+      jf_renderer_measure_styled(renderer, " ", size, &styles[0]);
+  for (const char *p = text;;) {
+    const char c = *p;
+    if (c == JF_SUBS_BOLD_ON || c == JF_SUBS_BOLD_OFF ||
+        c == JF_SUBS_ITALIC_ON || c == JF_SUBS_ITALIC_OFF) {
+      if (c == JF_SUBS_BOLD_ON)
+        style |= 1;
+      else if (c == JF_SUBS_BOLD_OFF)
+        style &= (uint8_t)~1u;
+      else if (c == JF_SUBS_ITALIC_ON)
+        style |= 2;
+      else
+        style &= (uint8_t)~2u;
+      p++;
+      continue;
+    }
+    if (c == '\0' || c == '\n') {
+      if (c == '\0')
+        break;
+      row++, x = 0, word_start = count, space_pending = false, p++;
+      continue;
+    }
+    if (c == ' ') {
+      space_pending = x > 0;
+      word_start = count;
+      p++;
+      continue;
+    }
+    /* One run: up to the next space, newline or marker. */
+    size_t length = 0;
+    while (p[length] != '\0' && p[length] != ' ' && p[length] != '\n' &&
+           (unsigned char)p[length] > JF_SUBS_ITALIC_OFF)
+      length++;
+    if (count == sizeof(runs) / sizeof(*runs) ||
+        used + length + 1 > sizeof(pool))
+      break;
+    char *copy = pool + used;
+    memcpy(copy, p, length);
+    copy[length] = '\0';
+    used += length + 1;
+    p += length;
+    const float width =
+        jf_renderer_measure_styled(renderer, copy, size, &styles[style]);
+    if (word_start == count) { /* a word starts here */
+      if (space_pending)
+        x += space;
+      space_pending = false;
+      word_x = x;
+    }
+    runs[count] = (text_run){copy, x, width, row, style};
+    x += width;
+    count++;
+    /* Too wide: the whole word moves down a row, unless it is alone there. */
+    if (x > max_width && word_x > 0) {
+      row++;
+      for (size_t i = word_start; i < count; i++) {
+        runs[i].x -= word_x;
+        runs[i].row = row;
+      }
+      x -= word_x;
+      word_x = 0;
+    }
+  }
+  if (count == 0)
+    return;
+
+  const int rows = runs[count - 1].row + 1;
+  const float margin = (float)gl_height * sub_style.margin_percent / 100.0f;
+  float top =
+      sub_style.top ? margin : (float)gl_height - margin - (float)rows * line;
+  if (!sub_style.top && top + (float)rows * line > bottom_limit)
+    top = bottom_limit - (float)rows * line;
+  /* Centre each row on its own width. */
+  static const loom_color clear = {0, 0, 0, 0};
+  for (int pass = sub_style.outline ? 0 : 1; pass < 2; pass++)
+    for (size_t first = 0; first < count;) {
+      size_t last = first;
+      while (last + 1 < count && runs[last + 1].row == runs[first].row)
+        last++;
+      const float row_width = runs[last].x + runs[last].width;
+      const float left = ((float)gl_width - row_width) / 2;
+      for (size_t i = first; i <= last; i++) {
+        const text_run *r = &runs[i];
+        loom_label_styled(
+            ctx,
+            (loom_rect){left + r->x, top + (float)r->row * line, r->width + 1,
+                        line},
+            NULL, r->text, pass == 0 ? clear : swatches[sub_style.color].color,
+            size, pass == 0 ? &styles[r->style] : &fills[r->style]);
+      }
+      first = last + 1;
+    }
+}
+
 static void draw_subtitles(loom_context *ctx) {
   /* Dialogue rises clear of the playback chrome while it is in. libass can
    * tell dialogue from a sign placed over the picture; for a bitmap track,
    * only a picture wholly in the bottom third is taken for dialogue. */
   const float chrome_top = (float)gl_height * (1 - 200.0f / 1080);
-  const bool lift = !subtitle_picker && playback_chrome_wanted(now_ns());
+  const bool lift = !subtitle_picker && !subtitle_settings && !search.open &&
+                    !sources.open && playback_chrome_wanted(now_ns());
   jf_subs_keep_above(lift ? (int)chrome_top : INT_MAX);
   if (!subtitles_active() && subtitle_texture != 0) {
     jf_renderer_destroy_texture(renderer, subtitle_texture);
     subtitle_texture = 0;
+  }
+  const float bottom_limit =
+      lift ? chrome_top + (gl_height - chrome_top) * (1 - chrome_motion.value)
+           : (float)gl_height;
+  const bool plain = jf_subs_plain();
+  if (plain && plain_text[0] != '\0') {
+    draw_plain_subtitles(ctx, plain_text, bottom_limit);
+  } else if (subtitle_settings && setting_is_style(focused_setting()) &&
+             (plain || !subtitles_active())) {
+    /* Nothing said right now: a stand-in, so a change still shows. */
+    static const char sample[] = "Subtitles look like this,\n"
+                                 "\x01"
+                                 "bold"
+                                 "\x02"
+                                 " and "
+                                 "\x03"
+                                 "italic"
+                                 "\x04"
+                                 " too.";
+    draw_plain_subtitles(ctx, sample, bottom_limit);
   }
   if (subtitle_texture == 0)
     return;
@@ -3822,6 +5419,18 @@ static bool next_deadline(uint64_t now, bool controls_visible, uint64_t *out) {
       deadline = playback_controls_until;
     have = true;
   }
+  if (sources.installing[0] != '\0') {
+    const uint64_t at = sources.poll_at > now ? sources.poll_at : now;
+    if (!have || at < deadline)
+      deadline = at;
+    have = true;
+  }
+  if (search.phase == DOWNLOAD_LISTING) {
+    const uint64_t at = search.poll_at > now ? search.poll_at : now;
+    if (!have || at < deadline)
+      deadline = at;
+    have = true;
+  }
   if (screen == SCREEN_PLAYBACK && subtitles_active()) {
     if (!have || subtitle_tick < deadline)
       deadline = subtitle_tick;
@@ -3994,6 +5603,8 @@ static bool app_init(int argc, char **argv) {
   snprintf(preferences_path, sizeof(preferences_path),
            "%s/conf/preferences.ini", jf_store_root());
   load_preferences();
+  /* Read before a subtitle needs a script the UI face lacks. */
+  jf_font_index_warm();
   log_to_file();
   jf_decoders_probe(&decoders);
   const bool restored = jf_session_load(&session);

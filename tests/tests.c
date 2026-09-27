@@ -26,6 +26,10 @@
 #ifdef JF_HAVE_SUBS
 #include "jf/subs.h"
 #endif
+#ifdef JF_HAVE_MSDF
+#include "platform/os.h"
+#include "ui/msdf.h"
+#endif
 
 #define CHECK(cond)                                                            \
   do {                                                                         \
@@ -450,24 +454,25 @@ static void test_subtitles(void) {
   char *copy = malloc(sizeof(script));
   memcpy(copy, script, sizeof(script));
   CHECK(jf_subs_open_file(1, copy, sizeof(script) - 1));
-  frame_until(9000, &image, true);
-  CHECK(image.w > 0);
-  frame_until(2000, &image, true);
-  for (int tries = 0; tries < 400 && image.w == drawn_w; tries++) {
-    usleep(5000);
-    jf_subs_frame(2000, &image);
-  }
-  CHECK(image.w > drawn_w); /* "Hello there", not the fed "Hello" */
-  const int there_w = image.w, there_h = image.h;
-  frame_until(11000, &image, false);
-  frame_until(13000, &image, true);
-  CHECK(image.w == there_w); /* no tags drawn as text */
-  frame_until(15000, &image, false);
-  frame_until(17000, &image, true);
-  CHECK(image.h > there_h * 3 / 2); /* two lines */
-  frame_until(19000, &image, false);
-  frame_until(21000, &image, true);
-  CHECK(image.w == drawn_w); /* "Hello" alone, as fed */
+  /* A converted track is the UI's to draw as plain text: libass draws
+   * nothing, and the text comes without its markup. */
+  CHECK(jf_subs_plain());
+  frame_until(2000, &image, false);
+  char text[256];
+  jf_subs_text(9000, text, sizeof(text), true);
+  CHECK(strcmp(text, "Later") == 0);
+  jf_subs_text(2000, text, sizeof(text), true);
+  CHECK(strcmp(text, "Hello there") == 0); /* not the fed "Hello" */
+  jf_subs_text(13000, text, sizeof(text), true);
+  CHECK(strcmp(text, "\x03\x04Hello there") == 0); /* <i></i>, no colour */
+  jf_subs_text(13000, text, sizeof(text), false);
+  CHECK(strcmp(text, "Hello there") == 0);
+  jf_subs_text(17000, text, sizeof(text), true);
+  CHECK(strcmp(text, "Hello\nthere") == 0); /* the soft break is real */
+  jf_subs_text(21000, text, sizeof(text), true);
+  CHECK(strcmp(text, "Hello") == 0);
+  jf_subs_text(15000, text, sizeof(text), true);
+  CHECK(text[0] == '\0');
   /* An older selection's file is not used. */
   copy = malloc(sizeof(script));
   memcpy(copy, script, sizeof(script));
@@ -481,6 +486,15 @@ static void test_subtitles(void) {
   CHECK(jf_subs_open(2, 0, header, (int)sizeof(header) - 1));
   frame_until(1500, &image, true);
   CHECK(image.w > 0 && image.y + image.h <= 940);
+  CHECK(!jf_subs_plain()); /* written as ASS */
+  /* Asked to, a real ASS track goes plain too, and comes back. */
+  jf_subs_force_plain(true);
+  CHECK(jf_subs_plain());
+  frame_until(1500, &image, false);
+  jf_subs_text(1500, text, sizeof(text), true);
+  CHECK(strcmp(text, "Hello") == 0);
+  jf_subs_force_plain(false);
+  frame_until(1500, &image, true);
   /* Kept above the player's controls: the dialogue line rises, a sign pinned
    * with \pos stays on the picture. */
   const int low_y = image.y;
@@ -510,9 +524,45 @@ static void test_subtitles(void) {
     usleep(5000);
   }
   CHECK(!flashed);
+  /* Another container track that is this one cut 1.5 s later: every line
+   * of it votes for the same delay. */
+  for (int i = 0; i < 20; i++) {
+    char event[64];
+    const int length =
+        snprintf(event, sizeof(event), "0,0,Default,,0,0,0,,Line %d", i);
+    const int64_t at = 40000 + i * 3100 + (i % 3) * 700;
+    jf_subs_feed(0, event, length, at, 1500);
+    jf_subs_feed(3, event, length, at + 1500, 1500);
+  }
+  int64_t delay = 0;
+  CHECK(jf_subs_suggest_delay(&delay));
+  CHECK(delay > 1400 && delay < 1600);
   jf_subs_close(5);
   CHECK(!jf_subs_ready());
   jf_subs_release();
+}
+
+/* Only what dialogue says: override blocks, drawings and the tags that
+ * merely start like \b or \i leave nothing behind. */
+static void test_subtitle_strip(void) {
+  char out[128];
+  jf_subs_strip("{\\an8\\pos(1,2)}Hi {\\b1}there{\\b0}\\Nyou", out, sizeof(out),
+                true);
+  CHECK(strcmp(out, "Hi \x01there\x02\nyou") == 0);
+  jf_subs_strip("{\\blur2\\bord3\\be1\\iclip(0,0,1,1)}{\\i1}a\\hb", out,
+                sizeof(out), true);
+  CHECK(strcmp(out, "\x03"
+                    "a b") == 0);
+  jf_subs_strip("{\\i1}a{\\r}b", out, sizeof(out), false);
+  CHECK(strcmp(out, "ab") == 0);
+  /* A drawing is not text, and a line of nothing else is empty. */
+  CHECK(jf_subs_strip("{\\p1}m 0 0 l 10 0 10 10{\\p0}", out, sizeof(out),
+                      true) == 0);
+  CHECK(jf_subs_strip("{\\b700}  Bold  ", out, sizeof(out), true) == 7 &&
+        strcmp(out, "\x01  Bold") == 0);
+  /* Truncated rather than overrun. */
+  CHECK(jf_subs_strip("abcdefgh", out, 4, true) == 3 &&
+        strcmp(out, "abc") == 0);
 }
 #endif
 
@@ -674,6 +724,86 @@ static void test_video_path(void) {
   CHECK(!jf_tv_decodes(&heavy, &tv));
 }
 
+#ifdef JF_HAVE_MSDF
+/* The field, thresholded, is the glyph: wherever FreeType's own coverage is
+ * clearly inside or outside, the median and the true distance agree with it. */
+static void test_msdf(void) {
+  FT_Library library;
+  CHECK(FT_Init_FreeType(&library) == 0);
+  size_t count = 0;
+  const char *const *paths = jf_os_font_candidates(&count);
+  FT_Face face = NULL;
+  for (size_t i = 0; i < count && face == NULL; i++)
+    if (FT_New_Face(library, paths[i], 0, &face) != 0)
+      face = NULL;
+  if (face == NULL) {
+    fprintf(stderr, "skipping the MSDF test: no font\n");
+    FT_Done_FreeType(library);
+    return;
+  }
+  FT_Set_Pixel_Sizes(face, 0, 48);
+  jf_arena scratch = {0};
+  for (const char *c = "OAg@&%"; *c != '\0'; c++) {
+    const FT_UInt index = FT_Get_Char_Index(face, (FT_ULong)*c);
+    CHECK(FT_Load_Glyph(face, index, FT_LOAD_NO_HINTING) == 0);
+    jf_msdf field;
+    CHECK(
+        jf_msdf_generate(library, &face->glyph->outline, 12, &scratch, &field));
+    CHECK(field.rgba != NULL && field.width > 12 && field.height > 12);
+    CHECK(FT_Load_Glyph(face, index, FT_LOAD_NO_HINTING | FT_LOAD_RENDER) == 0);
+    const FT_Bitmap *bitmap = &face->glyph->bitmap;
+    unsigned decisive = 0, wrong = 0;
+    for (int y = 0; y < field.height; y++)
+      for (int x = 0; x < field.width; x++) {
+        const int bx = field.left + x - face->glyph->bitmap_left;
+        const int by = y + field.top + face->glyph->bitmap_top;
+        const unsigned cover = bx >= 0 && by >= 0 && bx < (int)bitmap->width &&
+                                       by < (int)bitmap->rows
+                                   ? bitmap->buffer[by * bitmap->pitch + bx]
+                                   : 0;
+        if (cover > 32 && cover < 223)
+          continue;
+        const uint8_t *t = field.rgba + ((size_t)y * field.width + x) * 4;
+        const int lo = t[0] < t[1] ? t[0] : t[1],
+                  hi = t[0] < t[1] ? t[1] : t[0];
+        const int median = hi < t[2] ? hi : lo > t[2] ? lo : t[2];
+        decisive++;
+        wrong += (median > 127) != (cover >= 223);
+        wrong += (t[3] > 127) != (cover >= 223);
+      }
+    CHECK(decisive > 100 && wrong * 100 < decisive);
+    /* Holes: wherever filtering between four texels lands a pixel inside
+     * by the true distance, the median has to agree. Channels that each
+     * pick the wrong edge pass the check above texel by texel and fail here
+     * - the A's arch, the 1, a corner of the E. */
+    unsigned holes = 0;
+    for (int y = 0; y + 1 < field.height; y++)
+      for (int x = 0; x + 1 < field.width; x++) {
+        const uint8_t *a = field.rgba + ((size_t)y * field.width + x) * 4;
+        const uint8_t *quad[4] = {a, a + 4, a + (size_t)field.width * 4,
+                                  a + (size_t)field.width * 4 + 4};
+        for (int s = 0; s < 16; s++) {
+          const float fx = (s % 4 + .5f) / 4, fy = (s / 4 + .5f) / 4;
+          float v[4];
+          for (int k = 0; k < 4; k++)
+            v[k] = ((quad[0][k] * (1 - fx) + quad[1][k] * fx) * (1 - fy) +
+                    (quad[2][k] * (1 - fx) + quad[3][k] * fx) * fy) /
+                   255;
+          const float lo = v[0] < v[1] ? v[0] : v[1];
+          const float hi = v[0] < v[1] ? v[1] : v[0];
+          const float median = hi < v[2] ? hi : lo > v[2] ? lo : v[2];
+          holes += v[3] > .5f + 1.0f / 12 && median < .5f;
+        }
+      }
+    CHECK(holes == 0);
+    jf_arena_rewind(&scratch);
+  }
+  jf_arena_destroy(&scratch);
+  FT_Done_Face(face);
+  FT_Done_FreeType(library);
+}
+#endif
+
 int main(void) {
   test_cfg_round_trip();
   test_blurhash();
@@ -688,10 +818,14 @@ int main(void) {
   test_nav();
   test_video_path();
   test_skyline();
+#ifdef JF_HAVE_MSDF
+  test_msdf();
+#endif
 #ifdef JF_HAVE_DEMUX
   test_demux_open_failure();
 #endif
 #ifdef JF_HAVE_SUBS
+  test_subtitle_strip();
   test_subtitles();
 #endif
   if (failures != 0) {

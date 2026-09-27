@@ -37,6 +37,8 @@ void mock_hold(jf_job job);
 void mock_release(jf_job job);
 /* Requests waiting in mock_hold right now. */
 unsigned mock_held(void);
+/* The JSON the last JF_JOB_SAVE_DELAYS sent; empty since reset. */
+const char *mock_saved_delays(void);
 /* Requests of `job` answered or failed since reset. */
 unsigned mock_calls(jf_job job);
 

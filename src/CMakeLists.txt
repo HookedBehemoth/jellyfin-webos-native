@@ -104,13 +104,25 @@ if (HAVE_PLATFORM)
 
     # The instanced UI batch and its glyph atlas.
     pkg_check_modules(FREETYPE REQUIRED freetype2)
-    add_library(jf-ui STATIC ui/loom.c ui/nav.c ui/skyline.c ui/glyph_atlas.c ui/renderer.c)
+    add_library(jf-ui STATIC ui/glyph_atlas.c ui/font_index.c ui/msdf.c ui/renderer.c)
     target_include_directories(jf-ui PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(jf-ui SYSTEM PUBLIC ${FREETYPE_INCLUDE_DIRS})
     target_link_directories(jf-ui PUBLIC ${FREETYPE_LIBRARY_DIRS})
-    target_link_libraries(jf-ui PUBLIC jf-platform ${FREETYPE_LIBRARIES} m)
+    target_link_libraries(jf-ui PUBLIC jf-platform jf-portable ${FREETYPE_LIBRARIES} m)
+    # HarfBuzz shapes subtitle text. It is libass's already, built with FreeType
+    # support by tools/build-libass.sh and shipped with it.
+    if (WIN32)
+        pkg_check_modules(HARFBUZZ REQUIRED harfbuzz)
+        target_include_directories(jf-ui SYSTEM PUBLIC ${HARFBUZZ_INCLUDE_DIRS})
+        target_link_directories(jf-ui PUBLIC ${HARFBUZZ_LIBRARY_DIRS})
+        target_link_libraries(jf-ui PUBLIC ${HARFBUZZ_LIBRARIES})
+    else ()
+        target_include_directories(jf-ui SYSTEM PUBLIC "${LIBASS_ROOT}/include/harfbuzz")
+        target_link_libraries(jf-ui PUBLIC "${LIBASS_ROOT}/lib/libharfbuzz.so")
+    endif ()
     foreach (_entry vsUi:ui_vs:vertex fsFill:ui_fill:fragment fsRound:ui_round:fragment
-            fsBorder:ui_border:fragment fsGlyph:ui_glyph:fragment fsImage:ui_image:fragment
+            fsBorder:ui_border:fragment fsGlyph:ui_glyph:fragment fsSubtitle:ui_subtitle:fragment
+            fsImage:ui_image:fragment
             fsImagePremultiplied:ui_image_premultiplied:fragment)
         string(REPLACE ":" ";" _parts "${_entry}")
         list(GET _parts 0 _fn)
@@ -185,7 +197,6 @@ endif ()
 # (tests/ui_tests.c) run the same app against a mock server.
 add_library(jf-app STATIC
         jf/api.c
-        jf/arena.c
         jf/codecs.c
         jf/decoders.c
         jf/blurhash.c

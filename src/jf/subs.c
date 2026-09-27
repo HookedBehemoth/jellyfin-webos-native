@@ -1,6 +1,11 @@
 #include "subs.h"
 
+#include "../ui/font_index.h"
+
 #include <ass/ass.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <ctype.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -25,12 +30,27 @@ static void ass_log(int level, const char *format, va_list args, void *unused) {
   (void)unused;
   if (level > 2) /* past warnings: a line per font lookup and per track */
     return;
+  /* Falling back to the default face and family is the design here (see
+   * fallback_path), not something to warn about per glyph. */
+  if (strncmp(format, "fontselect: Using default", 25) == 0)
+    return;
   fprintf(stderr, "libass: ");
   vfprintf(stderr, format, args);
   fputc('\n', stderr);
 }
 
 const char *jf_subs_font;
+
+/* The installed font for a script the UI face lacks - Thai, say - and the
+ * family libass knows it by. With no font provider, every style resolves to
+ * the default path and every missing glyph to it again, so libass alone has
+ * nowhere to find Thai. Registered as a memory font and made the default
+ * *family*, it is where libass looks for a glyph first; the UI face stays the
+ * default path, for everything the fallback lacks. Changed only with the
+ * workers stopped; `fallback_serial` says which renderers have it. */
+static const char *fallback_path;
+static char fallback_family[256];
+static unsigned fallback_serial;
 
 static const char *pick_font(void) {
   if (jf_subs_font != NULL)
@@ -122,6 +142,7 @@ static ASS_Library *library;
  * up, and a typeset track's attachments are megabytes of CJK face to load
  * again on every switch. */
 static ASS_Renderer *renderers[MAX_WORKERS];
+static unsigned renderer_fallback[MAX_WORKERS];
 static worker workers[MAX_WORKERS];
 static size_t worker_count;
 static slot slots[MAX_WORKERS + 2];
@@ -133,6 +154,11 @@ static double frame_ms = 1000.0 / 24;
 /* The picture in the overlay, and the row dialogue stays above. */
 static int picture_top, picture_height = 1080;
 static int keep_above = INT_MAX;
+/* Whether the open track is drawn as plain text by the UI (see subs.h), and
+ * the settings libass takes for the rest. */
+static bool plain_source, force_plain;
+static double font_scale = 1, style_margin;
+static bool style_top;
 /* A jump back makes every slot in flight stale. */
 static uint32_t generation;
 static int64_t playhead, next_frame;
@@ -446,8 +472,11 @@ static void *render_loop(void *arg) {
   while (running) {
     if (next_frame < playhead)
       next_frame = playhead;
-    /* No further ahead than the slots can hold. */
-    slot *s = playhead >= 0 && next_frame < playhead + (int64_t)slot_count - 1
+    /* No further ahead than the slots can hold, and nothing for a track the
+     * UI draws itself. */
+    const bool plain = plain_source || force_plain;
+    slot *s = !plain && playhead >= 0 &&
+                      next_frame < playhead + (int64_t)slot_count - 1
                   ? claim()
                   : NULL;
     if (s == NULL) {
@@ -461,11 +490,15 @@ static void *render_loop(void *arg) {
      * with \pos or \move, which is how typesetting pins a sign to the
      * picture. A percentage of the way from the bottom to the top. */
     const int bottom = picture_top + picture_height;
-    const double line_position =
-        keep_above < bottom ? (bottom - keep_above) * 100.0 / picture_height
-                            : 0;
+    double line_position =
+        style_top ? 100 - style_margin * 100 : style_margin * 100;
+    if (!style_top && keep_above < bottom &&
+        (bottom - keep_above) * 100.0 / picture_height > line_position)
+      line_position = (bottom - keep_above) * 100.0 / picture_height;
+    const double scale = font_scale;
     pthread_mutex_unlock(&lock);
     ass_set_line_position(w->renderer, line_position);
+    ass_set_font_scale(w->renderer, scale);
 
     const int64_t ms = (int64_t)((double)s->frame * frame_ms);
     feed_window(w, ms);
@@ -534,8 +567,10 @@ static char *events_header(const char *header, int size, int *out_size) {
   return out;
 }
 
-/* Starts the workers for `id`'s selection. Control held, workers stopped. */
-static bool start(uint64_t id, const char *header, int header_size) {
+/* Starts the workers for `id`'s selection, of a track `converted` from
+ * another format. Control held, workers stopped. */
+static bool start(uint64_t id, const char *header, int header_size,
+                  bool converted) {
   const long long started_at = now_ms();
   pthread_mutex_lock(&lock);
   bool ok = false;
@@ -578,11 +613,21 @@ static bool start(uint64_t id, const char *header, int header_size) {
       /* No system provider is compiled in (see tools/build-libass.sh): a
        * style resolves to a font the container attached, or else to this
        * default face. `update` has to be 1 for libass to load either. */
-      ass_set_fonts(renderers[worker_count], pick_font(), "Sans",
-                    ASS_FONTPROVIDER_NONE, NULL, 1);
+      renderer_fallback[worker_count] = fallback_serial - 1;
       /* HarfBuzz is linked in, so the shaper that uses it is the one to ask
        * for. */
       ass_set_shaper(renderers[worker_count], ASS_SHAPING_COMPLEX);
+      /* The size setting scales dialogue, not signs typeset to the picture. */
+      ass_set_selective_style_override_enabled(
+          renderers[worker_count], ASS_OVERRIDE_BIT_SELECTIVE_FONT_SCALE);
+    }
+    /* Only when it changed: this reloads the fonts, a typeset track's
+     * attached CJK faces among them. */
+    if (renderer_fallback[worker_count] != fallback_serial) {
+      ass_set_fonts(renderers[worker_count], pick_font(),
+                    fallback_family[0] != '\0' ? fallback_family : "Sans",
+                    ASS_FONTPROVIDER_NONE, NULL, 1);
+      renderer_fallback[worker_count] = fallback_serial;
     }
     w->renderer = renderers[worker_count];
     ass_set_frame_size(w->renderer, frame_width, frame_height);
@@ -607,6 +652,7 @@ static bool start(uint64_t id, const char *header, int header_size) {
   for (size_t i = 0; i < slot_count; i++)
     slots[i].state = SLOT_FREE;
   serial = id;
+  plain_source = converted;
   generation++;
   epoch++;
   /* Unknown until the first jf_subs_frame: nothing renders before then, or
@@ -699,7 +745,10 @@ bool jf_subs_open(uint64_t id, int stream, const char *header,
   bool ok = held;
   if (!skip) {
     stop();
-    ok = start(id, header, header_size);
+    /* FFmpeg writes its own header for a track it converted to ASS. */
+    const bool converted = header != NULL && header_size > 0 &&
+                           strstr(header, "Script generated by FFmpeg") != NULL;
+    ok = start(id, header, header_size, converted);
     if (ok && stream >= 0 && stream < MAX_STREAMS) {
       pthread_mutex_lock(&lock);
       open_stream = stream;
@@ -787,8 +836,9 @@ static bool starts(const char *at, const char *end, const char *word) {
  * both into ASS, as FFmpeg's own decoders do for the container's copy. A
  * converted script is known by its short event format, which lacks the Name
  * field every real ASS script has. Takes `data`, returns the result (`data`
- * itself when there is nothing to convert), NUL-terminated, or NULL. */
-static char *from_markup(char *data, size_t *size) {
+ * itself when there is nothing to convert), NUL-terminated, or NULL, and
+ * whether it was a converted script. */
+static char *from_markup(char *data, size_t *size, bool *was_converted) {
   const char *events = strstr(data, "[Events]");
   const char *format = events != NULL ? strstr(events, "Format:") : NULL;
   const char *eol = format != NULL ? strchr(format, '\n') : NULL;
@@ -799,6 +849,7 @@ static char *from_markup(char *data, size_t *size) {
     for (size_t i = 0; i + 4 <= length && converted; i++)
       converted = !starts(format + i, format + length, "name");
   }
+  *was_converted = converted;
   /* A real ASS script is left alone: markup there would be a typo, and a
    * typeset track's copy is a hundred megabytes the TV cannot spare twice. */
   if (!converted)
@@ -853,6 +904,94 @@ static char *from_markup(char *data, size_t *size) {
   return out;
 }
 
+/* An entry's Text: past its seven other fields. */
+static const char *event_text(const entry *e) {
+  const char *text = e->text;
+  for (int commas = 0; commas < 7 && text != NULL; commas++) {
+    text = strchr(text, ',');
+    if (text != NULL)
+      text++;
+  }
+  return text != NULL ? text : "";
+}
+
+/* One codepoint, '?' for anything malformed; always advances. */
+static uint32_t utf8_next(const char **text) {
+  const unsigned char *s = (const unsigned char *)*text;
+  const unsigned length = s[0] < 0x80             ? 1
+                          : (s[0] & 0xe0) == 0xc0 ? 2
+                          : (s[0] & 0xf0) == 0xe0 ? 3
+                          : (s[0] & 0xf8) == 0xf0 ? 4
+                                                  : 0;
+  if (length == 0) {
+    *text += 1;
+    return '?';
+  }
+  uint32_t value = length == 1 ? s[0] : s[0] & (0x7fu >> length);
+  for (unsigned i = 1; i < length; i++) {
+    if ((s[i] & 0xc0) != 0x80) {
+      *text += 1;
+      return '?';
+    }
+    value = value << 6 | (s[i] & 0x3fu);
+  }
+  *text += length;
+  return value;
+}
+
+/* The font for the first character of the script that neither the UI face
+ * nor the fallback already chosen has, or NULL when they cover it all. */
+static const char *needed_fallback(const entry_list *list) {
+  const char *primary = pick_font();
+  for (size_t i = 0; i < list->count && i < 4000; i++)
+    for (const char *p = event_text(list->items[i]); *p != '\0';) {
+      const uint32_t c = utf8_next(&p);
+      /* Past Latin, and not the markup's own characters. */
+      if (c < 0x250 || (primary != NULL && jf_font_covers(primary, c)) ||
+          (fallback_path != NULL && jf_font_covers(fallback_path, c)))
+        continue;
+      return jf_font_for(c);
+    }
+  return NULL;
+}
+
+/* Makes `path` the fallback. Control held, workers stopped. */
+static void use_fallback(const char *path) {
+  FILE *file = fopen(path, "rb");
+  if (file == NULL)
+    return;
+  fseek(file, 0, SEEK_END);
+  const long size = ftell(file);
+  fseek(file, 0, SEEK_SET);
+  char *data = size > 0 ? malloc((size_t)size) : NULL;
+  const bool read =
+      data != NULL && fread(data, 1, (size_t)size, file) == (size_t)size;
+  fclose(file);
+  FT_Library freetype;
+  FT_Face face;
+  if (read && FT_Init_FreeType(&freetype) == 0) {
+    if (FT_New_Memory_Face(freetype, (const FT_Byte *)data, size, 0, &face) ==
+        0) {
+      snprintf(fallback_family, sizeof(fallback_family), "%s",
+               face->family_name != NULL ? face->family_name : "");
+      FT_Done_Face(face);
+    }
+    FT_Done_FreeType(freetype);
+    pthread_mutex_lock(&lock);
+    if (have_library() && fallback_family[0] != '\0') {
+      ass_add_font(library, fallback_family, data, (int)size);
+      static char kept[512];
+      snprintf(kept, sizeof(kept), "%s", path);
+      fallback_path = kept;
+      fallback_serial++;
+      fprintf(stderr, "subtitles: %s (%s) for what the UI face lacks\n",
+              fallback_family, path);
+    }
+    pthread_mutex_unlock(&lock);
+  }
+  free(data);
+}
+
 bool jf_subs_open_file(uint64_t id, char *data, size_t size) {
   /* A typeset script takes most of a second to parse; not for a selection
    * that has already moved on. */
@@ -863,7 +1002,8 @@ bool jf_subs_open_file(uint64_t id, char *data, size_t size) {
     free(data);
     return false;
   }
-  data = from_markup(data, &size);
+  bool converted = false;
+  data = from_markup(data, &size, &converted);
   if (data == NULL)
     return false;
   /* The header before ass_read_memory, which parses in place. */
@@ -887,9 +1027,21 @@ bool jf_subs_open_file(uint64_t id, char *data, size_t size) {
   if (!stale) {
     /* Already rendering this selection from the demuxer: its header has the
      * same styles, so only the lines change hands. */
-    ok = held || (stop(), start(id, header, header_size));
+    /* A script the fonts so far cannot draw restarts even a held selection:
+     * the fallback changes only with the workers stopped. */
+    const char *fallback = converted ? NULL : needed_fallback(&parsed);
+    const bool refont =
+        fallback != NULL &&
+        (fallback_path == NULL || strcmp(fallback, fallback_path) != 0);
+    if (refont) {
+      stop();
+      use_fallback(fallback);
+    }
+    ok = (held && !refont) ||
+         (stop(), start(id, header, header_size, converted));
     if (ok) {
       pthread_mutex_lock(&lock);
+      plain_source = converted;
       for (size_t i = 0; i < lines.count; i++)
         list_push(&retired, lines.items[i]);
       free(lines.items);
@@ -981,7 +1133,15 @@ void jf_subs_feed(int stream, const char *text, int length, int64_t start_ms,
 
 bool jf_subs_frame(int64_t media_ms, jf_subs_image *out) {
   pthread_mutex_lock(&lock);
-  if (worker_count > 0) {
+  if (worker_count > 0 && (plain_source || force_plain)) {
+    if (shown != NULL)
+      shown->state = SLOT_FREE;
+    shown = NULL;
+    shown_valid = false;
+    if (current.w != 0)
+      dirty = true;
+    current = (jf_subs_image){0};
+  } else if (worker_count > 0) {
     const int64_t target = (int64_t)((double)media_ms / frame_ms);
     if (target != playhead) {
       /* A jump either way leaves nothing rendered worth showing: frames from
@@ -1035,16 +1195,190 @@ bool jf_subs_frame(int64_t media_ms, jf_subs_image *out) {
   return changed;
 }
 
+/* Everything rendered ahead is out of date: again from the playhead. Lock
+ * held. */
+static void rerender(void) {
+  generation++;
+  next_frame = playhead;
+  pthread_cond_broadcast(&work);
+}
+
 void jf_subs_keep_above(int y) {
   pthread_mutex_lock(&lock);
   if (y != keep_above) {
     keep_above = y;
-    /* Everything rendered ahead is in the old place: again from here. */
-    generation++;
-    next_frame = playhead;
-    pthread_cond_broadcast(&work);
+    rerender();
   }
   pthread_mutex_unlock(&lock);
+}
+
+void jf_subs_force_plain(bool on) {
+  pthread_mutex_lock(&lock);
+  if (on != force_plain) {
+    force_plain = on;
+    rerender();
+  }
+  pthread_mutex_unlock(&lock);
+}
+
+bool jf_subs_plain(void) {
+  pthread_mutex_lock(&lock);
+  const bool plain = worker_count > 0 && (plain_source || force_plain);
+  pthread_mutex_unlock(&lock);
+  return plain;
+}
+
+void jf_subs_style(double scale, double margin, bool top) {
+  pthread_mutex_lock(&lock);
+  if (scale != font_scale || margin != style_margin || top != style_top) {
+    font_scale = scale;
+    style_margin = margin;
+    style_top = top;
+    rerender();
+  }
+  pthread_mutex_unlock(&lock);
+}
+
+size_t jf_subs_strip(const char *text, char *out, size_t size, bool styles) {
+  size_t n = 0;
+  bool drawing = false, visible = false;
+#define PUT(c)                                                                 \
+  do {                                                                         \
+    if (n + 1 < size)                                                          \
+      out[n++] = (char)(c);                                                    \
+  } while (0)
+  for (const char *p = text; *p != '\0'; p++) {
+    if (*p == '{') {
+      const char *close = strchr(p, '}');
+      if (close == NULL)
+        break;
+      for (const char *t = p + 1; t + 1 < close; t++) {
+        if (*t != '\\')
+          continue;
+        const char tag = t[1];
+        const bool digit = t + 2 < close && isdigit((unsigned char)t[2]);
+        /* \b is also \blur, \bord and \be; \i also \iclip; \p also \pos. */
+        if (tag == 'b' && digit && styles) {
+          const long weight = strtol(t + 2, NULL, 10);
+          PUT(weight == 1 || weight >= 600 ? JF_SUBS_BOLD_ON
+                                           : JF_SUBS_BOLD_OFF);
+        } else if (tag == 'i' && digit && styles) {
+          PUT(t[2] != '0' ? JF_SUBS_ITALIC_ON : JF_SUBS_ITALIC_OFF);
+        } else if (tag == 'r' && styles) {
+          PUT(JF_SUBS_BOLD_OFF);
+          PUT(JF_SUBS_ITALIC_OFF);
+        } else if (tag == 'p' && digit) {
+          drawing = strtol(t + 2, NULL, 10) > 0;
+        }
+      }
+      p = close;
+      continue;
+    }
+    if (*p == '\\' && p[1] == 'N') {
+      PUT('\n');
+      p++;
+      continue;
+    }
+    if (*p == '\\' && (p[1] == 'n' || p[1] == 'h')) {
+      PUT(' ');
+      p++;
+      continue;
+    }
+    if (drawing || (unsigned char)*p < 0x20)
+      continue;
+    visible |= *p != ' ';
+    PUT(*p);
+  }
+#undef PUT
+  if (!visible)
+    n = 0;
+  /* Blank edges, which a stripped tag often leaves. */
+  while (n > 0 && (out[n - 1] == ' ' || out[n - 1] == '\n'))
+    n--;
+  size_t lead = 0;
+  while (lead < n && (out[lead] == ' ' || out[lead] == '\n'))
+    lead++;
+  memmove(out, out + lead, n - lead);
+  n -= lead;
+  if (size > 0)
+    out[n] = '\0';
+  return n;
+}
+
+size_t jf_subs_text(int64_t media_ms, char *out, size_t size, bool styles) {
+  size_t n = 0;
+  if (size > 0)
+    out[0] = '\0';
+  pthread_mutex_lock(&lock);
+  for (size_t i = lower_bound(&lines, media_ms - lines.longest);
+       i < lines.count && lines.items[i]->start <= media_ms && n + 2 < size;
+       i++) {
+    const entry *e = lines.items[i];
+    if (e->end <= media_ms)
+      continue;
+    const size_t at = n > 0 ? n + 1 : 0;
+    const size_t length =
+        jf_subs_strip(event_text(e), out + at, size - at, styles);
+    if (length == 0)
+      continue;
+    if (n > 0)
+      out[n] = '\n';
+    n = at + length;
+  }
+  pthread_mutex_unlock(&lock);
+  return n;
+}
+
+/* Delays tried, either way, and the width of a vote. */
+#define SUGGEST_REACH_MS 20000
+#define SUGGEST_BIN_MS 100
+#define SUGGEST_BINS (2 * SUGGEST_REACH_MS / SUGGEST_BIN_MS + 1)
+
+bool jf_subs_suggest_delay(int64_t *delay_ms) {
+  /* Every pair of starts within reach votes for the delay between them. Two
+   * cuts of one dialogue share most of their starts, so the true delay
+   * gathers the votes and every chance pairing scatters. */
+  static unsigned votes[SUGGEST_BINS];
+  unsigned best = 0, best_lines = 0;
+  int64_t best_delay = 0;
+  pthread_mutex_lock(&lock);
+  for (int stream = 0; stream < MAX_STREAMS; stream++) {
+    const entry_list *ref = &backlog[stream];
+    if (stream == open_stream || ref->count < 8)
+      continue;
+    memset(votes, 0, sizeof(votes));
+    unsigned mine = 0;
+    for (size_t r = 0; r < ref->count; r++) {
+      const int64_t at = ref->items[r]->start;
+      for (size_t i = lower_bound(&lines, at - SUGGEST_REACH_MS);
+           i < lines.count && lines.items[i]->start <= at + SUGGEST_REACH_MS;
+           i++)
+        votes[(at - lines.items[i]->start + SUGGEST_REACH_MS) /
+              SUGGEST_BIN_MS]++;
+    }
+    for (size_t i = lower_bound(&lines, ref->items[0]->start);
+         i < lines.count &&
+         lines.items[i]->start <= ref->items[ref->count - 1]->start;
+         i++)
+      mine++;
+    for (int b = 1; b + 1 < SUGGEST_BINS; b++) {
+      const unsigned score = votes[b - 1] + votes[b] + votes[b + 1];
+      if (score <= best)
+        continue;
+      best = score;
+      best_lines = mine < ref->count ? mine : (unsigned)ref->count;
+      /* The centre of mass of the three bins. */
+      const double centre =
+          (double)((int64_t)votes[b + 1] - (int64_t)votes[b - 1]) / score;
+      best_delay = (int64_t)((b + centre) * SUGGEST_BIN_MS) - SUGGEST_REACH_MS;
+    }
+  }
+  pthread_mutex_unlock(&lock);
+  /* A third of the lines agreeing is far beyond chance. */
+  if (best < 5 || best * 3 < best_lines)
+    return false;
+  *delay_ms = best_delay;
+  return true;
 }
 
 jf_subs_cost jf_subs_last_cost(void) {

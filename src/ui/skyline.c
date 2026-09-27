@@ -48,14 +48,22 @@ bool skyline_init(skyline *packer, uint16_t size) {
   packer->size = size;
   /* Zeroed, like the reference's calloc: stale bytes between glyphs bleed into
    * neighbours under linear filtering. */
-  packer->data = calloc((size_t)size * size, 1);
+  packer->data = calloc((size_t)size * size, SKYLINE_BPP);
   if (packer->data == NULL) {
     free(packer->nodes);
     packer->nodes = NULL;
     return false;
   }
-  packer->dirty = true;
+  skyline_touch(packer, 0, size);
   return true;
+}
+
+void skyline_touch(skyline *packer, uint16_t top, uint16_t bottom) {
+  if (!packer->dirty || top < packer->dirty_top)
+    packer->dirty_top = top;
+  if (!packer->dirty || bottom > packer->dirty_bottom)
+    packer->dirty_bottom = bottom;
+  packer->dirty = true;
 }
 
 void skyline_destroy(skyline *packer) {
@@ -72,9 +80,10 @@ bool skyline_blit(skyline *packer, skyline_region region, const uint8_t *data,
       region.y + region.h > packer->size - 1)
     return false;
   for (uint16_t row = 0; row < region.h; row++)
-    memcpy(packer->data + ((size_t)(region.y + row) * packer->size + region.x),
-           data + (size_t)row * stride, region.w);
-  packer->dirty = true;
+    memcpy(packer->data + ((size_t)(region.y + row) * packer->size + region.x) *
+                              SKYLINE_BPP,
+           data + (size_t)row * stride, (size_t)region.w * SKYLINE_BPP);
+  skyline_touch(packer, region.y, (uint16_t)(region.y + region.h));
   return true;
 }
 
@@ -181,7 +190,7 @@ bool skyline_enlarge(skyline *packer, uint16_t size) {
   if (size < packer->size || (size & (uint16_t)(size - 1)) != 0)
     return false;
 
-  uint8_t *grown = calloc((size_t)size * size, 1);
+  uint8_t *grown = calloc((size_t)size * size, SKYLINE_BPP);
   if (grown == NULL)
     return false;
   const uint16_t old_size = packer->size;
@@ -200,7 +209,9 @@ bool skyline_enlarge(skyline *packer, uint16_t size) {
 
   const skyline_region copy = {1, 1, (uint16_t)(old_size - 2),
                                (uint16_t)(old_size - 2)};
-  skyline_blit(packer, copy, old_data + (size_t)old_size + 1, old_size);
+  skyline_blit(packer, copy, old_data + ((size_t)old_size + 1) * SKYLINE_BPP,
+               (size_t)old_size * SKYLINE_BPP);
   free(old_data);
+  skyline_touch(packer, 0, size);
   return true;
 }

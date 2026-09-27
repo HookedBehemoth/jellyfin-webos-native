@@ -6,12 +6,15 @@
 
 #include "../platform/gl.h"
 
+#include <hb.h>
+
 #include "ui_border.h"
 #include "ui_fill.h"
 #include "ui_glyph.h"
 #include "ui_image.h"
 #include "ui_image_premultiplied.h"
 #include "ui_round.h"
+#include "ui_subtitle.h"
 #include "ui_vs.h"
 
 /* One program per kind of instance, so no fragment ever executes another kind's
@@ -22,6 +25,7 @@ typedef enum {
   KIND_ROUND,
   KIND_BORDER,
   KIND_GLYPH,
+  KIND_SUBTITLE,
   KIND_IMAGE,
   KIND_IMAGE_PREMULTIPLIED,
   KIND_COUNT
@@ -42,10 +46,11 @@ typedef struct {
   float mask_offset[4];
 } instance;
 
-/* std140 pads a float2 block to 16 bytes, so the tail is explicit. */
+/* std140 puts the float4 on a 16-byte boundary, so the padding is explicit. */
 typedef struct {
   float viewport[2];
   float padding[2];
+  float outline[4];
 } uniforms;
 
 /* Everything a draw call needs bound. Two batches merge iff these match. */
@@ -63,6 +68,7 @@ typedef struct {
 
 struct jf_renderer {
   jf_atlas *atlas;
+  hb_buffer_t *shaping;
   instance *instances;
   size_t instance_count, instance_capacity;
   GLuint programs[KIND_COUNT];
@@ -188,10 +194,10 @@ jf_renderer *jf_renderer_create(const uint8_t *media, uint32_t media_width,
   glActiveTexture(ATLAS_UNIT);
   glBindTexture(GL_TEXTURE_2D, r->texture);
   const GLsizei atlas_size = (GLsizei)jf_atlas_size(r->atlas);
-  /* One channel: rasterised coverage, not a three-channel distance field. */
-  glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, atlas_size, atlas_size);
+  /* MTSDF: three channels of field and the true distance. */
+  glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, atlas_size, atlas_size);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, atlas_size, atlas_size, GL_RED,
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, atlas_size, atlas_size, GL_RGBA,
                   GL_UNSIGNED_BYTE, jf_atlas_pixels(r->atlas));
   atlas_texture_params();
   jf_atlas_clear_dirty(r->atlas);
@@ -202,8 +208,13 @@ jf_renderer *jf_renderer_create(const uint8_t *media, uint32_t media_width,
                          ? make_texture(media_width, media_height, media, false)
                          : r->texture;
 
-  const unsigned char *const fragments[KIND_COUNT] = {
-      ui_fill, ui_round, ui_border, ui_glyph, ui_image, ui_image_premultiplied};
+  const unsigned char *const fragments[KIND_COUNT] = {ui_fill,
+                                                      ui_round,
+                                                      ui_border,
+                                                      ui_glyph,
+                                                      ui_subtitle,
+                                                      ui_image,
+                                                      ui_image_premultiplied};
   for (int i = 0; i < KIND_COUNT; i++)
     r->programs[i] = make_program(fragments[i]);
 
@@ -217,6 +228,7 @@ void jf_renderer_destroy(jf_renderer *r) {
   if (r == NULL)
     return;
   free(r->instances);
+  hb_buffer_destroy(r->shaping);
   jf_atlas_destroy(r->atlas);
   free(r);
 }
@@ -314,7 +326,7 @@ static void want(jf_renderer *r, kind which, GLuint texture, uniforms u,
 
 static void push(jf_renderer *r, loom_rect rect, loom_rect clip,
                  const loom_mask *mask, const float uv[4],
-                 const loom_color color, float radius, float border) {
+                 const loom_color color, const float shape[4]) {
   if (!r->have_state)
     return;
   if (r->instance_count == r->instance_capacity) {
@@ -343,10 +355,7 @@ static void push(jf_renderer *r, loom_rect rect, loom_rect clip,
   out->clip[1] = clip.y;
   out->clip[2] = clip.x + clip.w;
   out->clip[3] = clip.y + clip.h;
-  out->shape[0] = radius;
-  out->shape[1] = border;
-  out->shape[2] = 0;
-  out->shape[3] = 0;
+  memcpy(out->shape, shape, sizeof(out->shape));
   /* Bottom and right measure inwards from the other side, hence the mirrored
    * edge. An edge without a fade is a constant fully opaque 1. */
   static const float sign[4] = {1, -1, 1, -1};
@@ -371,10 +380,88 @@ static bool faded(const loom_command *c) {
           v.x + v.w > edge[LOOM_FADE_RIGHT] - width[LOOM_FADE_RIGHT]);
 }
 
+/* Styled text through HarfBuzz: cut into runs one face can draw, each run
+ * shaped, and every glyph placed where the font's positioning puts it. Only
+ * measures when `command` is NULL - which also rasterises whatever the text
+ * needs, so it runs before any UV is emitted. Returns the advance. */
+static float shape_text(jf_renderer *r, const char *text, float size,
+                        const loom_text_style *style,
+                        const loom_command *command, loom_rect clip) {
+  const float scale = size / JF_ATLAS_BASE_PX;
+  const float extra = 2 * style->weight; /* faux bold's room */
+  const float slant = style->slant;
+  const float range = JF_ATLAS_RANGE * scale;
+  const float shape[4] = {range, style->weight, slant, style->outline_width};
+  const int length = (int)strlen(text);
+  const float left = command != NULL ? command->rect.x : 0;
+  const float baseline = command != NULL ? command->rect.y + size : 0;
+  float pen = left;
+  if (r->shaping == NULL)
+    r->shaping = hb_buffer_create();
+  for (const char *p = text; *p != '\0';) {
+    const char *start = p;
+    const uint32_t first = jf_utf8_next(&p);
+    int face = jf_atlas_face_for(r->atlas, first);
+    if (face < 0)
+      face = 0; /* its missing-glyph box */
+    /* The run goes on while its face has the next character: marks and
+     * spaces stay with the letters they belong to. */
+    while (*p != '\0') {
+      const char *next = p;
+      if (!jf_atlas_face_has(r->atlas, face, jf_utf8_next(&next)))
+        break;
+      p = next;
+    }
+    hb_buffer_clear_contents(r->shaping);
+    hb_buffer_add_utf8(r->shaping, text, length, (unsigned)(start - text),
+                       (int)(p - start));
+    hb_buffer_guess_segment_properties(r->shaping);
+    hb_shape(jf_atlas_shaper(r->atlas, face), r->shaping, NULL, 0);
+    unsigned count = 0;
+    const hb_glyph_info_t *info = hb_buffer_get_glyph_infos(r->shaping, &count);
+    const hb_glyph_position_t *at =
+        hb_buffer_get_glyph_positions(r->shaping, &count);
+    for (unsigned i = 0; i < count; i++) {
+      const jf_glyph *glyph =
+          jf_atlas_glyph_index(r->atlas, face, info[i].codepoint);
+      if (command != NULL && glyph != NULL && glyph->region.w != 0) {
+        float placed[4], uv[4];
+        jf_atlas_quad(r->atlas, glyph, pen + at[i].x_offset / 64.0f * scale,
+                      baseline - at[i].y_offset / 64.0f * scale, size, placed,
+                      uv);
+        placed[0] -= (placed[1] + placed[3] - baseline) * slant;
+        push(r, (loom_rect){placed[0], placed[1], placed[2], placed[3]}, clip,
+             &command->mask, uv, command->text.color, shape);
+      }
+      /* A mark takes no room, so it gets none of bold's either. */
+      if (at[i].x_advance != 0)
+        pen += at[i].x_advance / 64.0f * scale + extra;
+    }
+  }
+  return pen - left;
+}
+
+float jf_renderer_measure_styled(jf_renderer *r, const char *text, float size,
+                                 const loom_text_style *style) {
+  return shape_text(r, text, size, style, NULL, (loom_rect){0, 0, 0, 0});
+}
+
 static void append_text(jf_renderer *r, loom_rect rect, loom_rect clip,
                         const loom_command *command) {
+  if (command->text.style != NULL) {
+    shape_text(r, command->text.contents, command->text.size,
+               command->text.style, command, clip);
+    return;
+  }
   const float size = command->text.size;
   const float scale = size / JF_ATLAS_BASE_PX;
+  const loom_text_style *style = command->text.style;
+  /* Screen pixels per unit of field, which is what makes the edge one pixel
+   * wide whatever the size. */
+  const float range = JF_ATLAS_RANGE * scale;
+  const float slant = style != NULL ? style->slant : 0;
+  float shape[4] = {range, style != NULL ? style->weight : 0, slant,
+                    style != NULL ? style->outline_width : 0};
   float pen_x = rect.x;
   const float baseline = rect.y + size;
   const char *text = command->text.contents;
@@ -385,10 +472,16 @@ static void append_text(jf_renderer *r, loom_rect rect, loom_rect clip,
     if (glyph->region.w != 0 && glyph->region.h != 0) {
       float placed[4], uv[4];
       jf_atlas_quad(r->atlas, glyph, pen_x, baseline, size, placed, uv);
+      /* The shear is about the quad's bottom; this keeps the baseline where
+       * it was. */
+      placed[0] -= (placed[1] + placed[3] - baseline) * slant;
+      if (style == NULL)
+        shape[3] = cp == JF_ICON_GLOW ? 1 : 0;
       push(r, (loom_rect){placed[0], placed[1], placed[2], placed[3]}, clip,
-           &command->mask, uv, command->text.color, 0, 0);
+           &command->mask, uv, command->text.color, shape);
     }
-    pen_x += glyph->advance * scale;
+    /* Dilated both ways, a faux-bold glyph needs that much more room. */
+    pen_x += glyph->advance * scale + 2 * shape[1];
   }
 }
 
@@ -396,23 +489,30 @@ static void sync_atlas(jf_renderer *r) {
   if (!jf_atlas_dirty(r->atlas))
     return;
   const GLsizei size = (GLsizei)jf_atlas_size(r->atlas);
+  uint16_t top, bottom;
+  jf_atlas_dirty_rows(r->atlas, &top, &bottom);
   glActiveTexture(ATLAS_UNIT);
   if (r->atlas_texture_size != jf_atlas_size(r->atlas)) {
     const GLuint previous = r->texture;
     glGenTextures(1, &r->texture);
     glBindTexture(GL_TEXTURE_2D, r->texture);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, size, size);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, size, size);
     atlas_texture_params();
     if (r->media_texture == previous)
       r->media_texture = r->texture;
     glDeleteTextures(1, &previous);
     r->atlas_texture_size = jf_atlas_size(r->atlas);
+    top = 0;
+    bottom = (uint16_t)size;
   } else {
     glBindTexture(GL_TEXTURE_2D, r->texture);
   }
+  /* Only the rows new glyphs landed in: a whole 2048-square RGBA atlas is
+   * 16 MB to push for one new character. */
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RED, GL_UNSIGNED_BYTE,
-                  jf_atlas_pixels(r->atlas));
+  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, top, size, bottom - top, GL_RGBA,
+                  GL_UNSIGNED_BYTE,
+                  jf_atlas_pixels(r->atlas) + (size_t)top * (size_t)size * 4);
   jf_atlas_clear_dirty(r->atlas);
   r->have_state = false;
 }
@@ -421,7 +521,10 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands,
                       size_t count, float width, float height) {
   /* Finish all atlas growth before emitting UVs or submitting any batch. */
   for (size_t i = 0; i < count; i++)
-    if (commands[i].kind == LOOM_TEXT)
+    if (commands[i].kind == LOOM_TEXT && commands[i].text.style != NULL)
+      jf_renderer_measure_styled(r, commands[i].text.contents,
+                                 commands[i].text.size, commands[i].text.style);
+    else if (commands[i].kind == LOOM_TEXT)
       jf_atlas_prepare(r->atlas, commands[i].text.contents);
   sync_atlas(r);
 
@@ -437,7 +540,7 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands,
   glDisable(GL_BLEND);
   r->blend_enabled = false;
 
-  const uniforms u = {{width, height}, {0, 0}};
+  const uniforms u = {{width, height}, {0, 0}, {0, 0, 0, 0}};
   glBindVertexArray(r->vao);
   glBindBufferBase(GL_UNIFORM_BUFFER, 0, r->uniform_buffer);
   glActiveTexture(ATLAS_UNIT);
@@ -452,26 +555,35 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands,
       const bool square = c->rectangle.radius <= 0;
       want(r, square ? KIND_FILL : KIND_ROUND, 0, u,
            !(square && c->rectangle.color[3] == 255) || faded(c));
-      push(r, c->rect, c->clip, &c->mask, no_uv, c->rectangle.color,
-           c->rectangle.radius, 0);
+      const float shape[4] = {c->rectangle.radius, 0, 0, 0};
+      push(r, c->rect, c->clip, &c->mask, no_uv, c->rectangle.color, shape);
       break;
     }
-    case LOOM_BORDER:
+    case LOOM_BORDER: {
       want(r, KIND_BORDER, 0, u, true);
-      push(r, c->rect, c->clip, &c->mask, no_uv, c->border.color,
-           c->border.radius, c->border.width);
+      const float shape[4] = {c->border.radius, c->border.width, 0, 0};
+      push(r, c->rect, c->clip, &c->mask, no_uv, c->border.color, shape);
       break;
-    case LOOM_TEXT:
-      want(r, KIND_GLYPH, r->texture, u, true);
+    }
+    case LOOM_TEXT: {
+      const loom_text_style *style = c->text.style;
+      uniforms styled = u;
+      if (style != NULL && style->outline_width > 0)
+        for (int k = 0; k < 4; k++)
+          styled.outline[k] = (float)style->outline[k] / 255.0f;
+      want(r, style != NULL ? KIND_SUBTITLE : KIND_GLYPH, r->texture, styled,
+           true);
       append_text(r, c->rect, c->clip, c);
       break;
-    case LOOM_IMAGE:
+    }
+    case LOOM_IMAGE: {
       want(r, c->image.premultiplied ? KIND_IMAGE_PREMULTIPLIED : KIND_IMAGE,
            c->image.texture != 0 ? c->image.texture : r->media_texture, u,
            true);
-      push(r, c->rect, c->clip, &c->mask, c->image.uv, c->image.tint,
-           c->image.radius, 0);
+      const float shape[4] = {c->image.radius, 0, 0, 0};
+      push(r, c->rect, c->clip, &c->mask, c->image.uv, c->image.tint, shape);
       break;
+    }
     }
   }
   flush(r);

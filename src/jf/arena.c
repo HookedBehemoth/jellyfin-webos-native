@@ -6,6 +6,16 @@
 
 #define BLOCK_SIZE (64 * 1024)
 
+/* Debug builds fill fresh and rewound memory with a pattern, so reading
+ * something never written - or written before the last reset - shows up as
+ * garbage instead of as the zeros or the stale values that happened to be
+ * there. Nothing is promised zeroed: a caller that wants zeros writes them. */
+#ifdef NDEBUG
+#define POISON(data, size) ((void)0)
+#else
+#define POISON(data, size) memset(data, 0xa5, size)
+#endif
+
 struct jf_arena_block {
   jf_arena_block *next;
   size_t used, capacity;
@@ -22,6 +32,7 @@ static jf_arena_block *new_block(size_t capacity) {
   block->next = NULL;
   block->used = 0;
   block->capacity = capacity;
+  POISON(block->data, capacity);
   return block;
 }
 
@@ -58,7 +69,20 @@ void jf_arena_reset(jf_arena *arena) {
     block = next;
   }
   arena->head->next = NULL;
+  POISON(arena->head->data, arena->head->used);
   arena->head->used = 0;
+}
+
+void jf_arena_rewind(jf_arena *arena) {
+  if (arena->head == NULL || arena->head->next == NULL) {
+    jf_arena_reset(arena);
+    return;
+  }
+  size_t total = 0;
+  for (jf_arena_block *block = arena->head; block != NULL; block = block->next)
+    total += block->capacity;
+  jf_arena_destroy(arena);
+  arena->head = new_block(total);
 }
 
 void jf_arena_destroy(jf_arena *arena) {

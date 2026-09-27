@@ -20,4 +20,6 @@ ssize_t jf_os_udp_recv(jf_os_socket socket, void *buffer, size_t size);
 void jf_os_udp_close(jf_os_socket socket);
 
 const char *const *jf_os_font_candidates(size_t *count);
-const char *const *jf_os_font_fallbacks(size_t *count);
+/* Where installed fonts live, searched recursively for scripts the UI face
+ * does not cover (see ui/font_index.h). */
+const char *const *jf_os_font_dirs(size_t *count);

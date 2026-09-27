@@ -29,17 +29,26 @@ The UI selects fonts in this order:
 3. Droid Sans;
 4. common DejaVu/Liberation Sans paths for host development.
 
-The selected path is printed at startup. The atlas prewarms printable ASCII,
-then caches additional Unicode glyphs on demand. Font data and rasterizer kernels
-remain alive so new titles and symbols can extend the cache at any time. Missing
-glyphs try installed Droid Sans Fallback, Droid Sans, and host DejaVu Sans faces;
-unsupported characters use `?`, with misses cached to avoid repeated work.
+The selected path is printed at startup. Glyphs are multi-channel distance
+fields (MTSDF, `src/ui/msdf.c`) generated from FreeType's outlines at 48 px;
+the atlas prewarms printable ASCII, then adds glyphs on demand.
 
-The skyline atlas grows as needed, preserving existing glyph positions, up to
-the GPU's supported texture size. The renderer prepares all text before building
-UVs and uploads changed atlas pixels, replacing the texture when it grows.
-Coverage depends on the installed fonts; complex-script shaping and bidirectional
-layout are not implemented.
+A character none of the loaded faces has is looked up in the font index
+(`src/ui/font_index.c`): every font under `/usr/share/fonts` is read once, on a
+thread started at launch, as ranges of the characters it maps, and the first
+font with the character joins the atlas. That is how Thai, Arabic, the Indic
+scripts and CJK find the TV's own faces for them. Regular cuts are tried before
+bold, italic and condensed ones, sans before serif.
+
+UI labels are drawn a glyph per codepoint. Subtitles drawn as plain text are
+shaped with HarfBuzz, so stacked Thai marks, joined Arabic and Indic conjuncts
+come out right; a line mixing directions is not reordered (no bidi).
+
+libass has no font provider here, so every style resolves to the UI face.
+When a script needs characters the UI face lacks, `subs.c` registers the font
+the index names as a memory font and makes it libass's default *family*: libass
+tries it for each missing glyph and still falls back to the UI face for the
+rest.
 
 To repeat the inventory on another set:
 

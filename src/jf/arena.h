@@ -16,8 +16,13 @@ typedef struct {
   jf_arena_block *head;
 } jf_arena;
 
+/* Uninitialised; debug builds fill it with 0xa5 (see arena.c). */
 void *jf_arena_alloc(jf_arena *arena, size_t size);
 char *jf_arena_strdup(jf_arena *arena, const char *text);
 /* Keeps the first block, so a slot reused every frame stops calling malloc. */
 void jf_arena_reset(jf_arena *arena);
+/* Reset for a scratch arena reused in a loop: a cycle that outgrew the first
+ * block leaves one block the size of everything it used, so the next cycle
+ * the same size calls malloc not at all. */
+void jf_arena_rewind(jf_arena *arena);
 void jf_arena_destroy(jf_arena *arena);

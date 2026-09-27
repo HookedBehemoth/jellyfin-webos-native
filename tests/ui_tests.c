@@ -350,9 +350,148 @@ static void test_playback(void) {
   press(KEY_SUBTITLE);
   CHECK(subtitle_picker);
   CHECK(focus_in_view());
+  CHECK(ui.focus == picker_row_id(track_row(-1))); /* off, under download */
   press(DOWN);
   CHECK(focus_in_view());
   capture("subtitles");
+
+  /* Right on a track opens its appearance and timing. An SRT has no ASS row,
+   * so the text colour comes first; left and right change it at once. */
+  const int track = jf_player_subtitle_current();
+  CHECK(track == 0);
+  press(RIGHT);
+  CHECK(subtitle_settings && !subtitle_picker);
+  CHECK(jf_player_subtitle_current() == track);
+  CHECK(ui.focus == setting_row_id(SETTING_COLOR));
+  const int color = sub_style.color;
+  press(RIGHT);
+  CHECK(sub_style.color == (color + 1) % SWATCH_COUNT);
+  press(LEFT);
+  CHECK(sub_style.color == color);
+  /* The outline's own rows go with it. */
+  press(DOWN);
+  CHECK(ui.focus == setting_row_id(SETTING_OUTLINE));
+  press(OK);
+  CHECK(!setting_shown(SETTING_OUTLINE_WIDTH));
+  press(DOWN);
+  CHECK(ui.focus == setting_row_id(SETTING_INLINE));
+  press(UP);
+  press(OK);
+  CHECK(setting_shown(SETTING_OUTLINE_WIDTH));
+  /* The delay is the track's, kept on the server. */
+  nav_focus(&ui, setting_row_id(SETTING_DELAY));
+  presses(RIGHT, 3);
+  CHECK(*current_delay() == 300);
+  presses(DOWN, SETTING_COUNT);
+  CHECK(focus_in_view());
+  /* An outline that shows against the black of the video hole, and the
+   * stand-in line, which only a style row brings up. */
+  const int outline_color = sub_style.outline_color;
+  sub_style.outline_color = 1;
+  sub_style.outline_width = 5;
+  nav_focus(&ui, setting_row_id(SETTING_OUTLINE_WIDTH));
+  jf_window_frame_requested = true;
+  test_ui_settle();
+  capture("subtitle-settings");
+  sub_style.outline_color = outline_color;
+  sub_style.outline_width = 3;
+  press(BACK);
+  CHECK(subtitle_picker && !subtitle_settings);
+  CHECK(ui.focus == picker_row_id(track_row(track)));
+  CHECK(strstr(mock_saved_delays(), "\"300\"") != NULL);
+
+  /* A bitmap track has no style to change, only its timing. */
+  presses(DOWN, 2);
+  CHECK(jf_player_subtitle_current() == 2);
+  press(RIGHT);
+  CHECK(ui.focus == setting_row_id(SETTING_DELAY));
+  CHECK(!setting_enabled(SETTING_COLOR) && !setting_enabled(SETTING_SUGGEST));
+  press(BACK);
+
+  /* The first row searches the server's providers; a result downloads and
+   * comes back as a track of its own, selected. */
+  presses(UP, 4);
+  CHECK(ui.focus == picker_row_id(0));
+  press(OK);
+  CHECK(search.open && !subtitle_picker);
+  CHECK(ui.focus == search_row_id(SEARCH_ROW_LANGUAGE));
+  CHECK(search.count == 2);
+  CHECK(sources.loaded && sources_on() == 0); /* "None on", in yellow */
+  capture("subtitle-search");
+  /* Sources, above the language: OpenSubtitles offered for installing; once
+   * installed, on after a restart, which a mistaken press can still switch
+   * off and on again; more sources a repository away; and a restart offered
+   * to apply it all. */
+  press(UP);
+  press(RIGHT);
+  CHECK(sources.open && !search.open);
+  CHECK(sources.count == 1 && sources.items[0].status[0] == '\0');
+  CHECK(offer_repository());
+  press(OK);
+  for (int i = 0; i < 100 && sources.items[0].status[0] == '\0'; i++) {
+    usleep(20000);
+    jf_window_frame_requested = true;
+    test_ui_settle();
+  }
+  CHECK(strcmp(sources.items[0].status, "Restart") == 0);
+  press(OK);
+  test_ui_settle();
+  CHECK(strcmp(sources.items[0].status, "Disabled") == 0);
+  press(OK);
+  test_ui_settle();
+  CHECK(strcmp(sources.items[0].status, "Restart") == 0);
+  press(DOWN);
+  press(OK);
+  test_ui_settle();
+  CHECK(sources.count == 2 && strcmp(sources.items[1].name, "subbuzz") == 0);
+  CHECK(!offer_repository());
+  CHECK(ui.focus ==
+            nav_child(nav_str("subtitle-sources"), nav_int(restart_row())) ||
+        focus_in_view());
+  nav_focus(&ui,
+            nav_child(nav_str("subtitle-sources"), nav_int(restart_row())));
+  press(OK);
+  CHECK(sources.restart_armed && mock_calls(JF_JOB_RESTART) == 0);
+  capture("subtitle-sources");
+  press(UP);
+  CHECK(!sources.restart_armed);
+  press(BACK);
+  CHECK(search.open && ui.focus == search_row_id(SEARCH_ROW_SOURCES));
+  test_ui_settle();
+  press(DOWN);
+  press(DOWN);
+  press(OK);
+  /* The server lists it only after a few looks (see the mock), and it is
+   * read back before the picker returns on it. */
+  for (int i = 0; i < 200 && search.open; i++) {
+    usleep(20000);
+    jf_window_frame_requested = true;
+    test_ui_settle();
+  }
+  CHECK(mock_calls(JF_JOB_SUBTITLE_CHECK) == 1);
+  CHECK(!search.open && subtitle_picker);
+  CHECK(jf_player_subtitle_count() == 4);
+  CHECK(strcmp(jf_player_subtitle_name(jf_player_subtitle_current()),
+               "Thai - Downloaded") == 0);
+  CHECK(ui.focus == picker_row_id(track_row(jf_player_subtitle_current())));
+  /* A click or OK on a value never steps it; only left and right do. */
+  press(RIGHT);
+  CHECK(subtitle_settings);
+  nav_focus(&ui, setting_row_id(SETTING_SIZE));
+  const int size = sub_style.size_percent;
+  press(OK);
+  CHECK(sub_style.size_percent == size);
+  /* The downloaded file can go again, on a second OK. */
+  CHECK(setting_shown(SETTING_DELETE));
+  nav_focus(&ui, setting_row_id(SETTING_DELETE));
+  press(OK);
+  CHECK(delete_armed && jf_player_subtitle_count() == 4);
+  capture("subtitle-delete");
+  press(OK);
+  test_ui_settle();
+  CHECK(jf_player_subtitle_count() == 3);
+  CHECK(jf_player_subtitle_current() == -1);
+  CHECK(subtitle_picker && ui.focus == picker_row_id(track_row(-1)));
   press(BACK);
   CHECK(!subtitle_picker);
 
