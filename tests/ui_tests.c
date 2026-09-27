@@ -5,8 +5,10 @@
  * offscreen driver. The tests are one journey through the app in order, as its
  * state is the app's.
  *
- * Run with `ctest --preset host`, or ./build-host/tests/jf-ui-tests;
- * UI_TEST_CAPTURE= <dir> saves every checked frame there as a PPM.
+ * Run with `ctest --preset host`, or ./build-host/tests/jf-ui-tests [animated]:
+ * the journey runs with animations off, or with the argument on. The home-row
+ * walk tries both either way. UI_TEST_CAPTURE=<dir> saves every checked frame
+ * there as a PPM.
  */
 #define JF_APP_TEST
 #include "app/main.c"
@@ -166,6 +168,10 @@ static void test_sign_in(void) {
 /* Right to the end of a row and back: the focused card is in view after every
  * press, however the row scrolls, and Left off the first card opens the
  * sidebar. */
+/* Whether this run has animations on, which every test but the row walk uses.
+ */
+static bool animated;
+
 static void walk_row(bool animate) {
   animations_enabled = animate;
   go_home();
@@ -197,6 +203,7 @@ static void test_rows(void) {
    * its own and would hide a scroll that asks for none. */
   walk_row(true);
   walk_row(false);
+  animations_enabled = animated;
 
   press(DOWN);
   CHECK(ui.focus == home_card(ROW_NEXT_UP, "episode-0-2-1"));
@@ -387,7 +394,8 @@ static void test_settings(void) {
   CHECK(ui.focus == home_card(ROW_RESUME, "movie-0"));
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  animated = argc > 1 && strcmp(argv[1], "animated") == 0;
   char store[] = "/tmp/jf-ui-tests-XXXXXX";
   if (mkdtemp(store) == NULL)
     return 1;
@@ -399,10 +407,10 @@ int main(void) {
   unsetenv("UI_SCRIPT");
   unsetenv("UI_CAPTURE");
   unsetenv("JF_PLAY");
-  char *argv[] = {"jf-ui-tests", NULL};
-  if (!app_init(1, argv))
+  char *app_argv[] = {argv[0], NULL};
+  if (!app_init(1, app_argv))
     return 1;
-  animations_enabled = false;
+  animations_enabled = animated;
 
   test_sign_in();
   test_rows();

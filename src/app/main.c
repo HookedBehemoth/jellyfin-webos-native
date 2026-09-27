@@ -3702,6 +3702,9 @@ static bool advance_animations(uint64_t now) {
       sidebar_slide.value == 0) {
     sidebar_open = false;
     sidebar_closing = false;
+    /* What it covered takes the focus again, which only a frame without it
+     * declares; otherwise the next key press finds nothing to move from. */
+    return true;
   }
   return animated_float_running(&sidebar_slide);
 }
