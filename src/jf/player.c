@@ -37,7 +37,6 @@
 #include "picsubs.h"
 #include "smp.h"
 #include "smp_payload.h"
-#include "smp_segment.h"
 #include "subs.h"
 
 #define APP_ID "dev.hookedbehemoth.jellyfin"
@@ -269,14 +268,6 @@ static bool pipeline_flush(int64_t offset_ms)
         return false;
     pthread_mutex_lock(&pipeline_mutex);
     bool ok = smp_flush(payload);
-    pthread_mutex_unlock(&pipeline_mutex);
-    return ok;
-}
-
-static bool pipeline_begin_segment(int64_t pts_ns)
-{
-    pthread_mutex_lock(&pipeline_mutex);
-    bool ok = jf_starfish_begin_segment(pts_ns);
     pthread_mutex_unlock(&pipeline_mutex);
     return ok;
 }
@@ -917,9 +908,6 @@ static void seek_to(void *demux, int target_ms, bool transcoded)
     pipeline_pause();
     if (!pipeline_flush(0))
       fprintf(stderr, "SMP flush refused\n");
-    if (!pipeline_begin_segment(0))
-      fprintf(stderr, "SMP segment restart refused: %s\n",
-              jf_starfish_segment_error());
   }
     jf_audio_flush();
     const int wanted_audio = atomic_load(&audio_track);
@@ -1162,15 +1150,6 @@ static void *session(void *unused)
     if (!atomic_load(&running))
         goto done;
 
-    /* The load payload describes the timeline, but libpf does not activate it until
-     * CustomPipeline receives a segment event. */
-    if (!pipeline_begin_segment(0)) {
-        fprintf(stderr, "Starfish segment setup failed: %s\n", jf_starfish_segment_error());
-        set_error("Starfish could not establish the initial media segment");
-        goto done;
-    }
-    fprintf(stderr, "t=%lld Starfish segment established at 0ns\n",
-            timing_ms());
     reset_segment_timeline();
     set_state(JF_PLAYING);
     have_loader = pthread_create(&loader, NULL, subtitle_loader, NULL) == 0;

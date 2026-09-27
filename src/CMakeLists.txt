@@ -281,8 +281,7 @@ target_sources(jellyfin PRIVATE
         jf/audio_alsa.c
         jf/clock.c
         jf/packet_queue.c
-        jf/smp_payload.c
-        jf/smp_segment.c)
+        jf/smp_payload.c)
 target_include_directories(jellyfin SYSTEM PRIVATE ${ALSA_INCLUDE_DIRS}
         "${FFMPEG_ROOT}/include")
 target_link_directories(jellyfin PRIVATE "${FFMPEG_ROOT}/lib")

@@ -21,7 +21,6 @@
 #include <time.h>
 
 #include "smp.h"
-#include "smp_segment.h"
 
 static smp_event_fn *events;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -318,18 +317,7 @@ bool smp_feed(const char *payload, char *status, size_t status_len) {
   return true;
 }
 
-void *smp_player(void) { return NULL; }
 const char *smp_shim_error(void) { return ""; }
-
-bool jf_starfish_begin_segment(int64_t pts_ns) {
-  pthread_mutex_lock(&lock);
-  playing = false;
-  pthread_mutex_unlock(&lock);
-  anchor(pts_ns);
-  return true;
-}
-
-const char *jf_starfish_segment_error(void) { return ""; }
 
 /* ------------------------------------------------------------- presentation */
 

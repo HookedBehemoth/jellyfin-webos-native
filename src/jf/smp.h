@@ -18,27 +18,26 @@ extern "C" {
 
 /* Event ids, from PF_EVENT_T in starfish-media-pipeline/StarfishMediaAPIs.h. */
 enum {
-    SMP_FRAMEREADY = 0x00,
-    SMP_STR_VIDEO_INFO = 0x04,
-    SMP_STR_AUDIO_INFO = 0x07,
-    SMP_STR_SOURCE_INFO = 0x0b,
-    SMP_INT_ERROR = 0x12,
-    SMP_STR_ERROR = 0x13,
-    SMP_LOADCOMPLETED = 0x16,
-    SMP_UNLOADCOMPLETED = 0x17,
-    SMP_SEEKDONE = 0x19,
-    SMP_PLAYING = 0x1a,
-    SMP_PAUSED = 0x1b,
-    SMP_ENDOFSTREAM = 0x1c,
-    SMP_INT_BUFFERLOW = 0x2c,
-    SMP_STR_BUFFERFULL = 0x2d,
-    SMP_STR_BUFFERLOW = 0x2e,
-    SMP_DROPPED_FRAME = 0x30,
+  SMP_FRAMEREADY = 0x00,
+  SMP_STR_VIDEO_INFO = 0x04,
+  SMP_STR_SOURCE_INFO = 0x0b,
+  SMP_INT_ERROR = 0x12,
+  SMP_STR_ERROR = 0x13,
+  SMP_LOADCOMPLETED = 0x16,
+  SMP_UNLOADCOMPLETED = 0x17,
+  SMP_SEEKDONE = 0x19,
+  SMP_PLAYING = 0x1a,
+  SMP_PAUSED = 0x1b,
+  SMP_ENDOFSTREAM = 0x1c,
+  SMP_INT_BUFFERLOW = 0x2c,
+  SMP_STR_BUFFERFULL = 0x2d,
+  SMP_STR_BUFFERLOW = 0x2e,
+  SMP_DROPPED_FRAME = 0x30,
 };
 
-/* Which elementary stream a feed carries. Audio is no longer one of them - it leaves the
- * pipeline entirely and goes to ALSA; see audio_alsa.h. */
-enum { SMP_ES_VIDEO = 1, SMP_ES_AUDIO = 2 };
+/* The elementary stream a feed carries. Only video: audio goes to ALSA; see
+ * audio_alsa.h. */
+enum { SMP_ES_VIDEO = 1 };
 
 /* Invoked on the pipeline's own thread, not the caller's. */
 typedef void (smp_event_fn)(int type, int64_t num_value, const char *str_value);
@@ -71,10 +70,6 @@ bool smp_feed(const char *payload, char *status, size_t status_len);
 /* The pipeline's own presentation clock in nanoseconds, negative when unavailable.
  * `option.queryPosition` in the load payload is what keeps it maintained. */
 int64_t smp_get_current_playtime(void);
-
-/* The public `player` member of the instance, for the libpf segment bridge. NULL before
- * a successful load. */
-void *smp_player(void);
 
 /* Set when a shim call threw; empty otherwise. */
 const char *smp_shim_error(void);

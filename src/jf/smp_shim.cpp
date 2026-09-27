@@ -1,14 +1,15 @@
 /*
  * The only C++ in this program.
  *
- * Every function here is a try/catch around one call into libplayerAPIs and nothing more.
- * No JSON is built here, no status string is interpreted here, no state is tracked here
- * beyond the instance itself - all of that is C, in smp_payload.c and player.c, where it
- * can be read and tested without a C++ toolchain in the way.
+ * Every function here is a try/catch around one call into libplayerAPIs and
+ * nothing more. No JSON is built here, no status string is interpreted here, no
+ * state is tracked here beyond the instance itself - all of that is C, in
+ * smp_payload.c and player.c, where it can be read and tested without a C++
+ * toolchain in the way.
  *
- * The one thing that genuinely needs C++ is the ABI: the constructor, the `std::string`
- * that Feed() returns by value, and the `boost::shared_ptr<Player>` member the segment
- * bridge follows. Confining those to this file is the whole point of it existing.
+ * The one thing that genuinely needs C++ is the ABI: the constructor and the
+ * `std::string` that Feed() returns by value. Confining those to this file is
+ * the whole point of it existing.
  */
 #include <starfish-media-pipeline/StarfishMediaAPIs.h>
 
@@ -119,15 +120,6 @@ bool smp_feed(const char *payload, char *status, size_t status_len)
     if (status_len > 0)
         status[0] = '\0';
     return false;
-}
-
-void *smp_player(void)
-{
-    if (g_api == nullptr)
-        return nullptr;
-    /* The member is public in the SDK header, so the segment bridge does not have to
-     * guess at an offset into the instance the way it used to. */
-    return g_api->player.get();
 }
 
 const char *smp_shim_error(void) { return g_error; }

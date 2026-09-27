@@ -294,7 +294,6 @@ src/jf/player.c       the three threads, the segment loop, seek and pause
 src/jf/smp.h          the C API of the pipeline
 src/jf/smp_shim.cpp   the only C++: try/catch around StarfishMediaAPIs
 src/jf/smp_payload.c  the JSON the pipeline actually consumes
-src/jf/smp_segment.c  the libpf entry points StarfishMediaAPIs does not forward
 src/jf/clock.c        where playback is, from the pipeline's own events
 src/jf/audio_alsa.c   the PCM sink, and the whole of A/V sync
 ```
@@ -355,12 +354,6 @@ at the flip needs none of that; `src/jf/clock.c` is forty lines.
 
 - **`Load` returning true only means the request was accepted.** Feeding and
   `Play` belong after the asynchronous `LOADCOMPLETED` event.
-- **The load payload describes the timeline but does not activate it.** libpf
-  does nothing until `CustomPipeline` receives a segment event, and
-  `StarfishMediaAPIs` does not forward `sendSegmentEvent`. `smp_segment.c`
-  reaches it by mangled name through `libpf-1.0`, following the public `player`
-  member of the instance. `setTimeToDecode`, the public wrapper, rejects the
-  `LOADED` state.
 - **`flush()` with no argument sends no `FLUSH_START`/`FLUSH_STOP` pair** and
   leaves the sink on the pre-seek segment. `flush(const char *)` parses exactly
   two keys, `audioFlush` and `offset`, and those reach the pipeline.
