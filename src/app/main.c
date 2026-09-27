@@ -801,6 +801,9 @@ static card previous_episode, next_episode;
 static bool subtitle_picker;
 /* Where the focus was when the picker opened. */
 static nav_id picker_return_focus;
+/* The picker's first frame puts the focus on the current track: its rows do
+ * not exist until then, and nav falls back off a focus nothing declares. */
+static bool picker_focus_pending;
 static bool playback_paused;
 static screen_id playback_return_screen;
 static nav_id playback_return_focus;
@@ -1886,7 +1889,7 @@ static void open_subtitle_picker(void) {
   subtitle_picker = true;
   jf_player_subtitle_preview(true);
   picker_return_focus = ui.focus;
-  nav_focus(&ui, picker_row_id((size_t)(jf_player_subtitle_current() + 1)));
+  picker_focus_pending = true;
 }
 
 static void close_subtitle_picker(void) {
@@ -3111,6 +3114,10 @@ static void draw_subtitle_picker(loom_context *ctx, float width, float height,
   const float scroll =
       nav_scroll_begin(&ui, nav_str("subtitles"), list, LOOM_VERTICAL,
                        (float)rows * row, (float)(visible / 2) * row, 0);
+  if (picker_focus_pending) {
+    picker_focus_pending = false;
+    nav_focus(&ui, picker_row_id((size_t)(jf_player_subtitle_current() + 1)));
+  }
   bool chosen_any = false;
   for (size_t i = 0; i < rows; i++) {
     const loom_rect rect = {panel.x + 12 * scale,
@@ -4035,6 +4042,9 @@ int main(int argc, char **argv) {
       if (update_subtitles())
         jf_window_frame_requested = true;
     }
+    /* Turned off: the tick has stopped, and the last line is still up. */
+    if (subtitle_texture != 0 && !subtitles_active())
+      jf_window_frame_requested = true;
     /* A finished script still has to reach its capture. */
     const bool scripted_frame = script[script_at] != '\0' ||
                                 capture_after > 0 ||

@@ -854,6 +854,15 @@ static char *from_markup(char *data, size_t *size) {
 }
 
 bool jf_subs_open_file(uint64_t id, char *data, size_t size) {
+  /* A typeset script takes most of a second to parse; not for a selection
+   * that has already moved on. */
+  pthread_mutex_lock(&lock);
+  const bool overtaken = id < serial;
+  pthread_mutex_unlock(&lock);
+  if (overtaken) {
+    free(data);
+    return false;
+  }
   data = from_markup(data, &size);
   if (data == NULL)
     return false;

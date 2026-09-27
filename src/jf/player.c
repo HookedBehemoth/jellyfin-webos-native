@@ -125,6 +125,10 @@ static bool bitmap_streams[JF_DEMUX_SUB_STREAMS];
  * decoded - except while the picker is up, when all are, so a switch finds the
  * lines already running; see jf_subs_feed. */
 static bool text_streams[JF_DEMUX_SUB_STREAMS];
+/* Each text track's styles, copied as the session opens it, so a switch can
+ * start rendering from the lines already fed without waiting on the reader. */
+static char *text_headers[JF_DEMUX_SUB_STREAMS];
+static int text_header_sizes[JF_DEMUX_SUB_STREAMS];
 static atomic_int read_text = -1;
 static atomic_bool previewing;
 static atomic_uint subtitle_lines_fed;
@@ -1061,9 +1065,14 @@ static void *session(void *unused)
         /* Every decoder stays open for the whole session. */
         if (decodable == 2 && i < JF_DEMUX_SUB_STREAMS)
           bitmap_streams[i] = true;
-        else if (decodable == 1 && i < JF_DEMUX_SUB_STREAMS)
+        else if (decodable == 1 && i < JF_DEMUX_SUB_STREAMS) {
           text_streams[i] = true;
-        else
+          text_headers[i] = malloc((size_t)header_size + 1);
+          if (text_headers[i] != NULL && header != NULL) {
+            memcpy(text_headers[i], header, (size_t)header_size);
+            text_header_sizes[i] = header_size;
+          }
+        } else
           jf_demux_subtitle_stop(demux, i);
         if (decodable != 0 && container_track_count < MAX_SUB_TRACKS) {
           jf_player_track *track = &container_tracks[container_track_count++];
@@ -1194,6 +1203,12 @@ done:
     }
     jf_audio_close();
     jf_subs_release();
+    pthread_mutex_lock(&tracks_lock);
+    for (int i = 0; i < JF_DEMUX_SUB_STREAMS; i++) {
+      free(text_headers[i]);
+      text_headers[i] = NULL;
+    }
+    pthread_mutex_unlock(&tracks_lock);
     jf_picsubs_close();
     if (demux != NULL)
         jf_demux_close(demux);
@@ -1394,21 +1409,37 @@ int jf_player_subtitle_current(void) {
 void jf_player_subtitle_select(int track) {
   pthread_mutex_lock(&tracks_lock);
   const int chosen = track >= 0 && track < sub_track_count ? track : -1;
-  if (chosen != selected_track) {
+  const bool changed = chosen != selected_track;
+  if (changed) {
     selected_track = chosen;
     select_pictures();
     selection++;
     pthread_cond_broadcast(&tracks_changed);
   }
+  const int stream =
+      chosen >= 0 && sub_tracks[chosen].text && !atomic_load(&source_transcoded)
+          ? sub_tracks[chosen].stream
+          : -1;
+  /* A container track renders at once from the lines already fed; the reader
+   * sits blocked while paused, and the server's copy can take seconds. Both
+   * still follow, and find this selection already held. Under the lock, as
+   * the session frees the headers on its way out. */
+  if (changed && stream >= 0 && stream < JF_DEMUX_SUB_STREAMS &&
+      text_headers[stream] != NULL)
+    jf_subs_open(selection, stream, text_headers[stream],
+                 text_header_sizes[stream]);
   pthread_mutex_unlock(&tracks_lock);
-  /* Nothing else to do: the reader and the loader pick it up. */
 }
 
 void jf_player_subtitle_preview(bool on) { atomic_store(&previewing, on); }
 
 int jf_player_subtitle_ms(void) {
-  const int64_t pts = jf_clock_pts();
-  if (pts == JF_CLOCK_NONE || !atomic_load(&clock_origin_ready))
+  if (!atomic_load(&clock_origin_ready))
+    return -1;
+  /* Before the first frame after a seek - for as long as it is paused -
+   * playback sits where it will resume: the timeline's zero. */
+  const int64_t pts = jf_clock_ready() ? jf_clock_pts() : 0;
+  if (pts == JF_CLOCK_NONE)
     return -1;
   return (int)(atomic_load(&timeline_origin_ms) + pts / 1000000LL);
 }
