@@ -290,6 +290,15 @@ void jf_fetcher_release(jf_fetcher *fetcher, jf_task *task);
  * jf_fetcher_finished being drained. */
 size_t jf_fetcher_pending(jf_fetcher *fetcher);
 
+/* The transport a worker runs its tasks over, one connection per worker:
+ * api_http.c against a server, api_mock.c in the UI tests. Execute returns NULL
+ * on success, or the failure's name - Unauthorized, ClientError, ServerError,
+ * RequestFailed or HttpStatus - which is what ends up in the task's `error`. */
+void *jf_api_connect(void);
+void jf_api_disconnect(void *connection);
+const char *jf_api_execute(void *connection, const jf_session *session,
+                           jf_task *task);
+
 /* Exposed for the host tests. */
 void jf_url_escape(char *out, size_t out_len, const char *value);
 const char *jf_session_base(const jf_session *session, char *out, size_t out_len);

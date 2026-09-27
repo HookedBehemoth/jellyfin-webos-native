@@ -17,3 +17,12 @@ else ()
             "(tools/build-libass.sh --host)")
 endif ()
 add_test(NAME jf-tests COMMAND jf-tests)
+
+# The app itself against a mock server (api_mock.c), on SDL's offscreen driver: focus and
+# navigation, screen by screen. Wherever the app builds.
+if (TARGET jf-app AND NOT TARGET_WEBOS)
+    add_executable(jf-ui-tests ui_tests.c api_mock.c player_mock.c
+            "${CMAKE_SOURCE_DIR}/src/jf/picsubs.c")
+    target_link_libraries(jf-ui-tests PRIVATE jf-app)
+    add_test(NAME jf-ui-tests COMMAND jf-ui-tests)
+endif ()

@@ -181,8 +181,9 @@ if (NOT (LIBCURL_FOUND AND LIBPNG_FOUND AND JSONC_FOUND))
     return()
 endif ()
 
-add_executable(jellyfin
-        app/main.c
+# Everything the app is but its main.c and its transport, so the UI tests
+# (tests/ui_tests.c) run the same app against a mock server.
+add_library(jf-app STATIC
         jf/api.c
         jf/arena.c
         jf/codecs.c
@@ -207,32 +208,36 @@ foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
     string(REPLACE "|" ";" _parts "${_license}")
     list(GET _parts 0 _name)
     list(GET _parts 1 _path)
-    webos_embed(jellyfin SYMBOL license_${_name} FILE "${_path}")
+    webos_embed(jf-app SYMBOL license_${_name} FILE "${_path}")
 endforeach ()
+# The licences above and jf-probe's text shaders, which main.c includes.
+target_include_directories(jf-app PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 if (WIN32)
     # MSYS2 packages libass, so there is nothing to build out of tree.
     pkg_check_modules(LIBASS REQUIRED libass)
-    target_include_directories(jellyfin SYSTEM PRIVATE ${LIBASS_INCLUDE_DIRS})
-    target_link_directories(jellyfin PRIVATE ${LIBASS_LIBRARY_DIRS})
-    target_link_libraries(jellyfin PRIVATE ${LIBASS_LIBRARIES})
+    target_include_directories(jf-app SYSTEM PUBLIC ${LIBASS_INCLUDE_DIRS})
+    target_link_directories(jf-app PUBLIC ${LIBASS_LIBRARY_DIRS})
+    target_link_libraries(jf-app PUBLIC ${LIBASS_LIBRARIES})
 else ()
     if (NOT EXISTS "${LIBASS_ROOT}/lib")
         message(FATAL_ERROR "No libass at ${LIBASS_ROOT} - run tools/build-libass.sh")
     endif ()
-    target_include_directories(jellyfin SYSTEM PRIVATE "${LIBASS_ROOT}/include")
-    target_link_libraries(jellyfin PRIVATE "${LIBASS_ROOT}/lib/libass.so")
+    target_include_directories(jf-app SYSTEM PUBLIC "${LIBASS_ROOT}/include")
+    target_link_libraries(jf-app PUBLIC "${LIBASS_ROOT}/lib/libass.so")
 endif ()
-target_include_directories(jellyfin SYSTEM PRIVATE
-        ${LIBCURL_INCLUDE_DIRS} ${LIBPNG_INCLUDE_DIRS} ${JSONC_INCLUDE_DIRS})
-target_link_directories(jellyfin PRIVATE ${LIBCURL_LIBRARY_DIRS} ${LIBPNG_LIBRARY_DIRS}
-        ${JSONC_LIBRARY_DIRS})
+target_include_directories(jf-app SYSTEM PUBLIC ${LIBPNG_INCLUDE_DIRS} ${JSONC_INCLUDE_DIRS})
+target_link_directories(jf-app PUBLIC ${LIBPNG_LIBRARY_DIRS} ${JSONC_LIBRARY_DIRS})
 if (NOT WIN32)
     set(PLATFORM_SYSTEM_LIBS dl)
 endif ()
-target_link_libraries(jellyfin PRIVATE jf-ui jf-probe
-        ${LIBCURL_LIBRARIES} ${LIBPNG_LIBRARIES} ${JSONC_LIBRARIES}
+target_link_libraries(jf-app PUBLIC jf-ui jf-probe ${LIBPNG_LIBRARIES} ${JSONC_LIBRARIES}
         ${PLATFORM_SYSTEM_LIBS} m pthread)
+
+add_executable(jellyfin app/main.c jf/api_http.c)
+target_include_directories(jellyfin SYSTEM PRIVATE ${LIBCURL_INCLUDE_DIRS})
+target_link_directories(jellyfin PRIVATE ${LIBCURL_LIBRARY_DIRS})
+target_link_libraries(jellyfin PRIVATE jf-app ${LIBCURL_LIBRARIES})
 
 if (NOT TARGET_WEBOS)
     # The real player against a faked pipeline (jf/smp_host.c): audio, subtitles

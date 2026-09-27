@@ -1,0 +1,5 @@
+---
+# LLVM: 2-space indents, braces on the same line as ifs and function
+# definitions, 80 columns.
+BasedOnStyle: LLVM
+Language: Cpp

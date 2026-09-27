@@ -932,17 +932,17 @@ static void forget_scroll(const char *id) { nav_forget(&ui, nav_str(id)); }
 
 static void open_grid(const card *source)
 {
-    set_text(grid_parent, sizeof(grid_parent), source->id);
-    set_text(grid_title, sizeof(grid_title), source->title);
-    grid_total = 0;
-    grid_loading = true;
-    memset(grid_cards, 0, sizeof(grid_cards));
-    for (size_t i = 0; i < WINDOW_SIZE; i++)
-        grid_at[i] = UINT32_MAX;
-    for (size_t i = 0; i < WINDOW_PAGES; i++)
-        grid_requested[i] = UINT32_MAX;
-    screen = SCREEN_GRID;
-    request_page(0);
+  set_text(grid_parent, sizeof(grid_parent), source->id);
+  set_text(grid_title, sizeof(grid_title), source->title);
+  grid_total = 0;
+  grid_loading = true;
+  memset(grid_cards, 0, sizeof(grid_cards));
+  for (size_t i = 0; i < WINDOW_SIZE; i++)
+    grid_at[i] = UINT32_MAX;
+  for (size_t i = 0; i < WINDOW_PAGES; i++)
+    grid_requested[i] = UINT32_MAX;
+  screen = SCREEN_GRID;
+  request_page(0);
 }
 
 static void open_details(const card *source) {
@@ -3837,23 +3837,27 @@ done:
  * those lines are the only diagnosis when a backend refuses. */
 static void log_to_file(void)
 {
-    if (isatty(2))
-        return;
-    char path[576];
-    /* conf/ rather than the app directory itself: the package can only make the
-     * subdirectories world-writable, and the app runs as a jail uid that owns none of
-     * them. /tmp is the fallback when even that fails. */
-    snprintf(path, sizeof(path), "%s/conf/jellyfin.log", jf_store_root());
-    int file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (file < 0)
-        file = open("/tmp/jellyfin.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (file < 0)
-        return;
-    dup2(file, 1);
-    dup2(file, 2);
-    close(file);
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IOLBF, 0);
+  /* The UI tests report on stderr, wherever it goes. */
+#ifdef JF_APP_TEST
+  return;
+#endif
+  if (isatty(2))
+    return;
+  char path[576];
+  /* conf/ rather than the app directory itself: the package can only make the
+   * subdirectories world-writable, and the app runs as a jail uid that owns
+   * none of them. /tmp is the fallback when even that fails. */
+  snprintf(path, sizeof(path), "%s/conf/jellyfin.log", jf_store_root());
+  int file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (file < 0)
+    file = open("/tmp/jellyfin.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (file < 0)
+    return;
+  dup2(file, 1);
+  dup2(file, 2);
+  close(file);
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  setvbuf(stderr, NULL, _IOLBF, 0);
 }
 
 /* A remote, replayed. There is no way to click through this app without a TV or a person,
@@ -3911,7 +3915,18 @@ static bool step_script(void)
     return false;
 }
 
-int main(int argc, char **argv) {
+/* What the frame loop keeps between iterations. */
+static loom_context ctx;
+static probe_overlay overlay;
+static probe_timer timer;
+static const char *capture_path;
+static unsigned capture_after;
+static bool controls_visible;
+static jf_player_state last_state;
+static const char *autoplay;
+static char launch_play[64];
+
+static bool app_init(int argc, char **argv) {
   for (size_t i = 0; i < ROW_COUNT; i++)
     rows[i].cards = home_cards[i];
   categories_row.cards = category_cards;
@@ -3934,7 +3949,7 @@ int main(int argc, char **argv) {
   jf_window_set_handler(on_event);
   const char *appid = getenv("APPID");
   if (!jf_window_init(appid != NULL ? appid : APP_ID, "Jellyfin", 0, 0))
-    return 1;
+    return false;
   /* How the TV asks the app to close. Absent off-device, where nothing asks. */
   if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
     fprintf(stderr, "no webOS lifecycle\n");
@@ -3947,12 +3962,9 @@ int main(int argc, char **argv) {
   renderer = jf_renderer_create(NULL, 0, 0);
   if (renderer == NULL) {
     fprintf(stderr, "the UI renderer could not start\n");
-    return 1;
+    return false;
   }
-  loom_context ctx;
   loom_init(&ctx);
-  probe_overlay overlay;
-  probe_timer timer;
   if (stats_overlay) {
     probe_overlay_init(&overlay, text_vs, text_fs, (int)gl_width,
                        (int)gl_height);
@@ -3961,7 +3973,7 @@ int main(int argc, char **argv) {
 
   if (!jf_fetcher_init(&fetcher, jf_window_wake)) {
     fprintf(stderr, "no fetcher worker threads\n");
-    return 1;
+    return false;
   }
   jf_fetcher_set_session(&fetcher, &session);
 
@@ -3996,162 +4008,175 @@ int main(int argc, char **argv) {
     }
   }
 
-  const char *capture_path = getenv("UI_CAPTURE");
+  capture_path = getenv("UI_CAPTURE");
   const char *requested_script = getenv("UI_SCRIPT");
   script = requested_script != NULL ? requested_script : "";
   /* Without a script, hold long enough for discovery's three timeouts. */
-  unsigned capture_after =
-      (capture_path != NULL && script[0] == '\0') ? 240 : 0;
-  bool controls_visible = false;
-  jf_player_state last_state = jf_player_state_get();
+  capture_after = (capture_path != NULL && script[0] == '\0') ? 240 : 0;
+  last_state = jf_player_state_get();
   /* JF_PLAY=<item id>[@ms], or a "play" launch parameter of the same form
    * (`ares-launch -p '{"play":"..."}'`), starts that item once signed in:
    * timing a start on the TV without driving the UI there. */
-  const char *autoplay = getenv("JF_PLAY");
-  static char launch_play[64];
+  autoplay = getenv("JF_PLAY");
   const char *param = argc > 1 ? strstr(argv[1], "\"play\":\"") : NULL;
   if (autoplay == NULL && param != NULL &&
       sscanf(param + 8, "%63[^\"]", launch_play) == 1)
     autoplay = launch_play;
+  return true;
+}
 
-  while (jf_window_poll()) {
-    pump();
-    if (autoplay != NULL && screen == SCREEN_HOME) {
-      char id[40];
-      long long at_ms = 0;
-      sscanf(autoplay, "%39[^@]@%lld", id, &at_ms);
-      start_playback(id, id, "", (uint64_t)at_ms * 10000ull);
-      autoplay = NULL;
-    }
-    const jf_player_state state = jf_player_state_get();
-    if (state != last_state) {
-      last_state = state;
-      if (screen == SCREEN_PLAYBACK)
-        jf_window_frame_requested = true;
-    }
-    const uint64_t now = now_ns();
-    const bool visible =
-        screen == SCREEN_PLAYBACK && playback_chrome_wanted(now);
-    if (visible != controls_visible) {
-      controls_visible = visible;
-      jf_window_frame_requested = true;
-    }
-    if (screen == SCREEN_PLAYBACK && subtitles_active() &&
-        now >= subtitle_tick) {
-      subtitle_tick = now + SUBTITLE_TICK_NS;
-      if (update_subtitles())
-        jf_window_frame_requested = true;
-    }
-    /* Turned off: the tick has stopped, and the last line is still up. */
-    if (subtitle_texture != 0 && !subtitles_active())
-      jf_window_frame_requested = true;
-    /* A finished script still has to reach its capture. */
-    const bool scripted_frame = script[script_at] != '\0' ||
-                                capture_after > 0 ||
-                                (script[0] != '\0' && capture_path != NULL);
-    if (!jf_window_drawable ||
-        (!jf_window_frame_requested && !jf_player_needs_frame() &&
-         !scripted_frame && !capture_requested)) {
-      uint64_t deadline = 0;
-      const bool have = next_deadline(now, controls_visible, &deadline);
-      jf_window_wait_timeout(wait_milliseconds(now_ns(), have, deadline));
-      continue;
-    }
-
-    if (stats_overlay) {
-      probe_timer_begin(&timer);
-      jf_window_frame_requested = true;
-    }
-    glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
-    if (screen == SCREEN_PLAYBACK && !jf_player_embedded())
-      glClearColor(0, 0, 0, 0); /* Starfish owns the webOS video plane. */
-    else
-      glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
+/* One pass of the event loop after the window's events: results, then a frame
+ * if anything asked for one. False when there was nothing to draw, with how
+ * long to sleep before the next deadline (-1 for none). */
+static bool app_step(int *wait_ms) {
+  pump();
+  if (autoplay != NULL && screen == SCREEN_HOME) {
+    char id[40];
+    long long at_ms = 0;
+    sscanf(autoplay, "%39[^@]@%lld", id, &at_ms);
+    start_playback(id, id, "", (uint64_t)at_ms * 10000ull);
+    autoplay = NULL;
+  }
+  const jf_player_state state = jf_player_state_get();
+  if (state != last_state) {
+    last_state = state;
     if (screen == SCREEN_PLAYBACK)
-      jf_player_render(gl_width, gl_height);
-    if (jf_window_frame_requested || scripted_frame) {
-      jf_window_frame_requested = false;
-      const double started = thread_ms();
-      build_ui(&ctx);
-      phase_frame[PHASE_UI] = thread_ms() - started;
-    }
-    const double draw_started = thread_ms();
-    jf_renderer_draw(renderer, ctx.commands, ctx.count, (float)gl_width,
-                     (float)gl_height);
-    phase_frame[PHASE_DRAW] = thread_ms() - draw_started;
-    if (stats_overlay) {
-      char line[PROBE_OVERLAY_COLS + 1];
-      probe_overlay_clear(&overlay);
-      snprintf(line, sizeof(line), "cpu  %6.2f ms", timer.cpu_ms);
-      probe_overlay_line(&overlay, 0, line);
-      snprintf(line, sizeof(line), "gpu %s%6.2f ms",
-               timer.mode == PROBE_GPU_FINISH ? "*" : " ", timer.gpu_ms);
-      probe_overlay_line(&overlay, 1, line);
-      snprintf(line, sizeof(line), "%5.1f fps %zu inst",
-               timer.frame_ms > 0 ? 1000.0 / timer.frame_ms : 0.0,
-               jf_renderer_instances(renderer));
-      probe_overlay_line(&overlay, 2, line);
-      snprintf(line, sizeof(line), "%u draws %.1fx",
-               jf_renderer_batches(renderer),
-               jf_renderer_covered(renderer) / ((double)gl_width * gl_height));
-      probe_overlay_line(&overlay, 3, line);
-      /* The rest are the worst frame of the last second, which is what a
-       * stutter is. */
-      for (int i = 0; i < PHASE_COUNT; i++)
-        if (phase_frame[i] > phase_peak[i])
-          phase_peak[i] = phase_frame[i];
-      static uint64_t window_started;
-      if (now_ns() - window_started >= 1000000000ull) {
-        window_started = now_ns();
-        memcpy(phase_shown, phase_peak, sizeof(phase_peak));
-        memset(phase_peak, 0, sizeof(phase_peak));
-        runs_shown = runs_peak;
-        runs_peak = 0;
-        fprintf(stderr,
-                "peak ms: ui %.2f  ass %.2f  composite %.2f (%u runs)  "
-                "upload %.2f  "
-                "draw %.2f\n",
-                phase_shown[PHASE_UI], phase_shown[PHASE_ASS],
-                phase_shown[PHASE_COMPOSITE], runs_shown,
-                phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
-      }
-      snprintf(line, sizeof(line), "ui   %6.2f ms", phase_shown[PHASE_UI]);
-      probe_overlay_line(&overlay, 4, line);
-      snprintf(line, sizeof(line), "ass  %6.2f ms", phase_shown[PHASE_ASS]);
-      probe_overlay_line(&overlay, 5, line);
-      snprintf(line, sizeof(line), "comp %6.2f ms %4u",
-               phase_shown[PHASE_COMPOSITE], runs_shown);
-      probe_overlay_line(&overlay, 6, line);
-      snprintf(line, sizeof(line), "up %5.2f gl %5.2f",
-               phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
-      probe_overlay_line(&overlay, 7, line);
-      memset(phase_frame, 0, sizeof(phase_frame));
-      glEnable(GL_BLEND);
-      probe_overlay_draw(&overlay);
-      probe_timer_end(&timer);
-    }
-
-    if (script[0] != '\0' && step_script() && capture_path != NULL &&
-        capture_after == 0)
-      capture_after = SCRIPT_BEAT;
-    if (capture_after > 0 && --capture_after == 0)
-      capture_requested = true;
-    if (capture_requested) {
-      capture_frame(capture_path != NULL ? capture_path
-                                         : "jellyfin-capture.ppm");
-      capture_requested = false;
-      if (capture_path != NULL)
-        jf_window_running = false;
-    }
-    jf_window_swap();
+      jf_window_frame_requested = true;
+  }
+  const uint64_t now = now_ns();
+  const bool visible = screen == SCREEN_PLAYBACK && playback_chrome_wanted(now);
+  if (visible != controls_visible) {
+    controls_visible = visible;
+    jf_window_frame_requested = true;
+  }
+  if (screen == SCREEN_PLAYBACK && subtitles_active() && now >= subtitle_tick) {
+    subtitle_tick = now + SUBTITLE_TICK_NS;
+    if (update_subtitles())
+      jf_window_frame_requested = true;
+  }
+  /* Turned off: the tick has stopped, and the last line is still up. */
+  if (subtitle_texture != 0 && !subtitles_active())
+    jf_window_frame_requested = true;
+  /* A finished script still has to reach its capture. */
+  const bool scripted_frame = script[script_at] != '\0' || capture_after > 0 ||
+                              (script[0] != '\0' && capture_path != NULL);
+  if (!jf_window_drawable ||
+      (!jf_window_frame_requested && !jf_player_needs_frame() &&
+       !scripted_frame && !capture_requested)) {
+    uint64_t deadline = 0;
+    const bool have = next_deadline(now, controls_visible, &deadline);
+    *wait_ms = wait_milliseconds(now_ns(), have, deadline);
+    return false;
   }
 
+  if (stats_overlay) {
+    probe_timer_begin(&timer);
+    jf_window_frame_requested = true;
+  }
+  glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
+  if (screen == SCREEN_PLAYBACK && !jf_player_embedded())
+    glClearColor(0, 0, 0, 0); /* Starfish owns the webOS video plane. */
+  else
+    glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  if (screen == SCREEN_PLAYBACK)
+    jf_player_render(gl_width, gl_height);
+  if (jf_window_frame_requested || scripted_frame) {
+    jf_window_frame_requested = false;
+    const double started = thread_ms();
+    build_ui(&ctx);
+    phase_frame[PHASE_UI] = thread_ms() - started;
+  }
+  const double draw_started = thread_ms();
+  jf_renderer_draw(renderer, ctx.commands, ctx.count, (float)gl_width,
+                   (float)gl_height);
+  phase_frame[PHASE_DRAW] = thread_ms() - draw_started;
+  if (stats_overlay) {
+    char line[PROBE_OVERLAY_COLS + 1];
+    probe_overlay_clear(&overlay);
+    snprintf(line, sizeof(line), "cpu  %6.2f ms", timer.cpu_ms);
+    probe_overlay_line(&overlay, 0, line);
+    snprintf(line, sizeof(line), "gpu %s%6.2f ms",
+             timer.mode == PROBE_GPU_FINISH ? "*" : " ", timer.gpu_ms);
+    probe_overlay_line(&overlay, 1, line);
+    snprintf(line, sizeof(line), "%5.1f fps %zu inst",
+             timer.frame_ms > 0 ? 1000.0 / timer.frame_ms : 0.0,
+             jf_renderer_instances(renderer));
+    probe_overlay_line(&overlay, 2, line);
+    snprintf(line, sizeof(line), "%u draws %.1fx",
+             jf_renderer_batches(renderer),
+             jf_renderer_covered(renderer) / ((double)gl_width * gl_height));
+    probe_overlay_line(&overlay, 3, line);
+    /* The rest are the worst frame of the last second, which is what a
+     * stutter is. */
+    for (int i = 0; i < PHASE_COUNT; i++)
+      if (phase_frame[i] > phase_peak[i])
+        phase_peak[i] = phase_frame[i];
+    static uint64_t window_started;
+    if (now_ns() - window_started >= 1000000000ull) {
+      window_started = now_ns();
+      memcpy(phase_shown, phase_peak, sizeof(phase_peak));
+      memset(phase_peak, 0, sizeof(phase_peak));
+      runs_shown = runs_peak;
+      runs_peak = 0;
+      fprintf(stderr,
+              "peak ms: ui %.2f  ass %.2f  composite %.2f (%u runs)  "
+              "upload %.2f  "
+              "draw %.2f\n",
+              phase_shown[PHASE_UI], phase_shown[PHASE_ASS],
+              phase_shown[PHASE_COMPOSITE], runs_shown,
+              phase_shown[PHASE_UPLOAD], phase_shown[PHASE_DRAW]);
+    }
+    snprintf(line, sizeof(line), "ui   %6.2f ms", phase_shown[PHASE_UI]);
+    probe_overlay_line(&overlay, 4, line);
+    snprintf(line, sizeof(line), "ass  %6.2f ms", phase_shown[PHASE_ASS]);
+    probe_overlay_line(&overlay, 5, line);
+    snprintf(line, sizeof(line), "comp %6.2f ms %4u",
+             phase_shown[PHASE_COMPOSITE], runs_shown);
+    probe_overlay_line(&overlay, 6, line);
+    snprintf(line, sizeof(line), "up %5.2f gl %5.2f", phase_shown[PHASE_UPLOAD],
+             phase_shown[PHASE_DRAW]);
+    probe_overlay_line(&overlay, 7, line);
+    memset(phase_frame, 0, sizeof(phase_frame));
+    glEnable(GL_BLEND);
+    probe_overlay_draw(&overlay);
+    probe_timer_end(&timer);
+  }
+
+  if (script[0] != '\0' && step_script() && capture_path != NULL &&
+      capture_after == 0)
+    capture_after = SCRIPT_BEAT;
+  if (capture_after > 0 && --capture_after == 0)
+    capture_requested = true;
+  if (capture_requested) {
+    capture_frame(capture_path != NULL ? capture_path : "jellyfin-capture.ppm");
+    capture_requested = false;
+    if (capture_path != NULL)
+      jf_window_running = false;
+  }
+  jf_window_swap();
+  return true;
+}
+
+static void app_deinit(void) {
   jf_player_deinit();
   jf_fetcher_deinit(&fetcher);
   loom_destroy(&ctx);
   jf_renderer_destroy(renderer);
   jf_luna_deinit();
   jf_window_deinit();
+}
+
+#ifndef JF_APP_TEST
+int main(int argc, char **argv) {
+  if (!app_init(argc, argv))
+    return 1;
+  while (jf_window_poll()) {
+    int wait_ms;
+    if (!app_step(&wait_ms))
+      jf_window_wait_timeout(wait_ms);
+  }
+  app_deinit();
   return 0;
 }
+#endif
