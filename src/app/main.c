@@ -35,6 +35,7 @@
 #include "../platform/window.h"
 #include "../ui/glyph_atlas.h"
 #include "../ui/loom.h"
+#include "../ui/nav.h"
 #include "../ui/renderer.h"
 #include "licenses.h"
 #include "text_fs.h"
@@ -205,17 +206,6 @@ static void animated_float_set(animated_float *value, float target,
 }
 
 static uint64_t frame_index;
-
-/* A list that was not on screen last frame appears where it belongs rather than
- * scrolling there. */
-static void animate_list(animated_float *motion, uint64_t *drawn_frame,
-                         float target) {
-  if (*drawn_frame + 1 == frame_index)
-    animated_float_set(motion, target, NAVIGATION_ANIMATION_NS);
-  else
-    animated_float_snap(motion, target);
-  *drawn_frame = frame_index;
-}
 
 static size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
 static float minf(float a, float b) { return a < b ? a : b; }
@@ -699,15 +689,8 @@ static item_row categories_row = {"All categories", true, NULL, CATEGORY_CAPACIT
 static uint32_t auth_generation;
 
 static screen_id screen = SCREEN_SERVER;
-static size_t focus;
-static size_t row_focus;
-static size_t col_focus[ROW_COUNT];
-static float home_scroll;
-static animated_float home_scroll_motion;
-static animated_float row_offset_motion[ROW_COUNT];
-static loom_rect home_rect;
-static float home_row_height = 470;
-static bool home_reveal;
+/* Focus and scrolling, for every screen and overlay. */
+static nav ui;
 
 /* Where Back goes, as a stack rather than a rule per screen.
  *
@@ -722,11 +705,7 @@ typedef struct {
     card card;
     /* The series a season belongs to, so a season can be re-entered. */
     card series;
-    size_t selected;
-    float scroll;
-    size_t focus;
-    size_t row_focus;
-    size_t col_focus[ROW_COUNT];
+    nav_id nav_focus;
 } stack_entry;
 
 static stack_entry stack[12];
@@ -739,16 +718,12 @@ static size_t license_open = JF_LICENSE_COUNT;
 static char *license_body;
 static const char **license_lines;
 static size_t license_line_count;
-static float license_scroll;
 /* Width of the longest line at a font size of one, measured once when the
  * licence is opened. The panel is then sized to the text rather than to the
  * screen. */
 static float license_text_width;
 /* Set by the draw, used by the key handler: one press moves one line of
  * whatever size that screen turned out to be. */
-static float license_line_height = 26;
-static float licenses_scroll;
-static bool licenses_reveal;
 
 /* The composited subtitle overlay, uploaded only when libass says it changed.
  */
@@ -787,12 +762,6 @@ static card grid_cards[WINDOW_SIZE];
  * same ring slot. */
 static uint32_t grid_at[WINDOW_SIZE];
 static uint32_t grid_requested[WINDOW_PAGES];
-static size_t grid_selected;
-static float grid_scroll;
-static animated_float grid_scroll_motion;
-static loom_rect grid_rect;
-static size_t grid_columns = 6;
-static float grid_row_height = 360;
 
 /* Details and season screens. */
 static card detail;
@@ -806,16 +775,9 @@ static uint64_t backdrop_fade_started_at;
 static card seasons_cards[SEASONS_CAPACITY];
 static card episodes_cards[EPISODES_CAPACITY];
 static item_row seasons_row = {"Seasons", false, NULL, SEASONS_CAPACITY, 0, false};
-static item_row episodes_row = {"Episodes", false, NULL, EPISODES_CAPACITY, 0, false};
-static size_t episode_selected;
+static item_row episodes_row = {"Episodes",        false, NULL,
+                                EPISODES_CAPACITY, 0,     false};
 static card season_detail;
-static float episode_scroll;
-static animated_float episode_scroll_motion;
-static loom_rect episode_rect;
-static float episode_row_height = 170;
-static bool episode_reveal;
-static bool select_unfinished_season;
-static bool select_unfinished_episode;
 static char playback_title[160];
 static char playback_item_id[40];
 static char playback_source_id[40];
@@ -825,10 +787,11 @@ static card previous_episode, next_episode;
 /* The subtitle picker, over the video so a choice shows on the frame behind
  * it. Row 0 is off, row i + 1 the player's track i. */
 static bool subtitle_picker;
-static size_t picker_focus;
+/* Where the focus was when the picker opened. */
+static nav_id picker_return_focus;
 static bool playback_paused;
 static screen_id playback_return_screen;
-static size_t playback_return_focus;
+static nav_id playback_return_focus;
 static uint64_t playback_started_at;
 static uint64_t playback_progress_at;
 /* The player chrome is deliberately transient: it never covers a scene for more than
@@ -837,8 +800,6 @@ static uint64_t playback_controls_until;
 #define PLAYBACK_CONTROLS_NS (3ull * 1000000000ull)
 /* Hidden with Up from the seek bar, until the next key or pointer movement. */
 static bool chrome_dismissed;
-/* 0: the buttons, 1: the seek bar above them. */
-static size_t playback_row;
 /* How far the chrome is in, 0 to 1, and where the focus glow is. */
 static animated_float chrome_motion, glow_x, glow_y;
 static bool glow_placed;
@@ -860,35 +821,16 @@ static char server_url[512];
 static char username[256];
 static char password[256];
 static char password_mask[257];
-static loom_rect url_rect, username_rect, password_rect;
 static edit_field active_field = EDIT_NONE;
 static bool capture_requested;
-
-static float cursor_x = -1;
-static float cursor_y = -1;
-static bool cursor_present;
-static bool pointer_press;
-/* Set by movement, so hovering takes the focus only when the pointer moved. */
-static bool pointer_moved;
 
 /* The sidebar is an overlay containing every library category and the one settings row. */
 static bool sidebar_open;
 static bool sidebar_closing;
-static size_t sidebar_focus;
-static float sidebar_scroll;
 static animated_float sidebar_slide;
-static animated_float sidebar_scroll_motion;
-static bool sidebar_reveal;
 static screen_id sidebar_return_screen;
-
-typedef struct {
-  animated_float x, y, w, h;
-  loom_rect rendered;
-  unsigned owner;
-  bool known;
-} navigation_cursor;
-static navigation_cursor focus_cursor;
-static bool focus_cursor_move_requested;
+/* Where the focus was on the screen the sidebar opened over. */
+static nav_id sidebar_return_focus;
 
 static char status_text[200];
 static bool status_error;
@@ -969,14 +911,15 @@ static void request_page(uint32_t index)
     jf_fetcher_start(&fetcher, task);
 }
 
+/* Opening a list afresh starts it at the top; Back into one keeps its place. */
+static void forget_scroll(const char *id) { nav_forget(&ui, nav_str(id)); }
+
 static void open_grid(const card *source)
 {
     set_text(grid_parent, sizeof(grid_parent), source->id);
     set_text(grid_title, sizeof(grid_title), source->title);
     grid_total = 0;
     grid_loading = true;
-    grid_selected = 0;
-    grid_scroll = 0;
     memset(grid_cards, 0, sizeof(grid_cards));
     for (size_t i = 0; i < WINDOW_SIZE; i++)
         grid_at[i] = UINT32_MAX;
@@ -986,47 +929,39 @@ static void open_grid(const card *source)
     request_page(0);
 }
 
-static void open_details(const card *source)
-{
-    select_unfinished_season = true;
-    if (strcmp(detail.backdrop_id, source->backdrop_id) != 0) {
-      backdrop_texture = 0;
-      backdrop_fade_started_at = 0;
-    }
-    detail = *source;
-    detail_extra[0] = '\0';
-    seasons_row.count = 0;
-    seasons_row.loading = false;
-    focus = 0;
-    screen = SCREEN_DETAILS;
+static void open_details(const card *source) {
+  if (strcmp(detail.backdrop_id, source->backdrop_id) != 0) {
+    backdrop_texture = 0;
+    backdrop_fade_started_at = 0;
+  }
+  detail = *source;
+  detail_extra[0] = '\0';
+  seasons_row.count = 0;
+  seasons_row.loading = false;
+  screen = SCREEN_DETAILS;
 
-    /* An episode plays as itself; a series needs its seasons before anything on this
-     * screen can be selected. */
-    jf_task *task = request(JF_JOB_ITEM, 0);
-    if (task == NULL)
-        return;
-    set_text(task->a, sizeof(task->a), detail.id);
-    jf_fetcher_start(&fetcher, task);
+  /* An episode plays as itself; a series needs its seasons before anything on
+   * this screen can be selected. */
+  jf_task *task = request(JF_JOB_ITEM, 0);
+  if (task == NULL)
+    return;
+  set_text(task->a, sizeof(task->a), detail.id);
+  jf_fetcher_start(&fetcher, task);
 
-    if (card_is(&detail, "Series")) {
-        seasons_row.loading = true;
-        jf_task *seasons = request(JF_JOB_SEASONS, 0);
-        if (seasons == NULL)
-            return;
-        set_text(seasons->a, sizeof(seasons->a), detail.id);
-        jf_fetcher_start(&fetcher, seasons);
-    }
+  if (card_is(&detail, "Series")) {
+    seasons_row.loading = true;
+    jf_task *seasons = request(JF_JOB_SEASONS, 0);
+    if (seasons == NULL)
+      return;
+    set_text(seasons->a, sizeof(seasons->a), detail.id);
+    jf_fetcher_start(&fetcher, seasons);
+  }
 }
 
-static void open_season(const card *source)
-{
-  select_unfinished_episode = true;
+static void open_season(const card *source) {
   season_detail = *source;
-  episode_scroll = 0;
-  episode_reveal = true;
   episodes_row.count = 0;
   episodes_row.loading = true;
-  episode_selected = 0;
   screen = SCREEN_SEASON;
   jf_task *task = request(JF_JOB_EPISODES, 0);
   if (task == NULL)
@@ -1058,15 +993,7 @@ static stack_entry here(void)
                  : screen == SCREEN_SEASON ? season_detail
                                            : detail;
     entry.series = detail;
-    entry.selected = screen == SCREEN_GRID     ? grid_selected
-                     : screen == SCREEN_SEASON ? episode_selected
-                                               : 0;
-    entry.scroll = screen == SCREEN_HOME       ? home_scroll
-                   : screen == SCREEN_SEASON   ? episode_scroll
-                                                : grid_scroll;
-    entry.focus = focus;
-    entry.row_focus = row_focus;
-    memcpy(entry.col_focus, col_focus, sizeof(col_focus));
+    entry.nav_focus = ui.focus;
     return entry;
 }
 
@@ -1088,39 +1015,29 @@ static void pop(void)
         return;
     }
     const stack_entry entry = stack[--depth];
-    row_focus = entry.row_focus;
-    memcpy(col_focus, entry.col_focus, sizeof(col_focus));
+    nav_focus(&ui, entry.nav_focus);
     switch (entry.screen) {
     case SCREEN_HOME:
-        screen = SCREEN_HOME;
-        home_scroll = entry.scroll;
-        break;
+      screen = SCREEN_HOME;
+      break;
     case SCREEN_GRID:
         /* Returning to the grid we are still holding pages for is free; a different
          * library has to be fetched again. */
         if (strcmp(grid_parent, entry.card.id) == 0 && grid_total != 0)
             screen = SCREEN_GRID;
         else
-            open_grid(&entry.card);
-        grid_selected = entry.selected;
-        grid_scroll = entry.scroll;
+          open_grid(&entry.card);
         break;
     case SCREEN_DETAILS:
-        open_details(&entry.card);
-        focus = entry.focus;
-        select_unfinished_season = false;
-        break;
+      open_details(&entry.card);
+      break;
     case SCREEN_SEASON:
         detail = entry.series;
         open_season(&entry.card);
-        episode_selected = entry.selected;
-        episode_scroll = entry.scroll;
-        select_unfinished_episode = false;
         break;
     default:
         /* Nothing above the sign-in screens is ever pushed. */
         screen = entry.screen;
-        focus = entry.focus;
         break;
     }
 }
@@ -1151,9 +1068,7 @@ static void signed_in(const jf_auth *auth, const char *used_password)
         return;
     }
     screen = SCREEN_HOME;
-    home_scroll = 0;
-    row_focus = 0;
-    memset(col_focus, 0, sizeof(col_focus));
+    nav_focus(&ui, 0);
     depth = 0;
     load_home();
 }
@@ -1198,7 +1113,7 @@ static void sign_out(void)
     categories_row.count = 0;
     depth = 0;
     screen = SCREEN_AUTH;
-    focus = 0;
+    nav_focus(&ui, 0);
     status_text[0] = '\0';
     status_error = false;
 }
@@ -1262,7 +1177,7 @@ static void on_failure(jf_task *task)
         if (strcmp(task->error, "ClientError") == 0 || strcmp(task->error, "Unauthorized") == 0 ||
             strcmp(task->error, "ServerError") == 0) {
             screen = SCREEN_AUTH;
-            focus = 0;
+            nav_focus(&ui, 0);
             set_error("%s for %s at %s", strcmp(task->error, "ServerError") == 0
                                            ? "Internal server error"
                                            : "Request failed",
@@ -1283,7 +1198,7 @@ static void on_failure(jf_task *task)
         }
         if (strcmp(task->error, "ClientError") == 0 || strcmp(task->error, "ServerError") == 0) {
             screen = SCREEN_AUTH;
-            focus = 0;
+            nav_focus(&ui, 0);
             set_error("%s for %s at %s", strcmp(task->error, "ServerError") == 0
                                            ? "Internal server error"
                                            : "Request failed",
@@ -1313,7 +1228,7 @@ static void on_failure(jf_task *task)
         if (strcmp(task->error, "ClientError") == 0 || strcmp(task->error, "Unauthorized") == 0 ||
             strcmp(task->error, "ServerError") == 0) {
             screen = SCREEN_AUTH;
-            focus = 0;
+            nav_focus(&ui, 0);
             set_error("%s for %s at %s", strcmp(task->error, "ServerError") == 0
                                            ? "Internal server error"
                                            : "Request failed",
@@ -1448,21 +1363,12 @@ static void consume(jf_task *task)
         if (strcmp(task->a, detail.id) != 0)
             return;
         row_fill(&seasons_row, task->list.items, task->list.count);
-        if (select_unfinished_season && screen == SCREEN_DETAILS) {
-            focus = first_unfinished(seasons_row.cards, seasons_row.count);
-            select_unfinished_season = false;
-        }
         break;
 
     case JF_JOB_EPISODES:
         if (strcmp(task->b, season_detail.id) != 0)
             return;
         row_fill(&episodes_row, task->list.items, task->list.count);
-        if (select_unfinished_episode && screen == SCREEN_SEASON) {
-            episode_selected = first_unfinished(episodes_row.cards, episodes_row.count);
-            episode_reveal = true;
-            select_unfinished_episode = false;
-        }
         break;
 
     case JF_JOB_POSTER:
@@ -1618,12 +1524,10 @@ static void use_server(const char *address, const char *name)
     set_text(server_name, sizeof(server_name), name != NULL && name[0] != '\0' ? name : address);
     jf_fetcher_set_session(&fetcher, &session);
     screen = SCREEN_AUTH;
-    focus = 0;
+    nav_focus(&ui, 0);
     status_text[0] = '\0';
     status_error = false;
 }
-
-static void activate(void);
 
 /* Split one licence into lines once, at open, rather than measuring the whole
  * text every frame. The copy is mutable so the newlines become terminators in
@@ -1635,7 +1539,7 @@ static void open_license(size_t index) {
   license_body = NULL;
   license_lines = NULL;
   license_line_count = 0;
-  license_scroll = 0;
+  nav_forget(&ui, nav_str("license"));
   license_open = index;
   if (index >= JF_LICENSE_COUNT)
     return;
@@ -1686,9 +1590,8 @@ static void open_sidebar(void)
     end_edit();
     sidebar_open = true;
     sidebar_closing = false;
-    sidebar_focus = min_size(sidebar_focus, categories_row.count);
-    sidebar_reveal = true;
     sidebar_return_screen = screen;
+    sidebar_return_focus = ui.focus;
     animated_float_set(&sidebar_slide, 1.0f, SIDEBAR_ANIMATION_NS);
 }
 
@@ -1696,20 +1599,21 @@ static void close_sidebar(void) {
   if (!sidebar_open || sidebar_closing)
     return;
   sidebar_closing = true;
+  nav_focus(&ui, sidebar_return_focus);
   animated_float_set(&sidebar_slide, 0.0f, NAVIGATION_ANIMATION_NS);
 }
 
-static void activate_sidebar(void)
-{
+/* Row `index` of the sidebar: a category, or past the last one, Settings. */
+static void activate_sidebar(size_t index) {
   close_sidebar();
-  if (sidebar_focus < categories_row.count) {
-    const card chosen = categories_row.cards[sidebar_focus];
+  if (index < categories_row.count) {
+    const card chosen = categories_row.cards[index];
     push();
+    forget_scroll(chosen.id);
     open_grid(&chosen);
     return;
   }
-    screen = SCREEN_SETTINGS;
-    focus = 0;
+  screen = SCREEN_SETTINGS;
 }
 
 static void go_back(void)
@@ -1724,7 +1628,7 @@ static void go_back(void)
         playback_paused = false;
         playback_item_id[0] = '\0';
         screen = playback_return_screen;
-        focus = playback_return_focus;
+        nav_focus(&ui, playback_return_focus);
         set_status("Stopped playback");
         return;
     }
@@ -1744,27 +1648,26 @@ static void go_back(void)
     case SCREEN_AUTH:
         auth_generation++;
         screen = SCREEN_SERVER;
-        focus = 0;
+        nav_focus(&ui, 0);
         break;
     case SCREEN_QUICK:
         auth_generation++;
         quick_secret[0] = '\0';
         screen = SCREEN_AUTH;
-        focus = 0;
+        nav_focus(&ui, 0);
         break;
     case SCREEN_SETTINGS:
         screen = sidebar_return_screen;
-        focus = 0;
+        nav_focus(&ui, sidebar_return_focus);
         break;
     case SCREEN_LICENSES:
       screen = SCREEN_SETTINGS;
-      focus = 2;
+      nav_focus(&ui, nav_str("settings.licenses"));
       break;
     case SCREEN_LICENSE:
-      focus = min_size(license_open, JF_LICENSE_COUNT - 1);
+      nav_focus(&ui, nav_child(nav_str("licenses"), nav_int(license_open)));
       open_license(JF_LICENSE_COUNT); /* frees the text */
       screen = SCREEN_LICENSES;
-      licenses_reveal = true;
       break;
     default:
         pop();
@@ -1812,6 +1715,11 @@ static const struct {
 #define PLAY_PAUSE_INDEX 4
 #define TRANSPORT_COUNT 9
 
+static nav_id seek_bar_id(void) { return nav_str("playback.seek"); }
+static nav_id button_id(size_t index) {
+  return nav_child(nav_str("playback.buttons"), nav_int(index));
+}
+
 static bool button_shown(size_t index) {
   const int *starts = NULL;
   switch (playback_buttons[index].action) {
@@ -1825,17 +1733,6 @@ static bool button_shown(size_t index) {
   default:
     return true;
   }
-}
-
-/* The shown button `direction` steps from `from`, or `from` at the end. */
-static size_t step_button(size_t from, int direction) {
-  for (size_t at = from;
-       direction < 0 ? at > 0 : at + 1 < PLAYBACK_BUTTON_COUNT;) {
-    at = direction < 0 ? at - 1 : at + 1;
-    if (button_shown(at))
-      return at;
-  }
-  return from;
 }
 
 static void report_playback(jf_job job)
@@ -1926,9 +1823,8 @@ static void start_playback(const char *id, const char *title,
   playback_started_at = now_ns();
   playback_progress_at = playback_started_at + 15000000000ull;
   playback_return_screen = screen;
-  playback_return_focus = focus;
-  focus = PLAY_PAUSE_INDEX;
-  playback_row = 0;
+  playback_return_focus = ui.focus;
+  nav_focus(&ui, button_id(PLAY_PAUSE_INDEX));
   glow_placed = false;
   animated_float_snap(&chrome_motion, 0);
   show_playback_chrome();
@@ -1949,6 +1845,11 @@ static void toggle_playback(void)
     }
 }
 
+static nav_id picker_row_id(size_t row) {
+  return nav_child(nav_str("subtitles"), nav_int(row));
+}
+
+/* Row 0 is off, row i + 1 the player's track i. */
 static void open_subtitle_picker(void) {
   if (jf_player_subtitle_count() == 0) {
     set_status("No subtitle tracks are available");
@@ -1956,29 +1857,28 @@ static void open_subtitle_picker(void) {
   }
   subtitle_picker = true;
   jf_player_subtitle_preview(true);
-  picker_focus = (size_t)(jf_player_subtitle_current() + 1);
+  picker_return_focus = ui.focus;
+  nav_focus(&ui, picker_row_id((size_t)(jf_player_subtitle_current() + 1)));
 }
 
-/* Moving is choosing: the frame behind the picker shows the track at once. */
-static void pick_subtitle(size_t row) {
-  picker_focus = row;
-  jf_player_subtitle_select((int)row - 1);
+static void close_subtitle_picker(void) {
+  subtitle_picker = false;
+  jf_player_subtitle_preview(false);
+  report_playback(JF_JOB_PLAYBACK_PROGRESS);
+  nav_focus(&ui, picker_return_focus);
 }
 
-/* The picker takes every key while it is up. */
+/* The picker takes every key while it is up. The subtitle key goes round the
+ * tracks. */
 static void picker_key(uint32_t code) {
-  const size_t rows = (size_t)jf_player_subtitle_count() + 1;
-  if (jf_window_is_back_key(code) || code == 28 || code == 96 || code == 352) {
-    subtitle_picker = false;
-    jf_player_subtitle_preview(false);
-    report_playback(JF_JOB_PLAYBACK_PROGRESS);
-  } else if (code == 103) {
-    pick_subtitle(picker_focus > 0 ? picker_focus - 1 : 0);
-  } else if (code == 108) {
-    pick_subtitle(min_size(picker_focus + 1, rows - 1));
-  } else if (code == KEY_SUBTITLE) {
-    pick_subtitle((picker_focus + 1) % rows);
-  }
+  if (jf_window_is_back_key(code) || code == 28 || code == 96 || code == 352)
+    close_subtitle_picker();
+  else if (code == 103)
+    nav_move(&ui, NAV_UP);
+  else if (code == 108)
+    nav_move(&ui, NAV_DOWN);
+  else if (code == KEY_SUBTITLE && !nav_move(&ui, NAV_DOWN))
+    nav_focus(&ui, picker_row_id(0));
 }
 
 /* Next is the first chapter starting after here; back is the start of this
@@ -2007,7 +1907,7 @@ static void play_adjacent(const card *episode) {
     return;
   const card chosen = *episode;
   const screen_id back = playback_return_screen;
-  const size_t back_focus = playback_return_focus;
+  const nav_id back_focus = playback_return_focus;
   report_playback(JF_JOB_PLAYBACK_PROGRESS);
   jf_player_stop();
   start_playback(chosen.id, chosen.episode_title, chosen.series_id,
@@ -2016,36 +1916,45 @@ static void play_adjacent(const card *episode) {
   playback_return_focus = back_focus;
 }
 
-static void activate_playback(void)
-{
-    playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
-    switch (playback_buttons[min_size(focus, PLAYBACK_BUTTON_COUNT - 1)].action) {
-    case ACTION_BACK_30: jf_player_seek(-30); break;
-    case ACTION_BACK_10: jf_player_seek(-10); break;
-    case ACTION_PAUSE: toggle_playback(); break;
-    case ACTION_FORWARD_10: jf_player_seek(10); break;
-    case ACTION_FORWARD_30: jf_player_seek(30); break;
-    case ACTION_PREVIOUS:
-      play_adjacent(&previous_episode);
-      break;
-    case ACTION_NEXT:
-      play_adjacent(&next_episode);
-      break;
-    case ACTION_CHAPTER_BACK:
-      seek_chapter(-1);
-      break;
-    case ACTION_CHAPTER_NEXT:
-      seek_chapter(1);
-      break;
-    case ACTION_SUBTITLES:
-      open_subtitle_picker();
-      break;
-    case ACTION_AUDIO:
-      if (jf_player_audio_count() > 1)
-        jf_player_audio_select((jf_player_audio_current() + 1) %
-                               jf_player_audio_count());
-      break;
-    }
+static void activate_playback(size_t index) {
+  playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
+  switch (playback_buttons[index].action) {
+  case ACTION_BACK_30:
+    jf_player_seek(-30);
+    break;
+  case ACTION_BACK_10:
+    jf_player_seek(-10);
+    break;
+  case ACTION_PAUSE:
+    toggle_playback();
+    break;
+  case ACTION_FORWARD_10:
+    jf_player_seek(10);
+    break;
+  case ACTION_FORWARD_30:
+    jf_player_seek(30);
+    break;
+  case ACTION_PREVIOUS:
+    play_adjacent(&previous_episode);
+    break;
+  case ACTION_NEXT:
+    play_adjacent(&next_episode);
+    break;
+  case ACTION_CHAPTER_BACK:
+    seek_chapter(-1);
+    break;
+  case ACTION_CHAPTER_NEXT:
+    seek_chapter(1);
+    break;
+  case ACTION_SUBTITLES:
+    open_subtitle_picker();
+    break;
+  case ACTION_AUDIO:
+    if (jf_player_audio_count() > 1)
+      jf_player_audio_select((jf_player_audio_current() + 1) %
+                             jf_player_audio_count());
+    break;
+  }
 }
 
 /* The chrome is two rows: the buttons, and above them the seek bar. Up from the
@@ -2097,362 +2006,87 @@ static void playback_key(uint32_t code, bool repeat) {
     if (ok)
       toggle_playback();
     if (code == 105 || code == 106) {
-      playback_row = 1;
+      nav_focus(&ui, seek_bar_id());
       scrub(code == 105 ? -1 : 1, repeat);
     }
     return;
   }
   switch (code) {
   case 103:
-    if (playback_row == 0) {
-      playback_row = 1;
-    } else {
+    /* Up past the seek bar hides the chrome; it comes back on play/pause. */
+    if (!nav_move(&ui, NAV_UP)) {
       chrome_dismissed = true;
-      playback_row = 0;
+      nav_focus(&ui, 0);
     }
     break;
   case 108:
-    playback_row = 0;
+    nav_move(&ui, NAV_DOWN);
     break;
   case 105:
   case 106:
-    if (playback_row == 1)
+    if (ui.focus == seek_bar_id())
       scrub(code == 105 ? -1 : 1, repeat);
     else
-      focus = step_button(focus, code == 105 ? -1 : 1);
+      nav_move(&ui, code == 105 ? NAV_LEFT : NAV_RIGHT);
     break;
   default:
-    if (ok) {
-      if (playback_row == 1)
-        toggle_playback();
-      else
-        activate_playback();
-    }
+    if (ok)
+      nav_activate(&ui);
     break;
   }
 }
 
-static void activate_server(void)
-{
-    if (focus == 0) {
-        begin_edit(EDIT_URL, url_rect);
-        return;
-    }
-    if (focus == 1) {
-        if (server_url[0] == '\0') {
-            set_error("Enter a server URL first");
-            return;
-        }
-        jf_task *task = request(JF_JOB_PROBE, 0);
-        if (task == NULL)
-            return;
-        set_text(task->a, sizeof(task->a), server_url);
-        connecting = true;
-        jf_fetcher_start(&fetcher, task);
-        return;
-    }
-    const size_t index = focus - 2;
-    if (index < discovered_count) {
-        use_server(discovered[index].address, discovered[index].name);
-    } else if (index == discovered_count) {
-        restart_discovery();
-    }
+static void connect_server(void) {
+  if (server_url[0] == '\0') {
+    set_error("Enter a server URL first");
+    return;
+  }
+  jf_task *task = request(JF_JOB_PROBE, 0);
+  if (task == NULL)
+    return;
+  set_text(task->a, sizeof(task->a), server_url);
+  connecting = true;
+  jf_fetcher_start(&fetcher, task);
 }
 
-static void activate_details(void)
-{
-    if (card_is(&detail, "Series")) {
-        if (focus < seasons_row.count) {
-            push();
-            open_season(&seasons_row.cards[focus]);
-        }
-        return;
-    }
-    if (focus == 0)
-      start_playback(detail.id, detail.title, detail.series_id,
-                     detail.playback_position_ticks);
+static void sign_in(void) {
+  if (username[0] == '\0') {
+    set_error("Enter a username");
+    return;
+  }
+  jf_task *task = request(JF_JOB_LOGIN, 0);
+  if (task == NULL)
+    return;
+  set_text(task->a, sizeof(task->a), username);
+  set_text(task->b, sizeof(task->b), password);
+  jf_fetcher_start(&fetcher, task);
+  set_status("Signing in...");
 }
 
-static void activate(void)
-{
-    switch (screen) {
-    case SCREEN_SERVER:
-        activate_server();
-        break;
-    case SCREEN_AUTH:
-        switch (focus) {
-        case 0: begin_edit(EDIT_USERNAME, username_rect); break;
-        case 1: begin_edit(EDIT_PASSWORD, password_rect); break;
-        case 2: {
-            if (username[0] == '\0') {
-                set_error("Enter a username");
-                return;
-            }
-            jf_task *task = request(JF_JOB_LOGIN, 0);
-            if (task == NULL)
-                return;
-            set_text(task->a, sizeof(task->a), username);
-            set_text(task->b, sizeof(task->b), password);
-            jf_fetcher_start(&fetcher, task);
-            set_status("Signing in...");
-            break;
-        }
-        default:
-            simple(JF_JOB_QUICK_INITIATE);
-            set_status("Requesting a Quick Connect code...");
-            break;
-        }
-        break;
-    case SCREEN_QUICK:
-        go_back();
-        break;
-    case SCREEN_HOME: {
-        const item_row *row = &rows[row_focus];
-        const size_t index = col_focus[row_focus];
-        if (index >= row->count)
-            return;
-        const card chosen = row->cards[index];
-        push();
-        if (row_focus == ROW_LIBRARIES)
-            open_grid(&chosen);
-        else
-            open_details(&chosen);
-        break;
-    }
-    case SCREEN_GRID: {
-        const card *chosen = grid_card(grid_selected);
-        if (chosen != NULL) {
-            const card copy = *chosen;
-            push();
-            open_details(&copy);
-        }
-        break;
-    }
-    case SCREEN_DETAILS:
-        activate_details();
-        break;
-    case SCREEN_SEASON:
-        if (episode_selected < episodes_row.count)
-          start_playback(
-              episodes_row.cards[episode_selected].id,
-              episodes_row.cards[episode_selected].episode_title,
-              episodes_row.cards[episode_selected].series_id,
-              episodes_row.cards[episode_selected].playback_position_ticks);
-        break;
-    case SCREEN_PLAYBACK:
-        activate_playback();
-        break;
-    case SCREEN_SETTINGS:
-      if (focus == 0) {
-        animations_enabled = !animations_enabled;
-        save_preferences();
-        if (!animations_enabled) {
-          animated_float_snap(&sidebar_slide, sidebar_open ? 1.0f : 0.0f);
-          animated_float_snap(&home_scroll_motion, home_scroll);
-          animated_float_snap(&grid_scroll_motion, grid_scroll);
-          animated_float_snap(&episode_scroll_motion, episode_scroll);
-          animated_float_snap(&sidebar_scroll_motion, sidebar_scroll);
-          for (size_t index = 0; index < ROW_COUNT; index++)
-            animated_float_snap(&row_offset_motion[index], 0);
-          focus_cursor.known = false;
-        }
-      } else if (focus == 1) {
-        sign_out();
-      } else {
-        screen = SCREEN_LICENSES;
-        focus = 0;
-        licenses_reveal = true;
-      }
-        break;
-    case SCREEN_LICENSES:
-      open_license(min_size(focus, JF_LICENSE_COUNT - 1));
-      break;
-    case SCREEN_LICENSE:
-      break;
-    }
-}
-
-/* How many focusable things the current screen has, so navigation clamps without every
- * caller knowing the layout. */
-static size_t focus_count(void)
-{
-    switch (screen) {
-    case SCREEN_SERVER: return discovered_count + 3;
-    case SCREEN_AUTH: return 4;
-    case SCREEN_QUICK: return 1;
-    case SCREEN_PLAYBACK: return PLAYBACK_BUTTON_COUNT;
-    case SCREEN_SETTINGS:
-      return 3;
-    case SCREEN_LICENSES:
-      return JF_LICENSE_COUNT;
-    case SCREEN_LICENSE:
-      return 1;
-    case SCREEN_DETAILS:
-        return card_is(&detail, "Series") ? (seasons_row.count > 0 ? seasons_row.count : 1) : 1;
-    default: return 1;
-    }
+static void toggle_animations(void) {
+  animations_enabled = !animations_enabled;
+  save_preferences();
+  if (!animations_enabled) {
+    animated_float_snap(&sidebar_slide, sidebar_open ? 1.0f : 0.0f);
+  }
 }
 
 typedef enum { DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT } direction;
 
-static size_t grid_rows_count(void)
-{
-    return (grid_total + grid_columns - 1) / grid_columns;
-}
-
-static size_t grid_move(size_t selected, size_t total, size_t columns, direction where)
-{
-    if (total == 0)
-        return selected;
-    switch (where) {
-    case DIR_LEFT: return dec(selected);
-    case DIR_RIGHT: return min_size(selected + 1, total - 1);
-    case DIR_UP: return selected >= columns ? selected - columns : selected;
-    case DIR_DOWN: return selected + columns < total ? selected + columns : selected;
-    }
-    return selected;
-}
-
-static void move_grid(direction where)
-{
-    const size_t next = grid_move(grid_selected, grid_total, grid_columns, where);
-    if (next == grid_selected)
-        return;
-    grid_selected = next;
-    focus_cursor_move_requested = true;
-    const loom_virtual_list list =
-        loom_virtual_list_init(grid_rect, grid_rows_count(), grid_row_height, grid_scroll);
-    grid_scroll =
-        loom_virtual_list_reveal(&list, grid_selected / grid_columns, 0);
-    request_page((uint32_t)grid_selected);
-}
-
-static void move_home(direction where)
-{
-  const size_t old_row = row_focus;
-  const size_t old_column = col_focus[row_focus];
-  home_reveal = true;
-  switch (where) {
-  case DIR_UP:
-    row_focus = dec(row_focus);
-    break;
-  case DIR_DOWN:
-    row_focus = min_size(row_focus + 1, ROW_COUNT - 1);
-    break;
-  case DIR_LEFT:
-    col_focus[row_focus] = dec(col_focus[row_focus]);
-    break;
-  case DIR_RIGHT:
-    col_focus[row_focus] =
-        min_size(col_focus[row_focus] + 1, dec(rows[row_focus].count));
-    break;
-  }
-    col_focus[row_focus] = min_size(col_focus[row_focus], dec(rows[row_focus].count));
-    if (row_focus != old_row || col_focus[row_focus] != old_column)
-      focus_cursor_move_requested = true;
-}
-
+/* Moves the focus; where there is nothing to move to, what that means on this
+ * screen. */
 static void move(direction where, bool repeat) {
-  if (sidebar_open) {
-    if (where == DIR_UP) {
-      const size_t next = dec(sidebar_focus);
-      if (next != sidebar_focus) {
-        sidebar_focus = next;
-        sidebar_reveal = true;
-        focus_cursor_move_requested = true;
-      }
-    } else if (where == DIR_DOWN) {
-      const size_t next = min_size(sidebar_focus + 1, categories_row.count);
-      if (next != sidebar_focus) {
-        sidebar_focus = next;
-        sidebar_reveal = true;
-        focus_cursor_move_requested = true;
-      }
-    } else if (where == DIR_RIGHT) {
-      close_sidebar();
-    }
+  /* direction and nav_dir list the same four in the same order. */
+  if (nav_move(&ui, (nav_dir)where))
     return;
-  }
-  if (where == DIR_LEFT) {
-    bool at_left =
-        screen == SCREEN_SERVER || (screen == SCREEN_AUTH && focus != 3) ||
-        screen == SCREEN_QUICK || (screen == SCREEN_DETAILS && focus == 0) ||
-        screen == SCREEN_SETTINGS ||
-        (screen == SCREEN_HOME && col_focus[row_focus] == 0) ||
-        (screen == SCREEN_GRID && grid_columns != 0 &&
-         grid_selected % grid_columns == 0) ||
-        screen == SCREEN_SEASON || (screen == SCREEN_PLAYBACK && focus == 0);
-    /* A held Left walks on through the grid's rows instead of opening the
-     * sidebar. */
-    if (at_left && !repeat) {
-      open_sidebar();
-      return;
-    }
-  }
-  switch (screen) {
-  case SCREEN_HOME:
-    move_home(where);
-    break;
-  case SCREEN_AUTH:
-    if (where == DIR_UP)
-      focus = dec(focus);
-    else if (where == DIR_DOWN)
-      focus = min_size(focus + 1, focus_count() - 1);
-    else if (where == DIR_LEFT && focus == 3)
-      focus = 2;
-    else if (where == DIR_RIGHT && focus == 2)
-      focus = 3;
-    break;
-  case SCREEN_GRID:
-    move_grid(where);
-    break;
-  case SCREEN_LICENSES:
-    if (where == DIR_UP)
-      focus = dec(focus);
-    else if (where == DIR_DOWN)
-      focus = min_size(focus + 1, focus_count() - 1);
-    licenses_reveal = true;
-    break;
-  case SCREEN_LICENSE:
-    if (where == DIR_UP)
-      license_scroll = maxf(0, license_scroll - license_line_height);
-    else if (where == DIR_DOWN)
-      license_scroll += license_line_height;
-    break;
-  case SCREEN_SEASON:
-    if (where == DIR_UP) {
-      const size_t next = dec(episode_selected);
-      focus_cursor_move_requested |= next != episode_selected;
-      episode_selected = next;
-    } else if (where == DIR_DOWN) {
-      const size_t next =
-          min_size(episode_selected + 1, dec(episodes_row.count));
-      focus_cursor_move_requested |= next != episode_selected;
-      episode_selected = next;
-    }
-    episode_reveal = true;
-    break;
-  /* The details screen's seasons and the playback transport read as a row;
-   * every other screen is a single column of controls. */
-  case SCREEN_DETAILS:
-  case SCREEN_PLAYBACK:
-    if (where == DIR_LEFT) {
-      const size_t next = dec(focus);
-      focus_cursor_move_requested |= screen == SCREEN_DETAILS && next != focus;
-      focus = next;
-    } else if (where == DIR_RIGHT) {
-      const size_t next = min_size(focus + 1, focus_count() - 1);
-      focus_cursor_move_requested |= screen == SCREEN_DETAILS && next != focus;
-      focus = next;
-    }
-    break;
-  default:
-    if (where == DIR_UP)
-      focus = dec(focus);
-    else if (where == DIR_DOWN)
-      focus = min_size(focus + 1, focus_count() - 1);
-    break;
-  }
+  if (where == DIR_UP || where == DIR_DOWN)
+    nav_step(&ui, where == DIR_DOWN ? 1 : -1);
+  else if (sidebar_open)
+    close_sidebar();
+  /* A held Left stops at the edge rather than opening the sidebar. */
+  else if (where == DIR_LEFT && !repeat && screen != SCREEN_LICENSES &&
+           screen != SCREEN_LICENSE)
+    open_sidebar();
 }
 
 static void navigate(uint32_t code, bool repeat) {
@@ -2476,10 +2110,7 @@ static void navigate(uint32_t code, bool repeat) {
   case 28:
   case 96:
   case 352:
-    if (sidebar_open)
-      activate_sidebar();
-    else
-      activate();
+    nav_activate(&ui);
     break;
   default:
     break;
@@ -2536,12 +2167,9 @@ static void on_key(uint32_t code, bool pressed, bool repeat) {
 
 static void move_cursor(jf_fixed x, jf_fixed y)
 {
-    cursor_x = (float)jf_fixed_to_int(x);
-    cursor_y = (float)jf_fixed_to_int(y);
-    cursor_present = true;
-    pointer_moved = true;
-    if (screen == SCREEN_PLAYBACK)
-      show_playback_chrome();
+  nav_pointer(&ui, (float)jf_fixed_to_int(x), (float)jf_fixed_to_int(y));
+  if (screen == SCREEN_PLAYBACK)
+    show_playback_chrome();
 }
 
 static void on_event(const jf_event *event)
@@ -2566,47 +2194,17 @@ static void on_event(const jf_event *event)
         move_cursor(event->pointer.x, event->pointer.y);
         break;
     case JF_EVENT_POINTER_LEAVE:
-        cursor_present = false;
-        cursor_x = -1;
-        break;
+      nav_pointer_leave(&ui);
+      break;
     case JF_EVENT_POINTER_BUTTON:
         if (event->button.pressed && event->button.button == 0x110)
-            pointer_press = true;
+          nav_click(&ui);
         break;
     case JF_EVENT_POINTER_AXIS: {
         if (event->axis.axis != 0)
             break;
         const float delta = (float)event->axis.value / 256.0f * 5.0f;
-        if (sidebar_open) {
-            sidebar_scroll += delta;
-            break;
-        }
-        switch (screen) {
-        case SCREEN_HOME:
-            home_scroll += delta;
-            home_reveal = false;
-            break;
-        case SCREEN_GRID:
-            grid_scroll += delta;
-            break;
-        case SCREEN_SEASON:
-            episode_scroll += delta;
-            episode_reveal = false;
-            break;
-        case SCREEN_DETAILS:
-            if (card_is(&detail, "Series") && delta != 0)
-                focus = delta > 0 ? min_size(focus + 1, dec(seasons_row.count)) : dec(focus);
-            break;
-        case SCREEN_LICENSES:
-          licenses_scroll += delta;
-          licenses_reveal = false;
-          break;
-        case SCREEN_LICENSE:
-          license_scroll = maxf(0, license_scroll + delta);
-          break;
-        default:
-            break;
-        }
+        nav_wheel(&ui, delta);
         break;
     }
     case JF_EVENT_CLOSE:
@@ -2618,52 +2216,7 @@ static void on_event(const jf_event *event)
     }
 }
 
-static bool hovered(loom_rect rect)
-{
-    return cursor_present && loom_contains(rect, cursor_x, cursor_y);
-}
-
 /* ------------------------------------------------------------------- views */
-
-static void draw_navigation_cursor(loom_context *ctx, loom_rect target,
-                                   const loom_rect *clip, float radius,
-                                   float scale, unsigned owner) {
-  if (!focus_cursor.known || focus_cursor.owner != owner) {
-    animated_float_snap(&focus_cursor.x, 0);
-    animated_float_snap(&focus_cursor.y, 0);
-    animated_float_snap(&focus_cursor.w, 0);
-    animated_float_snap(&focus_cursor.h, 0);
-    focus_cursor.rendered = target;
-    focus_cursor.owner = owner;
-    focus_cursor.known = true;
-    focus_cursor_move_requested = false;
-  } else if (focus_cursor_move_requested) {
-    /* The list's target can move while this is settling. Animate a delta from
-     * the last visible cursor to that live target so list scrolling carries the
-     * cursor with it. */
-    animated_float_snap(&focus_cursor.x, focus_cursor.rendered.x - target.x);
-    animated_float_snap(&focus_cursor.y, focus_cursor.rendered.y - target.y);
-    animated_float_snap(&focus_cursor.w, focus_cursor.rendered.w - target.w);
-    animated_float_snap(&focus_cursor.h, focus_cursor.rendered.h - target.h);
-    animated_float_set(&focus_cursor.x, 0, NAVIGATION_ANIMATION_NS);
-    animated_float_set(&focus_cursor.y, 0, NAVIGATION_ANIMATION_NS);
-    animated_float_set(&focus_cursor.w, 0, NAVIGATION_ANIMATION_NS);
-    animated_float_set(&focus_cursor.h, 0, NAVIGATION_ANIMATION_NS);
-    focus_cursor_move_requested = false;
-  } else if (!animated_float_running(&focus_cursor.x) &&
-             !animated_float_running(&focus_cursor.y)) {
-    animated_float_snap(&focus_cursor.x, 0);
-    animated_float_snap(&focus_cursor.y, 0);
-    animated_float_snap(&focus_cursor.w, 0);
-    animated_float_snap(&focus_cursor.h, 0);
-  }
-  const loom_rect cursor = {
-      target.x + focus_cursor.x.value, target.y + focus_cursor.y.value,
-      target.w + focus_cursor.w.value, target.h + focus_cursor.h.value};
-  focus_cursor.rendered = cursor;
-  loom_stroke(ctx, loom_inset(cursor, -4 * scale), clip, ACCENT, 4 * scale,
-              radius);
-}
 
 static void draw_heading_and_status(loom_context *ctx, float width, float height, float scale)
 {
@@ -2677,67 +2230,69 @@ static void draw_heading_and_status(loom_context *ctx, float width, float height
                    NULL, status_text, status_error ? RED : DIM, 19 * scale);
 }
 
-static void draw_button(loom_context *ctx, loom_rect rect, const char *label, size_t index,
-                        float scale)
-{
-    const bool hot = hovered(rect);
-    loom_fill(ctx, rect, NULL, hot ? HOT : CARD, 12 * scale);
-    loom_stroke(ctx, rect, NULL, focus == index ? ACCENT : BORDER,
-                focus == index ? 4 * scale : 2 * scale, 12 * scale);
-    loom_label(ctx,
-               (loom_rect){rect.x + 24 * scale, rect.y + (rect.h - 30 * scale) / 2,
-                           rect.w - 48 * scale, 38 * scale},
-               &rect, label, TEXT, 25 * scale);
-    if (hot && pointer_press) {
-        focus = index;
-        activate();
-    }
+/* Controls declare themselves to nav and draw; the flags they return say what
+ * happened to them this frame. */
+static unsigned draw_button(loom_context *ctx, loom_rect rect,
+                            const char *label, nav_id id, float scale) {
+  const unsigned flags = nav_item(&ui, id, rect, ctx->viewport);
+  const bool focused = flags & NAV_FOCUSED;
+  loom_fill(ctx, rect, NULL, flags & NAV_HOVERED ? HOT : CARD, 12 * scale);
+  loom_stroke(ctx, rect, NULL, focused ? ACCENT : BORDER,
+              focused ? 4 * scale : 2 * scale, 12 * scale);
+  loom_label(ctx,
+             (loom_rect){rect.x + 24 * scale,
+                         rect.y + (rect.h - 30 * scale) / 2,
+                         rect.w - 48 * scale, 38 * scale},
+             &rect, label, TEXT, 25 * scale);
+  return flags;
 }
 
-static void draw_action_button(loom_context *ctx, loom_rect rect, const char *label, size_t index,
-                               float scale)
-{
-    const bool hot = hovered(rect);
-    loom_fill(ctx, rect, NULL, hot ? SELECTED : ACCENT, 12 * scale);
-    loom_stroke(ctx, rect, NULL, focus == index ? WHITE : ACCENT,
-                focus == index ? 4 * scale : 2 * scale, 12 * scale);
-    loom_label(ctx,
-               (loom_rect){rect.x + 24 * scale, rect.y + (rect.h - 30 * scale) / 2,
-                           rect.w - 48 * scale, 38 * scale},
-               &rect, label, WHITE, 25 * scale);
-    if (hot && pointer_press) {
-        focus = index;
-        activate();
-    }
+static unsigned draw_action_button(loom_context *ctx, loom_rect rect,
+                                   const char *label, nav_id id, float scale) {
+  const unsigned flags = nav_item(&ui, id, rect, ctx->viewport);
+  const bool focused = flags & NAV_FOCUSED;
+  loom_fill(ctx, rect, NULL, flags & NAV_HOVERED ? SELECTED : ACCENT,
+            12 * scale);
+  loom_stroke(ctx, rect, NULL, focused ? WHITE : ACCENT,
+              focused ? 4 * scale : 2 * scale, 12 * scale);
+  loom_label(ctx,
+             (loom_rect){rect.x + 24 * scale,
+                         rect.y + (rect.h - 30 * scale) / 2,
+                         rect.w - 48 * scale, 38 * scale},
+             &rect, label, WHITE, 25 * scale);
+  return flags;
 }
 
-static void draw_field(loom_context *ctx, loom_rect rect, const char *label, edit_field which,
-                       size_t index, float scale)
-{
-    const bool hot = hovered(rect);
-    const bool editing = active_field == which;
-    const bool lit = focus == index || editing;
-    loom_fill(ctx, rect, NULL, editing ? SELECTED : hot ? HOT : CARD, 10 * scale);
-    loom_stroke(ctx, rect, NULL, lit ? ACCENT : BORDER, lit ? 4 * scale : 2 * scale, 10 * scale);
+/* Activating a field starts editing it. */
+static void draw_field(loom_context *ctx, loom_rect rect, const char *label,
+                       edit_field which, nav_id id, float scale) {
+  const unsigned flags = nav_item(&ui, id, rect, ctx->viewport);
+  const bool editing = active_field == which;
+  const bool lit = (flags & NAV_FOCUSED) || editing;
+  loom_fill(ctx, rect, NULL,
+            editing               ? SELECTED
+            : flags & NAV_HOVERED ? HOT
+                                  : CARD,
+            10 * scale);
+  loom_stroke(ctx, rect, NULL, lit ? ACCENT : BORDER,
+              lit ? 4 * scale : 2 * scale, 10 * scale);
 
-    size_t capacity = 0;
-    const char *target = field_buffer(which, &capacity);
-    const char *contents = target;
-    if (which == EDIT_PASSWORD) {
-        const size_t length = min_size(strlen(password), sizeof(password_mask) - 1);
-        memset(password_mask, '*', length);
-        password_mask[length] = '\0';
-        contents = password_mask;
-    }
-    const bool empty = contents == NULL || contents[0] == '\0';
-    loom_label(ctx,
-               (loom_rect){rect.x + 22 * scale, rect.y + 17 * scale, rect.w - 44 * scale,
-                           38 * scale},
-               &rect, empty ? label : contents, empty ? DIM : TEXT, 24 * scale);
-    if (hot && pointer_press) {
-        focus = index;
-        begin_edit(which, rect);
-    }
+  size_t capacity = 0;
+  const char *target = field_buffer(which, &capacity);
+  const char *contents = target;
+  if (which == EDIT_PASSWORD) {
+    const size_t length = min_size(strlen(password), sizeof(password_mask) - 1);
+    memset(password_mask, '*', length);
+    password_mask[length] = '\0';
+    contents = password_mask;
+  }
+  const bool empty = contents == NULL || contents[0] == '\0';
+  loom_label(ctx,
+             (loom_rect){rect.x + 22 * scale, rect.y + 17 * scale,
+                         rect.w - 44 * scale, 38 * scale},
+             &rect, empty ? label : contents, empty ? DIM : TEXT, 24 * scale);
+  if (flags & NAV_ACTIVATED)
+    begin_edit(which, rect);
 }
 
 /* Trim `text` to `width`, adding an ellipsis. Measured against the real glyph advances,
@@ -2824,44 +2379,48 @@ static void draw_watch_badge(loom_context *ctx, loom_rect art, loom_rect clip, c
 
 /* One poster card. Returns true when a pointer click landed on it, so the caller decides
  * what a click means: a card opens a grid on one screen and details on another. */
-static bool draw_card(loom_context *ctx, loom_rect rect, loom_rect clip, const card *source,
-                      bool focused, float scale)
-{
-    const loom_rect visible = loom_intersect(rect, clip);
-    if (visible.w <= 0 || visible.h <= 0)
-        return false;
-    const bool hot = hovered(rect) && loom_contains(clip, cursor_x, cursor_y);
-    const loom_rect art = {rect.x, rect.y, rect.w, rect.h - 78 * scale};
+/* `flags` are the card's from nav_item. */
+static void draw_card(loom_context *ctx, loom_rect rect, loom_rect clip,
+                      const card *source, unsigned flags, float scale) {
+  const loom_rect visible = loom_intersect(rect, clip);
+  if (visible.w <= 0 || visible.h <= 0)
+    return;
+  const bool hot = flags & NAV_HOVERED;
+  const bool focused = flags & NAV_FOCUSED;
+  const loom_rect art = {rect.x, rect.y, rect.w, rect.h - 78 * scale};
 
-    const poster_slot *slot = card_poster(source);
-    if (slot != NULL) {
-        float uv[4];
-        cover_uv(slot, art, uv);
-        loom_textured(ctx, art, &clip, slot->texture, uv, WHITE, 10 * scale);
-    } else if (!draw_blur(ctx, art, clip, poster_card(source), 10 * scale)) {
-      loom_fill(ctx, art, &clip, hot ? HOT : CARD, 10 * scale);
-      if (artwork_loading(source->poster_id, source->poster_tag,
-                          JF_IMAGE_PRIMARY, POSTER_W, POSTER_H))
-        draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale,
-                     &clip, scale);
-    }
-    draw_watch_badge(ctx, art, clip, source, scale);
+  const poster_slot *slot = card_poster(source);
+  if (slot != NULL) {
+    float uv[4];
+    cover_uv(slot, art, uv);
+    loom_textured(ctx, art, &clip, slot->texture, uv, WHITE, 10 * scale);
+  } else if (!draw_blur(ctx, art, clip, poster_card(source), 10 * scale)) {
+    loom_fill(ctx, art, &clip, hot ? HOT : CARD, 10 * scale);
+    if (artwork_loading(source->poster_id, source->poster_tag, JF_IMAGE_PRIMARY,
+                        POSTER_W, POSTER_H))
+      draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale, &clip,
+                   scale);
+  }
+  draw_watch_badge(ctx, art, clip, source, scale);
 
-    if (source->progress > 1) {
-        const loom_rect bar = {art.x + 5 * scale, art.y + art.h - 10 * scale,
-                               art.w - 10 * scale, 6 * scale};
-        loom_fill(ctx, bar, &clip, BORDER, 3 * scale);
-        loom_fill(ctx,
-                  (loom_rect){bar.x, bar.y, bar.w * minf(source->progress, 100) / 100, bar.h},
-                  &clip, ACCENT, 3 * scale);
-    }
-    const loom_rect text_clip = loom_intersect(rect, clip);
-    loom_label(ctx, (loom_rect){rect.x, art.y + art.h + 12 * scale, rect.w, 32 * scale},
-               &text_clip, ellipsize(source->title, rect.w, 21 * scale), focused ? TEXT : DIM,
-               21 * scale);
-    loom_label(ctx, (loom_rect){rect.x, art.y + art.h + 44 * scale, rect.w, 28 * scale},
-               &text_clip, ellipsize(source->subtitle, rect.w, 17 * scale), DIM, 17 * scale);
-    return hot && pointer_press;
+  if (source->progress > 1) {
+    const loom_rect bar = {art.x + 5 * scale, art.y + art.h - 10 * scale,
+                           art.w - 10 * scale, 6 * scale};
+    loom_fill(ctx, bar, &clip, BORDER, 3 * scale);
+    loom_fill(ctx,
+              (loom_rect){bar.x, bar.y,
+                          bar.w * minf(source->progress, 100) / 100, bar.h},
+              &clip, ACCENT, 3 * scale);
+  }
+  const loom_rect text_clip = loom_intersect(rect, clip);
+  loom_label(
+      ctx, (loom_rect){rect.x, art.y + art.h + 12 * scale, rect.w, 32 * scale},
+      &text_clip, ellipsize(source->title, rect.w, 21 * scale),
+      focused ? TEXT : DIM, 21 * scale);
+  loom_label(
+      ctx, (loom_rect){rect.x, art.y + art.h + 44 * scale, rect.w, 28 * scale},
+      &text_clip, ellipsize(source->subtitle, rect.w, 17 * scale), DIM,
+      17 * scale);
 }
 
 static void draw_metadata(loom_context *ctx, loom_rect rect, const loom_rect *clip,
@@ -2936,18 +2495,27 @@ static void draw_server(loom_context *ctx, float width, float scale)
     loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
     const float x = panel.x + 54 * scale;
     const float w = panel.w - 108 * scale;
-    url_rect = (loom_rect){x, panel.y + 48 * scale, w, 70 * scale};
-    draw_field(ctx, url_rect, "Server URL", EDIT_URL, 0, scale);
-    draw_action_button(ctx, (loom_rect){x, panel.y + 142 * scale, w, 70 * scale}, "Connect",
-                       1, scale);
+    draw_field(ctx, (loom_rect){x, panel.y + 48 * scale, w, 70 * scale},
+               "Server URL", EDIT_URL, nav_str("server.url"), scale);
+    if (draw_action_button(ctx,
+                           (loom_rect){x, panel.y + 142 * scale, w, 70 * scale},
+                           "Connect", nav_str("server.connect"), scale) &
+        NAV_ACTIVATED)
+      connect_server();
 
     float y = panel.y + 236 * scale;
+    size_t chosen = discovered_count;
     for (size_t index = 0; index < discovered_count; index++) {
         const loom_rect rect = {x, y, w, 70 * scale};
-        const bool hot = hovered(rect);
-        loom_fill(ctx, rect, &panel, hot ? HOT : CARD, 13 * scale);
-        loom_stroke(ctx, rect, &panel, focus == index + 2 ? ACCENT : BORDER,
-                    focus == index + 2 ? 4 * scale : 2 * scale, 13 * scale);
+        const unsigned flags =
+            nav_item(&ui, nav_str(discovered[index].address), rect, panel);
+        const bool focused = flags & NAV_FOCUSED;
+        if (flags & NAV_ACTIVATED)
+          chosen = index;
+        loom_fill(ctx, rect, &panel, flags & NAV_HOVERED ? HOT : CARD,
+                  13 * scale);
+        loom_stroke(ctx, rect, &panel, focused ? ACCENT : BORDER,
+                    focused ? 4 * scale : 2 * scale, 13 * scale);
         loom_fill(ctx,
                   (loom_rect){rect.x + 18 * scale, rect.y + 14 * scale, 40 * scale, 40 * scale},
                   &rect, ACCENT, 22 * scale);
@@ -2956,17 +2524,17 @@ static void draw_server(loom_context *ctx, float width, float scale)
                                30 * scale},
                    &rect, discovered[index].name, TEXT, 26 * scale);
         loom_label(ctx,
-                   (loom_rect){rect.x + 78 * scale, rect.y + 38 * scale, w - 96 * scale,
-                               24 * scale},
+                   (loom_rect){rect.x + 78 * scale, rect.y + 38 * scale,
+                               w - 96 * scale, 24 * scale},
                    &rect, discovered[index].address, DIM, 20 * scale);
-        if (hot && pointer_press) {
-            focus = index + 2;
-            activate();
-        }
         y += 80 * scale;
     }
-    draw_button(ctx, (loom_rect){x, y + 8 * scale, w, 62 * scale}, "Search again",
-                discovered_count + 2, scale);
+    if (draw_button(ctx, (loom_rect){x, y + 8 * scale, w, 62 * scale},
+                    "Search again", nav_str("server.search"), scale) &
+        NAV_ACTIVATED)
+      restart_discovery();
+    else if (chosen < discovered_count)
+      use_server(discovered[chosen].address, discovered[chosen].name);
     if (discovering || connecting)
         draw_spinner(ctx, panel.x + panel.w - 46 * scale, panel.y + panel.h - 46 * scale,
                      18 * scale, &panel, scale);
@@ -2994,16 +2562,23 @@ static void draw_auth(loom_context *ctx, float width, float scale)
                TEXT, 34 * scale);
     loom_label(ctx, (loom_rect){x, panel.y + 92 * scale, w, 32 * scale}, &panel, session.url,
                DIM, 20 * scale);
-    username_rect = (loom_rect){x, panel.y + 180 * scale, w, 70 * scale};
-    password_rect = (loom_rect){x, panel.y + 320 * scale, w, 70 * scale};
-    draw_field(ctx, username_rect, "Username", EDIT_USERNAME, 0, scale);
-    draw_field(ctx, password_rect, "Password", EDIT_PASSWORD, 1, scale);
-    draw_action_button(ctx, (loom_rect){x, panel.y + 450 * scale, 280 * scale, 72 * scale},
-                       "Sign in", 2, scale);
-    draw_action_button(ctx,
-                       (loom_rect){x + 310 * scale, panel.y + 450 * scale, 330 * scale,
-                                   72 * scale},
-                       "Quick Connect", 3, scale);
+    draw_field(ctx, (loom_rect){x, panel.y + 180 * scale, w, 70 * scale},
+               "Username", EDIT_USERNAME, nav_str("auth.username"), scale);
+    draw_field(ctx, (loom_rect){x, panel.y + 320 * scale, w, 70 * scale},
+               "Password", EDIT_PASSWORD, nav_str("auth.password"), scale);
+    if (draw_action_button(
+            ctx, (loom_rect){x, panel.y + 450 * scale, 280 * scale, 72 * scale},
+            "Sign in", nav_str("auth.sign_in"), scale) &
+        NAV_ACTIVATED)
+      sign_in();
+    if (draw_action_button(ctx,
+                           (loom_rect){x + 310 * scale, panel.y + 450 * scale,
+                                       330 * scale, 72 * scale},
+                           "Quick Connect", nav_str("auth.quick"), scale) &
+        NAV_ACTIVATED) {
+      simple(JF_JOB_QUICK_INITIATE);
+      set_status("Requesting a Quick Connect code...");
+    }
 }
 
 static void draw_quick(loom_context *ctx, float width, float scale)
@@ -3031,85 +2606,77 @@ static void draw_quick(loom_context *ctx, float width, float scale)
                (loom_rect){panel.x + 70 * scale, panel.y + 340 * scale, panel.w - 140 * scale,
                            34 * scale},
                &panel, "Approval is polled every two seconds.", DIM, 20 * scale);
-    draw_button(ctx, (loom_rect){panel.x + 150 * scale, panel.y + 440 * scale, 260 * scale,
-                                 72 * scale},
-                "Cancel", 0, scale);
+    if (draw_button(ctx,
+                    (loom_rect){panel.x + 150 * scale, panel.y + 440 * scale,
+                                260 * scale, 72 * scale},
+                    "Cancel", nav_str("quick.cancel"), scale) &
+        NAV_ACTIVATED)
+      go_back();
 }
 
 /* A horizontal row of poster cards. Only the focused row scrolls; a TV row holds few
  * enough items that the whole row is one strip with an offset. */
-static void draw_row(loom_context *ctx, const item_row *row, size_t id, float top, float width,
-                     loom_rect clip, float scale)
-{
-    const float margin = 64 * scale;
-    const float card_w = (row->wide ? 356.0f : 200.0f) * scale;
-    const float card_h = (row->wide ? 278.0f : 378.0f) * scale;
-    const float gap = 26 * scale;
-    loom_label(ctx, (loom_rect){margin, top, 600 * scale, 36 * scale}, &clip, row->title,
-               row_focus == id ? TEXT : DIM, 25 * scale);
-    const loom_rect strip = {margin, top + 46 * scale, width - margin * 2, card_h};
+/* Returns the card activated in this row, if any. */
+static const card *draw_row(loom_context *ctx, const item_row *row, size_t id,
+                            float top, float width, loom_rect clip,
+                            float scale) {
+  const float margin = 64 * scale;
+  const float card_w = (row->wide ? 356.0f : 200.0f) * scale;
+  const float card_h = (row->wide ? 278.0f : 378.0f) * scale;
+  const float gap = 26 * scale;
+  const loom_rect strip = {margin, top + 46 * scale, width - margin * 2,
+                           card_h};
+  const loom_rect title = {margin, top, 600 * scale, 36 * scale};
 
-    if (row->count == 0) {
-        if (row->loading)
-            draw_spinner(ctx, strip.x + 30 * scale, strip.y + 30 * scale, 14 * scale, &clip,
-                         scale);
-        else
-            loom_label(ctx, (loom_rect){margin, strip.y + 30 * scale, 700 * scale, 32 * scale},
-                       &clip, "Nothing here", DIM, 20 * scale);
-        return;
-    }
+  if (row->count == 0) {
+    loom_label(ctx, title, &clip, row->title, DIM, 25 * scale);
+    if (row->loading)
+      draw_spinner(ctx, strip.x + 30 * scale, strip.y + 30 * scale, 14 * scale,
+                   &clip, scale);
+    else
+      loom_label(
+          ctx,
+          (loom_rect){margin, strip.y + 30 * scale, 700 * scale, 32 * scale},
+          &clip, "Nothing here", DIM, 20 * scale);
+    return NULL;
+  }
 
-    /* The cursor moves across the fully visible cards first. Only when it reaches the last
-     * full slot does the strip translate: one predecessor then starts beyond the left edge
-     * and exits through the viewport fade. */
-    /* The final fully visible card has no following gap. Counting that otherwise treats
-     * a fitting final slot as overflow and scrolls the carousel one item too early. */
-    size_t visible = (size_t)((strip.w + gap) / (card_w + gap));
-    if (visible < 1)
-        visible = 1;
-    const float step = card_w + gap;
-    /* Keep the strip's position cumulative. Advancing the virtual first index
-     * while resetting this to one step made every movement after the first one
-     * jump. */
-    const size_t scroll_steps =
-        col_focus[id] >= visible ? col_focus[id] - visible + 1 : 0;
-    /* The last card stops at the strip's right edge rather than a whole slot
-     * in. */
-    const float end_scroll = maxf(0, (float)row->count * step - gap - strip.w);
-    static uint64_t drawn[ROW_COUNT];
-    animate_list(&row_offset_motion[id], &drawn[id],
-                 minf((float)scroll_steps * step, end_scroll));
-    const float strip_scroll = row_offset_motion[id].value;
-    const size_t first = dec((size_t)(strip_scroll / step));
-    const loom_mask outer = ctx->mask;
-    loom_fade(ctx, LOOM_HORIZONTAL, ctx->viewport.x,
-              ctx->viewport.x + ctx->viewport.w, strip_scroll, end_scroll,
-              86 * scale);
-    loom_rect selected_art = {0};
-    bool selected_drawn = false;
-    for (size_t index = first; index < row->count; index++) {
-      const float x = strip.x - strip_scroll + (float)index * step;
-      if (x >= width)
-        break;
-      const loom_rect rect = {x, strip.y, card_w, card_h};
-      const bool focused = row_focus == id && col_focus[id] == index;
-      if (draw_card(ctx, rect, clip, &row->cards[index], focused, scale)) {
-        row_focus = id;
-        col_focus[id] = index;
-        activate();
-        ctx->mask = outer;
-        return;
-      }
-        if (focused) {
-          selected_art =
-              (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale};
-          selected_drawn = true;
-        }
+  /* The strip keeps the cards either side of the focused one fully in view,
+   * moving a whole card at a time, so one predecessor starts beyond the left
+   * edge and exits through the viewport fade. The last card stops at the
+   * strip's right edge rather than a whole slot in. */
+  const float step = card_w + gap;
+  const float extent = (float)row->count * step - gap;
+  const float strip_scroll = nav_scroll_begin(
+      &ui, nav_int(id), strip, LOOM_HORIZONTAL, extent, step, step);
+  const size_t first = dec((size_t)(strip_scroll / step));
+  const loom_mask outer = ctx->mask;
+  loom_fade(ctx, LOOM_HORIZONTAL, ctx->viewport.x,
+            ctx->viewport.x + ctx->viewport.w, strip_scroll,
+            maxf(0, extent - strip.w), 86 * scale);
+  const card *chosen = NULL;
+  bool row_focused = false;
+  for (size_t index = first; index < row->count; index++) {
+    const float x = strip.x - strip_scroll + (float)index * step;
+    if (x >= width)
+      break;
+    const loom_rect rect = {x, strip.y, card_w, card_h};
+    const unsigned flags =
+        nav_item(&ui, nav_str(row->cards[index].id), rect, clip);
+    if (flags & NAV_FOCUSED) {
+      row_focused = true;
+      nav_ring(&ui, (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale},
+               12 * scale);
     }
-    if (selected_drawn)
-      draw_navigation_cursor(ctx, selected_art, &clip, 12 * scale, scale,
-                             100 + (unsigned)id);
-    ctx->mask = outer;
+    if (flags & NAV_ACTIVATED)
+      chosen = &row->cards[index];
+    draw_card(ctx, rect, clip, &row->cards[index], flags, scale);
+  }
+  nav_scroll_end(&ui);
+  ctx->mask = outer;
+  loom_label(ctx, title, &clip, row->title, row_focused ? TEXT : DIM,
+             25 * scale);
+  return chosen;
 }
 
 static void draw_home(loom_context *ctx, float width, float height, float scale)
@@ -3118,29 +2685,44 @@ static void draw_home(loom_context *ctx, float width, float height, float scale)
         draw_spinner(ctx, width / 2, height / 2, 26 * scale, NULL, scale);
         return;
     }
-    home_row_height = 470 * scale;
-    home_rect = (loom_rect){0, 0, width, height};
-    loom_virtual_list target = loom_virtual_list_init(
-        home_rect, ROW_COUNT, home_row_height, home_scroll);
+    const float row_height = 470 * scale;
+    const float extent = ROW_COUNT * row_height;
     const float fade_height = 78 * scale;
-    if (home_reveal) {
-      home_scroll = loom_virtual_list_reveal(&target, row_focus, fade_height);
-      home_reveal = false;
-    }
-    target = loom_virtual_list_init(home_rect, ROW_COUNT, home_row_height,
-                                    home_scroll);
-    home_scroll = target.scroll;
-    static uint64_t drawn;
-    animate_list(&home_scroll_motion, &drawn, home_scroll);
-    const loom_virtual_list list = loom_virtual_list_init(
-        home_rect, ROW_COUNT, home_row_height, home_scroll_motion.value);
+    /* A card is revealed with its row's title clear of the fade above it. */
+    const float scroll =
+        nav_scroll_begin(&ui, nav_str("home"), (loom_rect){0, 0, width, height},
+                         LOOM_VERTICAL, extent, fade_height + 46 * scale, 0);
+    /* Nothing takes focus until every row is in, or the first card declared
+     * would be a library and the focus would start on the bottom row. */
+    const bool inert = ui.inert;
+    nav_set_inert(&ui, inert || rows[ROW_RESUME].loading ||
+                           rows[ROW_NEXT_UP].loading);
     const loom_mask outer = ctx->mask;
-    loom_fade(ctx, LOOM_VERTICAL, 0, height, list.scroll,
-              loom_virtual_list_max_scroll(&list), fade_height);
-    for (size_t id = 0; id < ROW_COUNT; id++)
-        draw_row(ctx, &rows[id], id, loom_virtual_list_item(&list, id).y, width, ctx->viewport,
-                 scale);
+    loom_fade(ctx, LOOM_VERTICAL, 0, height, scroll, maxf(0, extent - height),
+              fade_height);
+    const card *chosen = NULL;
+    size_t chosen_row = 0;
+    for (size_t id = 0; id < ROW_COUNT; id++) {
+      const card *activated =
+          draw_row(ctx, &rows[id], id, (float)id * row_height - scroll, width,
+                   ctx->viewport, scale);
+      if (activated != NULL) {
+        chosen = activated;
+        chosen_row = id;
+      }
+    }
     ctx->mask = outer;
+    nav_set_inert(&ui, inert);
+    nav_scroll_end(&ui);
+    if (chosen != NULL) {
+      const card copy = *chosen;
+      push();
+      forget_scroll(copy.id);
+      if (chosen_row == ROW_LIBRARIES)
+        open_grid(&copy);
+      else
+        open_details(&copy);
+    }
 }
 
 static void draw_grid(loom_context *ctx, float width, float height, float scale)
@@ -3148,11 +2730,12 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     const float margin = 64 * scale;
     const float card_w = 200 * scale;
     const float gap = 26 * scale;
-    grid_rect = (loom_rect){margin, 120 * scale, width - margin * 2, height - 190 * scale};
-    grid_columns = (size_t)((grid_rect.w + gap) / (card_w + gap));
-    if (grid_columns < 1)
-        grid_columns = 1;
-    grid_row_height = 404 * scale;
+    const loom_rect grid_rect = {margin, 120 * scale, width - margin * 2,
+                                 height - 190 * scale};
+    size_t columns = (size_t)((grid_rect.w + gap) / (card_w + gap));
+    if (columns < 1)
+      columns = 1;
+    const float row_height = 404 * scale;
 
     if (grid_total == 0) {
         loom_label(ctx, (loom_rect){margin, 40 * scale, width - margin * 2, 50 * scale}, NULL,
@@ -3165,70 +2748,71 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
         return;
     }
 
-    const size_t row_count = grid_rows_count();
-    const loom_virtual_list target = loom_virtual_list_init(
-        grid_rect, row_count, grid_row_height, grid_scroll);
-    grid_scroll = target.scroll;
-    static uint64_t drawn;
-    animate_list(&grid_scroll_motion, &drawn, grid_scroll);
-    const loom_virtual_list list = loom_virtual_list_init(
-        grid_rect, row_count, grid_row_height, grid_scroll_motion.value);
+    const size_t row_count = (grid_total + columns - 1) / columns;
+    const float extent = (float)row_count * row_height;
+    const float max_scroll = maxf(0, extent - grid_rect.h);
+    /* Keyed by the library, so Back into it finds its place. */
+    const float scroll = nav_scroll_begin(&ui, nav_str(grid_parent), grid_rect,
+                                          LOOM_VERTICAL, extent, 0, 0);
+    const loom_virtual_list list =
+        loom_virtual_list_init(grid_rect, row_count, row_height, scroll);
     const loom_mask outer = ctx->mask;
-    loom_fade(ctx, LOOM_VERTICAL, 0, height, list.scroll,
-              loom_virtual_list_max_scroll(&list), 72 * scale);
-    loom_label(ctx, (loom_rect){margin, 40 * scale - grid_scroll, width - margin * 2, 50 * scale},
+    loom_fade(ctx, LOOM_VERTICAL, 0, height, scroll, max_scroll, 72 * scale);
+    loom_label(ctx,
+               (loom_rect){margin, 40 * scale - scroll, width - margin * 2,
+                           50 * scale},
                NULL, grid_title, TEXT, 32 * scale);
     /* Grid padding reserves room for the first and last fully visible rows. It is not a
      * scissor: neighbouring rows extend into that margin and disappear at the viewport fade. */
     const loom_rect content = ctx->viewport;
 
-    /* Selection padding is not a scissor: include the rows that extend into it. */
-    loom_rect selected_art = {0};
-    bool selected_drawn = false;
+    const card *chosen = NULL;
+    /* A row either side of the view, so there is always a row to move into. */
     const size_t first = dec(list.first);
     const size_t last = min_size(list.last + 1, row_count);
     for (size_t row_index = first; row_index < last; row_index++) {
         const loom_rect row_rect = loom_virtual_list_item(&list, row_index);
-        for (size_t column = 0; column < grid_columns; column++) {
-            const size_t index = row_index * grid_columns + column;
-            if (index >= grid_total)
-                break;
-            const loom_rect rect = {row_rect.x + (float)column * (card_w + gap), row_rect.y,
-                                    card_w, grid_row_height - 26 * scale};
-            const card *source = grid_card(index);
-            if (source == NULL)
-                source = &blank_card;
-            if (draw_card(ctx, rect, content, source, index == grid_selected, scale)) {
-                grid_selected = index;
-                activate();
-                ctx->mask = outer;
-                return;
-            }
-            if (index == grid_selected) {
-              selected_art =
-                  (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale};
-              selected_drawn = true;
-            }
+        for (size_t column = 0; column < columns; column++) {
+          const size_t index = row_index * columns + column;
+          if (index >= grid_total)
+            break;
+          const loom_rect rect = {row_rect.x + (float)column * (card_w + gap),
+                                  row_rect.y, card_w, row_height - 26 * scale};
+          const card *source = grid_card(index);
+          const unsigned flags = nav_item(&ui, nav_int(index), rect, content);
+          if (flags & NAV_FOCUSED)
+            nav_ring(&ui,
+                     (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale},
+                     12 * scale);
+          if ((flags & NAV_ACTIVATED) && source != NULL)
+            chosen = source;
+          draw_card(ctx, rect, content, source != NULL ? source : &blank_card,
+                    flags, scale);
         }
-        /* One request per visible row is enough to walk the window forward while scrolling
-         * with the pointer, which never calls move_grid. */
-        request_page((uint32_t)min_size(row_index * grid_columns, dec(grid_total)));
+        /* One request per visible row is enough to walk the window forward
+         * while scrolling with the pointer. */
+        request_page((uint32_t)min_size(row_index * columns, dec(grid_total)));
     }
-    if (selected_drawn)
-      draw_navigation_cursor(ctx, selected_art, &content, 12 * scale, scale,
-                             200);
+    nav_scroll_end(&ui);
     ctx->mask = outer;
 
-    const loom_rect track = {grid_rect.x + grid_rect.w, grid_rect.y, 4 * scale, grid_rect.h};
-    const float max_scroll = loom_virtual_list_max_scroll(&list);
+    const loom_rect track = {grid_rect.x + grid_rect.w, grid_rect.y, 4 * scale,
+                             grid_rect.h};
     if (max_scroll > 0) {
-        const float thumb_h =
-            maxf(40 * scale, track.h * grid_rect.h / ((float)row_count * grid_row_height));
-        loom_fill(ctx, track, NULL, BORDER, track.w / 2);
-        loom_fill(ctx,
-                  (loom_rect){track.x, track.y + (track.h - thumb_h) * (grid_scroll / max_scroll),
-                              track.w, thumb_h},
-                  NULL, ACCENT, track.w / 2);
+      const float thumb_h = maxf(40 * scale, track.h * grid_rect.h / extent);
+      loom_fill(ctx, track, NULL, BORDER, track.w / 2);
+      loom_fill(
+          ctx,
+          (loom_rect){track.x,
+                      track.y + (track.h - thumb_h) * (scroll / max_scroll),
+                      track.w, thumb_h},
+          NULL, ACCENT, track.w / 2);
+    }
+    if (chosen != NULL) {
+      const card copy = *chosen;
+      push();
+      forget_scroll(copy.id);
+      open_details(&copy);
     }
 }
 
@@ -3269,36 +2853,56 @@ static void draw_details(loom_context *ctx, float width, float scale)
         }
         loom_label(ctx, (loom_rect){x, 470 * scale, w, 34 * scale}, NULL, "Seasons", TEXT,
                    26 * scale);
-        const loom_rect clip = ctx->viewport;
-        size_t visible = (size_t)((w + 26 * scale) / (226 * scale));
-        if (visible < 1)
-            visible = 1;
-        const size_t first = (focus + 1) > visible ? focus + 1 - visible : 0;
-        loom_rect selected_art = {0};
-        bool selected_drawn = false;
-        for (size_t index = first; index < seasons_row.count; index++) {
-            const loom_rect rect = {x + (float)(index - first) * 226 * scale, 524 * scale,
-                                    200 * scale, 378 * scale};
-            if (rect.x >= width)
-                break;
-            if (draw_card(ctx, rect, clip, &seasons_row.cards[index], focus == index, scale)) {
-                focus = index;
-                activate();
-                break;
-            }
-            if (focus == index) {
-              selected_art =
-                  (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale};
-              selected_drawn = true;
-            }
+        /* A carousel like the home rows, entering on the first season not yet
+         * watched. */
+        const float step = 226 * scale;
+        const float gap = 26 * scale;
+        const float extent = (float)seasons_row.count * step - gap;
+        const loom_rect strip = {x, 524 * scale, w, 378 * scale};
+        const float scroll =
+            nav_scroll_begin(&ui, nav_str(detail.id), strip, LOOM_HORIZONTAL,
+                             extent, step, step);
+        /* The poster ends 60 px left of the strip; a season leaving the strip
+         * fades out in that gap rather than over it. */
+        const loom_rect clip = {x - 60 * scale, 0, width - x + 60 * scale,
+                                ctx->viewport.h};
+        const loom_mask outer = ctx->mask;
+        loom_fade(ctx, LOOM_HORIZONTAL, clip.x, width, scroll,
+                  maxf(0, extent - strip.w), 60 * scale);
+        const size_t unfinished =
+            first_unfinished(seasons_row.cards, seasons_row.count);
+        const card *chosen = NULL;
+        for (size_t index = 0; index < seasons_row.count; index++) {
+          const loom_rect rect = {x - scroll + (float)index * step, strip.y,
+                                  200 * scale, strip.h};
+          if (index == unfinished)
+            nav_default(&ui);
+          const unsigned flags =
+              nav_item(&ui, nav_str(seasons_row.cards[index].id), rect, clip);
+          if (flags & NAV_FOCUSED)
+            nav_ring(&ui,
+                     (loom_rect){rect.x, rect.y, rect.w, rect.h - 78 * scale},
+                     12 * scale);
+          if (flags & NAV_ACTIVATED)
+            chosen = &seasons_row.cards[index];
+          draw_card(ctx, rect, clip, &seasons_row.cards[index], flags, scale);
         }
-        if (selected_drawn)
-          draw_navigation_cursor(ctx, selected_art, &clip, 12 * scale, scale,
-                                 300);
+        nav_scroll_end(&ui);
+        ctx->mask = outer;
+        if (chosen != NULL) {
+          const card copy = *chosen;
+          push();
+          forget_scroll(copy.id);
+          open_season(&copy);
+        }
         return;
     }
 
-    draw_button(ctx, (loom_rect){x, 570 * scale, 250 * scale, 74 * scale}, "Play", 0, scale);
+    if (draw_button(ctx, (loom_rect){x, 570 * scale, 250 * scale, 74 * scale},
+                    "Play", nav_str("details.play"), scale) &
+        NAV_ACTIVATED)
+      start_playback(detail.id, detail.title, detail.series_id,
+                     detail.playback_position_ticks);
 }
 
 static void draw_season(loom_context *ctx, float width, float height, float scale)
@@ -3330,102 +2934,100 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
                  season_detail.overview[0] != '\0' ? season_detail.overview : detail.overview,
                  22 * scale);
 
-    episode_rect = (loom_rect){x, 400 * scale, w, height - 464 * scale};
-    episode_row_height = 170 * scale;
+    const loom_rect list_rect = {x, 400 * scale, w, height - 464 * scale};
+    const float row_height = 170 * scale;
     if (episodes_row.count == 0) {
-        loom_label(ctx, (loom_rect){x, episode_rect.y + 20 * scale, w, 34 * scale},
-                   &episode_rect, episodes_row.loading ? "Loading episodes..." : "No episodes",
-                   DIM, 23 * scale);
-        return;
+      loom_label(ctx, (loom_rect){x, list_rect.y + 20 * scale, w, 34 * scale},
+                 &list_rect,
+                 episodes_row.loading ? "Loading episodes..." : "No episodes",
+                 DIM, 23 * scale);
+      return;
     }
 
     /* Like the home carousels: the selection walks down the fully visible
      * slots, then stays in the last one while the list moves a whole episode at
-     * a time. The slot above it is then the one leaving through the fade. */
-    if (episode_reveal) {
-      size_t visible = (size_t)(episode_rect.h / episode_row_height);
-      if (visible < 1)
-        visible = 1;
-      episode_scroll =
-          episode_selected >= visible
-              ? (float)(episode_selected - visible + 1) * episode_row_height
-              : 0;
-      episode_reveal = false;
-    }
+     * a time. The slot above it is then the one leaving through the fade. It
+     * opens on the first episode not yet watched. */
     const float fade_height = 64 * scale;
-    const loom_virtual_list target = loom_virtual_list_init(
-        episode_rect, episodes_row.count, episode_row_height, episode_scroll);
-    episode_scroll = target.scroll;
-    static uint64_t drawn;
-    animate_list(&episode_scroll_motion, &drawn, episode_scroll);
-    const loom_virtual_list list =
-        loom_virtual_list_init(episode_rect, episodes_row.count,
-                               episode_row_height, episode_scroll_motion.value);
+    const float extent = (float)episodes_row.count * row_height;
+    const float scroll =
+        nav_scroll_begin(&ui, nav_str(season_detail.id), list_rect,
+                         LOOM_VERTICAL, extent, 0, row_height);
+    const loom_virtual_list list = loom_virtual_list_init(
+        list_rect, episodes_row.count, row_height, scroll);
     /* Keep episodes below their heading, but let them reach the screen bottom. */
-    const loom_rect content = {x, episode_rect.y, width - x, height - episode_rect.y};
+    const loom_rect content = {x, list_rect.y, width - x, height - list_rect.y};
     const loom_mask outer = ctx->mask;
-    loom_fade(ctx, LOOM_VERTICAL, content.y, content.y + content.h, list.scroll,
-              loom_virtual_list_max_scroll(&list), fade_height);
-    loom_rect selected_row = {0};
-    bool selected_drawn = false;
-    for (size_t index = list.first; index < list.last; index++) {
-        const loom_rect raw = loom_virtual_list_item(&list, index);
-        const loom_rect row = {raw.x + 10 * scale, raw.y + 6 * scale, raw.w - 20 * scale,
-                               raw.h - 12 * scale};
-        const bool hot = hovered(row) && loom_contains(content, cursor_x, cursor_y);
-        const bool focused = index == episode_selected;
-        const card *source = &episodes_row.cards[index];
-        if (focused || hot) {
-            static const loom_color focused_bg = {20, 42, 60, 210};
-            static const loom_color hot_bg = {30, 40, 55, 180};
-            loom_fill(ctx, row, &content, focused ? focused_bg : hot_bg, 11 * scale);
-        }
-        if (focused) {
-          selected_row = row;
-          selected_drawn = true;
-        }
-        const loom_rect clip = loom_intersect(row, content);
-        const loom_rect thumb = {row.x + 12 * scale, row.y + 12 * scale, 232 * scale,
-                                 130.5f * scale};
-        const poster_slot *still =
-            artwork(source->id, source->thumbnail_tag, JF_IMAGE_PRIMARY, 384, 216);
-        if (still != NULL) {
-            float uv[4];
-            cover_uv(still, thumb, uv);
-            loom_textured(ctx, thumb, &clip, still->texture, uv, WHITE, 7 * scale);
-        } else if (!draw_blur(ctx, thumb, clip, source, 7 * scale)) {
-          loom_fill(ctx, thumb, &clip, CARD, 7 * scale);
-          if (artwork_loading(source->id, source->thumbnail_tag,
-                              JF_IMAGE_PRIMARY, 384, 216))
-            draw_spinner(ctx, thumb.x + thumb.w / 2, thumb.y + thumb.h / 2,
-                         13 * scale, &clip, scale);
-        }
-        draw_watch_badge(ctx, thumb, clip, source, scale);
+    loom_fade(ctx, LOOM_VERTICAL, content.y, content.y + content.h, scroll,
+              maxf(0, extent - list_rect.h), fade_height);
+    const size_t unfinished =
+        first_unfinished(episodes_row.cards, episodes_row.count);
+    const card *chosen = NULL;
+    /* Every episode is declared, drawn or not, so the one to open on can be
+     * anywhere in the season. */
+    for (size_t index = 0; index < episodes_row.count; index++) {
+      const loom_rect raw = loom_virtual_list_item(&list, index);
+      const loom_rect row = {raw.x + 10 * scale, raw.y + 6 * scale,
+                             raw.w - 20 * scale, raw.h - 12 * scale};
+      const card *source = &episodes_row.cards[index];
+      if (index == unfinished)
+        nav_default(&ui);
+      const unsigned flags = nav_item(&ui, nav_str(source->id), row, content);
+      if (flags & NAV_FOCUSED)
+        nav_ring(&ui, row, 11 * scale);
+      if (flags & NAV_ACTIVATED)
+        chosen = source;
+      if (index < list.first || index >= list.last)
+        continue;
+      const bool focused = flags & NAV_FOCUSED;
+      if (focused || (flags & NAV_HOVERED)) {
+        static const loom_color focused_bg = {20, 42, 60, 210};
+        static const loom_color hot_bg = {30, 40, 55, 180};
+        loom_fill(ctx, row, &content, focused ? focused_bg : hot_bg,
+                  11 * scale);
+      }
+      const loom_rect clip = loom_intersect(row, content);
+      const loom_rect thumb = {row.x + 12 * scale, row.y + 12 * scale,
+                               232 * scale, 130.5f * scale};
+      const poster_slot *still = artwork(source->id, source->thumbnail_tag,
+                                         JF_IMAGE_PRIMARY, 384, 216);
+      if (still != NULL) {
+        float uv[4];
+        cover_uv(still, thumb, uv);
+        loom_textured(ctx, thumb, &clip, still->texture, uv, WHITE, 7 * scale);
+      } else if (!draw_blur(ctx, thumb, clip, source, 7 * scale)) {
+        loom_fill(ctx, thumb, &clip, CARD, 7 * scale);
+        if (artwork_loading(source->id, source->thumbnail_tag, JF_IMAGE_PRIMARY,
+                            384, 216))
+          draw_spinner(ctx, thumb.x + thumb.w / 2, thumb.y + thumb.h / 2,
+                       13 * scale, &clip, scale);
+      }
+      draw_watch_badge(ctx, thumb, clip, source, scale);
 
-        const float text_x = thumb.x + thumb.w + 28 * scale;
-        const float text_w = row.x + row.w - text_x - 24 * scale;
-        loom_label(ctx, (loom_rect){text_x, row.y + 34 * scale, text_w, 44 * scale}, &clip,
-                   ellipsize(source->episode_title, text_w, 28 * scale), TEXT, 28 * scale);
-        draw_metadata(ctx, (loom_rect){text_x, row.y + 90 * scale, text_w, 32 * scale}, &clip,
-                      source->runtime, source->rating, 21 * scale, TEXT);
-        if (source->progress > 1) {
-            const loom_rect bar = {thumb.x + 4 * scale, thumb.y + thumb.h - 7 * scale,
-                                   thumb.w - 8 * scale, 5 * scale};
-            loom_fill(ctx,
-                      (loom_rect){bar.x, bar.y, bar.w * minf(source->progress, 100) / 100, bar.h},
-                      &clip, ACCENT, 2 * scale);
-        }
-        if (hot && pointer_press) {
-            episode_selected = index;
-            activate();
-            ctx->mask = outer;
-            return;
-        }
+      const float text_x = thumb.x + thumb.w + 28 * scale;
+      const float text_w = row.x + row.w - text_x - 24 * scale;
+      loom_label(ctx,
+                 (loom_rect){text_x, row.y + 34 * scale, text_w, 44 * scale},
+                 &clip, ellipsize(source->episode_title, text_w, 28 * scale),
+                 TEXT, 28 * scale);
+      draw_metadata(ctx,
+                    (loom_rect){text_x, row.y + 90 * scale, text_w, 32 * scale},
+                    &clip, source->runtime, source->rating, 21 * scale, TEXT);
+      if (source->progress > 1) {
+        const loom_rect bar = {thumb.x + 4 * scale,
+                               thumb.y + thumb.h - 7 * scale,
+                               thumb.w - 8 * scale, 5 * scale};
+        loom_fill(ctx,
+                  (loom_rect){bar.x, bar.y,
+                              bar.w * minf(source->progress, 100) / 100, bar.h},
+                  &clip, ACCENT, 2 * scale);
+      }
     }
-    if (selected_drawn)
-      draw_navigation_cursor(ctx, selected_row, &content, 11 * scale, scale,
-                             400);
+    nav_scroll_end(&ui);
     ctx->mask = outer;
+    if (chosen != NULL)
+      start_playback(chosen->id, chosen->episode_title, chosen->series_id,
+                     chosen->playback_position_ticks);
 }
 
 /* A column at the right, clear of where dialogue sits, so the line a choice
@@ -3433,13 +3035,9 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
 static void draw_subtitle_picker(loom_context *ctx, float width, float height,
                                  float scale) {
   static const loom_color chrome = {8, 12, 20, 215};
-  const int count = jf_player_subtitle_count();
+  const size_t rows = (size_t)jf_player_subtitle_count() + 1;
   const float row = 58 * scale, head = 64 * scale;
-  const size_t visible = min_size((size_t)count + 1, 11);
-  const size_t first =
-      picker_focus < visible / 2
-          ? 0
-          : min_size(picker_focus - visible / 2, (size_t)count + 1 - visible);
+  const size_t visible = min_size(rows, 11);
   const loom_rect panel = {width - 620 * scale,
                            (height - head - visible * row) / 2 - 40 * scale,
                            560 * scale, head + visible * row + 16 * scale};
@@ -3448,23 +3046,38 @@ static void draw_subtitle_picker(loom_context *ctx, float width, float height,
              (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
                          36 * scale},
              &panel, "Subtitles", DIM, 22 * scale);
-  for (size_t i = first; i < first + visible; i++) {
+  /* The choice stays in the middle, once there is room above it. */
+  const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
+  const float scroll =
+      nav_scroll_begin(&ui, nav_str("subtitles"), list, LOOM_VERTICAL,
+                       (float)rows * row, (float)(visible / 2) * row, 0);
+  bool chosen_any = false;
+  for (size_t i = 0; i < rows; i++) {
     const loom_rect rect = {panel.x + 12 * scale,
-                            panel.y + head + (float)(i - first) * row,
+                            list.y + (float)i * row - scroll,
                             panel.w - 24 * scale, row - 6 * scale};
-    const bool chosen = i == picker_focus;
+    const unsigned flags = nav_item(&ui, nav_int(i), rect, list);
+    const bool chosen = flags & NAV_FOCUSED;
+    /* Moving is choosing: the frame behind the picker shows the track at
+     * once. A click closes it, as OK does. */
+    if (chosen && (int)i - 1 != jf_player_subtitle_current())
+      jf_player_subtitle_select((int)i - 1);
+    chosen_any |= (flags & NAV_ACTIVATED) != 0;
+    if (rect.y + rect.h <= list.y || rect.y >= list.y + list.h)
+      continue;
     if (chosen)
-      loom_fill(ctx, rect, &panel, SELECTED, 10 * scale);
+      loom_fill(ctx, rect, &list, SELECTED, 10 * scale);
     const char *name = i == 0 ? "Off" : jf_player_subtitle_name((int)i - 1);
     loom_label(ctx,
                (loom_rect){rect.x + 16 * scale,
                            rect.y + (rect.h - 30 * scale) / 2,
                            rect.w - 32 * scale, 36 * scale},
-               &rect, ellipsize(name, rect.w - 32 * scale, 22 * scale),
+               &list, ellipsize(name, rect.w - 32 * scale, 22 * scale),
                chosen ? WHITE : TEXT, 22 * scale);
-    if (hovered(rect) && pointer_press)
-      pick_subtitle(i);
   }
+  nav_scroll_end(&ui);
+  if (chosen_any)
+    close_subtitle_picker();
 }
 
 static const char *clock_text(int ms) {
@@ -3546,15 +3159,20 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
   const float margin = 40 * scale;
   const float row_y = height - 74 * scale;  /* the buttons' centre line */
   const float bar_y = height - 136 * scale; /* the seek bar's */
+  /* What has the focus, for the hint and the glow; nav says which. Until it
+   * lands on something, play/pause, the default. */
+  const bool bar_focused = ui.focus == seek_bar_id();
+  size_t focused = PLAY_PAUSE_INDEX;
+  for (size_t index = 0; index < PLAYBACK_BUTTON_COUNT; index++)
+    if (button_shown(index) && ui.focus == button_id(index))
+      focused = index;
 
   /* Title, and what the focused control is or does. */
   const jf_player_state state = jf_player_state_get();
-  const char *hint =
-      state == JF_LOADING  ? "Loading..."
-      : state == JF_FAILED ? jf_player_error()
-      : playback_row == 1
-          ? (playback_paused ? "Paused" : "")
-          : playback_hint(min_size(focus, PLAYBACK_BUTTON_COUNT - 1));
+  const char *hint = state == JF_LOADING  ? "Loading..."
+                     : state == JF_FAILED ? jf_player_error()
+                     : bar_focused        ? (playback_paused ? "Paused" : "")
+                                          : playback_hint(focused);
   const float hint_size = 22 * scale;
   const float hint_w = jf_renderer_measure(renderer, hint, hint_size);
   loom_label(ctx,
@@ -3587,7 +3205,6 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
                          30 * scale},
              NULL, duration > 0 ? clock_text(duration) : "--:--", DIM,
              time_size);
-  const bool bar_focused = playback_row == 1;
   const float bar_h = (bar_focused ? 8 : 5) * scale;
   const loom_rect bar = {margin + time_w + 28 * scale, bar_y - bar_h / 2,
                          width - 2 * (margin + time_w + 28 * scale), bar_h};
@@ -3596,19 +3213,21 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
   const float head_x = bar.x + bar.w * seen;
   if (bar_focused)
     move_glow(head_x, bar_y);
+  /* OK on the bar pauses; a click on it seeks to there. */
   const loom_rect bar_hit = {bar.x, bar_y - 24 * scale, bar.w, 48 * scale};
-  if (hovered(bar_hit)) {
-    if (pointer_moved)
-      playback_row = 1;
-    if (pointer_press && duration > 0)
-      jf_player_seek_to((int)((cursor_x - bar.x) / bar.w * duration));
+  const unsigned bar_flags =
+      nav_item(&ui, seek_bar_id(), bar_hit, ctx->viewport);
+  if (bar_flags & NAV_ACTIVATED) {
+    if (bar_flags & NAV_CLICKED) {
+      if (duration > 0)
+        jf_player_seek_to((int)((ui.pointer_x - bar.x) / bar.w * duration));
+    } else {
+      toggle_playback();
+    }
   }
 
-  /* Everything that glows is drawn after the glow. */
-  /* A button that went away (chapters or episodes) hands the focus back. */
-  if (focus >= PLAYBACK_BUTTON_COUNT || !button_shown(focus))
-    focus = PLAY_PAUSE_INDEX;
-  const size_t focused = focus;
+  /* Everything that glows is drawn after the glow. A button that goes away
+   * (chapters or episodes) hands the focus back to play/pause, the default. */
   float centres[PLAYBACK_BUTTON_COUNT];
   const float step = 96 * scale;
   /* Play/pause holds the middle; the shown buttons pack outwards from it. */
@@ -3659,7 +3278,12 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
                            step};
     const loom_rect at = {centres[index] - icon / 2, row_y - icon / 2, icon,
                           icon};
-    const bool lit = !bar_focused && index == focused;
+    if (index == PLAY_PAUSE_INDEX)
+      nav_default(&ui);
+    const unsigned flags = nav_item(&ui, button_id(index), hit, ctx->viewport);
+    if (flags & NAV_ACTIVATED)
+      activate_playback(index);
+    const bool lit = flags & NAV_FOCUSED;
     loom_label(ctx, at, NULL,
                pause && playback_paused ? JF_ICON_PLAY
                                         : playback_buttons[index].icon,
@@ -3682,17 +3306,6 @@ static void draw_playback(loom_context *ctx, float width, float height, float sc
           ctx,
           (loom_rect){centres[index] - w / 2, at.y + icon, w + 2, size * 1.4f},
           NULL, tag, lit ? WHITE : DIM, size);
-    }
-    if (hovered(hit)) {
-      if (pointer_moved) {
-        focus = index;
-        playback_row = 0;
-      }
-      if (pointer_press) {
-        focus = index;
-        playback_row = 0;
-        activate_playback();
-      }
     }
   }
 
@@ -3802,27 +3415,29 @@ static void draw_licenses(loom_context *ctx, float width, float height,
 
   const loom_rect list_rect = {panel.x + 40 * scale, panel.y + 104 * scale,
                                panel.w - 80 * scale, panel.h - 144 * scale};
-  loom_virtual_list target = loom_virtual_list_init(
-      list_rect, JF_LICENSE_COUNT, row_height, licenses_scroll);
-  if (licenses_reveal) {
-    licenses_scroll = loom_virtual_list_reveal(&target, focus, 0);
-    licenses_reveal = false;
-    target = loom_virtual_list_init(list_rect, JF_LICENSE_COUNT, row_height,
-                                    licenses_scroll);
-  }
-  const loom_virtual_list list = target;
+  const float scroll =
+      nav_scroll_begin(&ui, nav_str("licenses"), list_rect, LOOM_VERTICAL,
+                       JF_LICENSE_COUNT * row_height, 0, 0);
+  const loom_virtual_list list =
+      loom_virtual_list_init(list_rect, JF_LICENSE_COUNT, row_height, scroll);
   /* Rows of its own rather than draw_button, for the same reason the sidebar
    * has them: a scrolled list needs every part of a row clipped to the view,
    * not just its text. */
   const loom_rect clip = {list_rect.x - 4 * scale, list_rect.y,
                           list_rect.w + 8 * scale, list_rect.h};
-  for (size_t index = list.first; index < list.last; index++) {
+  size_t chosen = JF_LICENSE_COUNT;
+  /* A row either side of the view, so there is always a row to move into. */
+  const size_t last = min_size(list.last + 1, JF_LICENSE_COUNT);
+  for (size_t index = dec(list.first); index < last; index++) {
     const loom_rect raw = loom_virtual_list_item(&list, index);
     const loom_rect row = {raw.x, raw.y + 6 * scale, raw.w, raw.h - 12 * scale};
-    const bool hot = hovered(row);
-    loom_fill(ctx, row, &clip, hot ? HOT : CARD, 12 * scale);
-    loom_stroke(ctx, row, &clip, focus == index ? ACCENT : BORDER,
-                focus == index ? 4 * scale : 2 * scale, 12 * scale);
+    const unsigned flags = nav_item(&ui, nav_int(index), row, clip);
+    const bool focused = flags & NAV_FOCUSED;
+    if (flags & NAV_ACTIVATED)
+      chosen = index;
+    loom_fill(ctx, row, &clip, flags & NAV_HOVERED ? HOT : CARD, 12 * scale);
+    loom_stroke(ctx, row, &clip, focused ? ACCENT : BORDER,
+                focused ? 4 * scale : 2 * scale, 12 * scale);
     loom_label(
         ctx,
         (loom_rect){row.x + 24 * scale, row.y + (row.h - 30 * scale) / 2,
@@ -3830,11 +3445,10 @@ static void draw_licenses(loom_context *ctx, float width, float height,
         &clip,
         fmt("%s - %s", jf_licenses[index].library, jf_licenses[index].license),
         TEXT, 25 * scale);
-    if (hot && pointer_press) {
-      focus = index;
-      activate();
-    }
   }
+  nav_scroll_end(&ui);
+  if (chosen < JF_LICENSE_COUNT)
+    open_license(chosen);
 }
 
 static void draw_license(loom_context *ctx, float width, float height,
@@ -3847,7 +3461,7 @@ static void draw_license(loom_context *ctx, float width, float height,
    * be cut to the text: the ISC licence is fifteen lines and has no business
    * filling a screen. */
   const float size = 17 * scale;
-  license_line_height = 24 * scale;
+  const float line_height = 24 * scale;
   const float padding = 40 * scale;
   const float heading = 86 * scale;
   const float panel_width =
@@ -3855,7 +3469,7 @@ static void draw_license(loom_context *ctx, float width, float height,
            maxf(620 * scale, license_text_width * size + 2 * padding));
   const float panel_height =
       minf(height - 180 * scale,
-           heading + license_line_count * license_line_height + padding);
+           heading + license_line_count * line_height + padding);
   const loom_rect panel = {(width - panel_width) / 2,
                            (height - panel_height) / 2, panel_width,
                            panel_height};
@@ -3871,22 +3485,24 @@ static void draw_license(loom_context *ctx, float width, float height,
 
   const loom_rect view = {panel.x + padding, panel.y + heading,
                           panel.w - 2 * padding, panel.h - heading - padding};
-  loom_virtual_list list = loom_virtual_list_init(
-      view, license_line_count, license_line_height, license_scroll);
-  const float end = loom_virtual_list_max_scroll(&list);
-  license_scroll = minf(license_scroll, end);
-  list = loom_virtual_list_init(view, license_line_count, license_line_height,
-                                license_scroll);
+  /* Up and Down, with nothing to focus here, move the text a line at a time. */
+  const float extent = (float)license_line_count * line_height;
+  const float end = maxf(0, extent - view.h);
+  const float scroll = nav_scroll_begin(&ui, nav_str("license"), view,
+                                        LOOM_VERTICAL, extent, 0, line_height);
+  const loom_virtual_list list =
+      loom_virtual_list_init(view, license_line_count, line_height, scroll);
   /* Deep enough to cover the line being cut in half. It grows in with the
    * scroll, so a licence at its top keeps its title readable. */
   const loom_mask outer = ctx->mask;
-  loom_fade(ctx, LOOM_VERTICAL, view.y, view.y + view.h, license_scroll, end,
-            license_line_height * 2);
+  loom_fade(ctx, LOOM_VERTICAL, view.y, view.y + view.h, scroll, end,
+            line_height * 2);
   for (size_t index = list.first; index < list.last; index++) {
     const loom_rect row = loom_virtual_list_item(&list, index);
     loom_label(ctx, (loom_rect){row.x, row.y, row.w, row.h}, &view,
                license_lines[index], DIM, size);
   }
+  nav_scroll_end(&ui);
   ctx->mask = outer;
 }
 
@@ -3900,19 +3516,27 @@ static void draw_settings(loom_context *ctx, float width, float scale)
              (loom_rect){panel.x + 48 * scale, panel.y + 42 * scale,
                          panel.w - 96 * scale, 44 * scale},
              &panel, "Settings", TEXT, 32 * scale);
-  draw_button(ctx,
-              (loom_rect){panel.x + 48 * scale, panel.y + 116 * scale,
-                          panel.w - 96 * scale, 72 * scale},
-              animations_enabled ? "Animations: On" : "Animations: Off", 0,
-              scale);
-  draw_button(ctx,
-              (loom_rect){panel.x + 48 * scale, panel.y + 210 * scale,
-                          panel.w - 96 * scale, 72 * scale},
-              "Sign out", 1, scale);
-  draw_button(ctx,
-              (loom_rect){panel.x + 48 * scale, panel.y + 304 * scale,
-                          panel.w - 96 * scale, 72 * scale},
-              "Open source licenses", 2, scale);
+  if (draw_button(ctx,
+                  (loom_rect){panel.x + 48 * scale, panel.y + 116 * scale,
+                              panel.w - 96 * scale, 72 * scale},
+                  animations_enabled ? "Animations: On" : "Animations: Off",
+                  nav_str("settings.animations"), scale) &
+      NAV_ACTIVATED)
+    toggle_animations();
+  if (draw_button(ctx,
+                  (loom_rect){panel.x + 48 * scale, panel.y + 210 * scale,
+                              panel.w - 96 * scale, 72 * scale},
+                  "Sign out", nav_str("settings.sign_out"), scale) &
+      NAV_ACTIVATED)
+    sign_out();
+  if (draw_button(ctx,
+                  (loom_rect){panel.x + 48 * scale, panel.y + 304 * scale,
+                              panel.w - 96 * scale, 72 * scale},
+                  "Open source licenses", nav_str("settings.licenses"), scale) &
+      NAV_ACTIVATED) {
+    screen = SCREEN_LICENSES;
+    nav_focus(&ui, nav_child(nav_str("licenses"), nav_int(0)));
+  }
 }
 
 static void draw_sidebar(loom_context *ctx, float height, float scale)
@@ -3930,28 +3554,34 @@ static void draw_sidebar(loom_context *ctx, float height, float scale)
                                panel.w - 36 * scale, panel.h - 96 * scale};
   const size_t count = categories_row.count + 1; /* the final row is Settings */
   const float row_height = 76 * scale;
-  loom_virtual_list target =
-      loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
-  if (sidebar_reveal) {
-    sidebar_scroll = loom_virtual_list_reveal(&target, sidebar_focus, 0);
-    sidebar_reveal = false;
-  }
-  target = loom_virtual_list_init(list_rect, count, row_height, sidebar_scroll);
-  static uint64_t drawn;
-  animate_list(&sidebar_scroll_motion, &drawn, target.scroll);
-  const loom_virtual_list list = loom_virtual_list_init(
-      list_rect, count, row_height, sidebar_scroll_motion.value);
-  const loom_rect selected_raw = loom_virtual_list_item(&list, sidebar_focus);
-  const loom_rect selected_row = {selected_raw.x, selected_raw.y + 5 * scale,
-                                  selected_raw.w, selected_raw.h - 10 * scale};
   const loom_rect button_clip = {
       list_rect.x - 4 * scale, list_rect.y - 4 * scale, list_rect.w + 8 * scale,
       list_rect.h + 8 * scale};
-  for (size_t index = list.first; index < list.last; index++) {
+  /* Closing, it hands the focus back to what it covers. */
+  const bool inert = ui.inert;
+  nav_set_inert(&ui, sidebar_closing);
+  const float scroll =
+      nav_scroll_begin(&ui, nav_str("sidebar"), list_rect, LOOM_VERTICAL,
+                       (float)count * row_height, 0, 0);
+  const loom_virtual_list list =
+      loom_virtual_list_init(list_rect, count, row_height, scroll);
+  size_t chosen = count;
+  /* Every row is declared, so it can open on the library already showing. */
+  for (size_t index = 0; index < count; index++) {
     const loom_rect raw = loom_virtual_list_item(&list, index);
     const loom_rect row = {raw.x, raw.y + 5 * scale, raw.w, raw.h - 10 * scale};
-    const bool hot = hovered(row);
-    loom_fill(ctx, row, &button_clip, hot ? HOT : CARD, 10 * scale);
+    if (screen == SCREEN_GRID && index < categories_row.count &&
+        strcmp(categories_row.cards[index].id, grid_parent) == 0)
+      nav_default(&ui);
+    const unsigned flags = nav_item(&ui, nav_int(index), row, button_clip);
+    if (flags & NAV_FOCUSED)
+      nav_ring(&ui, row, 10 * scale);
+    if (flags & NAV_ACTIVATED)
+      chosen = index;
+    if (index < list.first || index >= list.last)
+      continue;
+    loom_fill(ctx, row, &button_clip, flags & NAV_HOVERED ? HOT : CARD,
+              10 * scale);
     loom_stroke(ctx, row, &button_clip, BORDER, 1 * scale, 10 * scale);
     loom_label(ctx,
                (loom_rect){row.x + 22 * scale, row.y + 16 * scale,
@@ -3960,54 +3590,28 @@ static void draw_sidebar(loom_context *ctx, float height, float scale)
                index < categories_row.count ? categories_row.cards[index].title
                                             : "Settings",
                TEXT, 22 * scale);
-    if (hot && pointer_press) {
-      sidebar_focus = index;
-      activate_sidebar();
-    }
   }
-  draw_navigation_cursor(ctx, selected_row, &button_clip, 10 * scale, scale,
-                         500);
+  nav_scroll_end(&ui);
+  nav_set_inert(&ui, inert);
+  if (chosen < count)
+    activate_sidebar(chosen);
 }
 
 static bool advance_animations(uint64_t now) {
-  animated_float_update(&home_scroll_motion, now);
-  animated_float_update(&grid_scroll_motion, now);
-  animated_float_update(&episode_scroll_motion, now);
   animated_float_update(&sidebar_slide, now);
-  animated_float_update(&sidebar_scroll_motion, now);
-  animated_float_update(&focus_cursor.x, now);
-  animated_float_update(&focus_cursor.y, now);
-  animated_float_update(&focus_cursor.w, now);
-  animated_float_update(&focus_cursor.h, now);
   animated_float_update(&chrome_motion, now);
   animated_float_update(&glow_x, now);
   animated_float_update(&glow_y, now);
   if (animated_float_running(&chrome_motion) ||
       animated_float_running(&glow_x) || animated_float_running(&glow_y))
     return true;
-  for (size_t index = 0; index < ROW_COUNT; index++)
-    animated_float_update(&row_offset_motion[index], now);
 
   if (sidebar_closing && !animated_float_running(&sidebar_slide) &&
       sidebar_slide.value == 0) {
     sidebar_open = false;
     sidebar_closing = false;
-    focus_cursor.known = false;
   }
-  if (animated_float_running(&home_scroll_motion) ||
-      animated_float_running(&grid_scroll_motion) ||
-      animated_float_running(&episode_scroll_motion) ||
-      animated_float_running(&sidebar_slide) ||
-      animated_float_running(&sidebar_scroll_motion) ||
-      animated_float_running(&focus_cursor.x) ||
-      animated_float_running(&focus_cursor.y) ||
-      animated_float_running(&focus_cursor.w) ||
-      animated_float_running(&focus_cursor.h))
-    return true;
-  for (size_t index = 0; index < ROW_COUNT; index++)
-    if (animated_float_running(&row_offset_motion[index]))
-      return true;
-  return false;
+  return animated_float_running(&sidebar_slide);
 }
 
 static void build_ui(loom_context *ctx)
@@ -4021,6 +3625,11 @@ static void build_ui(loom_context *ctx)
     advance_animations(now_ns());
 
     loom_begin(ctx, width, height);
+    ui.animate = animations_enabled;
+    ui.duration = NAVIGATION_ANIMATION_NS;
+    nav_begin(&ui, ctx, now_ns());
+    /* What the sidebar covers cannot take the focus from under it. */
+    nav_set_inert(&ui, sidebar_open);
     /* The video plane sits behind this EGL surface. During playback every untouched pixel
      * must remain transparent, otherwise the UI obscures it. */
     if (screen != SCREEN_PLAYBACK)
@@ -4071,13 +3680,10 @@ static void build_ui(loom_context *ctx)
     }
     if (sidebar_open)
         draw_sidebar(ctx, height, scale);
-    /* Pointer activation happens during layout; rebuild its resulting screen. */
-    if (pointer_press)
-        jf_window_frame_requested = true;
+    if (nav_end(&ui, ACCENT, 4 * scale))
+      jf_window_frame_requested = true;
     if (advance_animations(now_ns()))
       jf_window_frame_requested = true;
-    pointer_press = false;
-    pointer_moved = false;
 }
 
 /* -------------------------------------------------------------------- main */
@@ -4232,8 +3838,9 @@ static bool step_script(void)
         wheel.axis.value = (command == '[' ? -180 : 180) * 256;
         on_event(&wheel);
     }
-    fprintf(stderr, "script: '%c' -> screen=%d focus=%zu row=%zu servers=%zu depth=%zu\n",
-            command, (int)screen, focus, row_focus, discovered_count, depth);
+    fprintf(stderr,
+            "script: '%c' -> screen=%d nav=%08x servers=%zu depth=%zu\n",
+            command, (int)screen, (unsigned)ui.focus, discovered_count, depth);
     return false;
 }
 

@@ -17,6 +17,7 @@
 #include "jf/store.h"
 #include "platform/luna.h"
 #include "ui/loom.h"
+#include "ui/nav.h"
 #include "ui/skyline.h"
 #ifdef JF_HAVE_DEMUX
 #include "jf/demux.h"
@@ -171,6 +172,111 @@ static void test_virtual_list(void)
     CHECK(loom_virtual_list_item(&list, list.first).y <= 0);
     /* Revealing an item already on screen must not move the view. */
     CHECK(loom_virtual_list_reveal(&list, list.first + 1, 0) == list.scroll);
+}
+
+/* A home screen as nav sees it: three carousels in a vertical list, 4 of 10
+ * cards fitting across. Returns the activated card as row * 100 + column. */
+static int nav_home(nav *ui, loom_context *ctx, float *row_scroll) {
+  int chosen = -1;
+  loom_begin(ctx, 500, 300);
+  nav_begin(ui, ctx, 1);
+  const loom_rect view = {0, 0, 500, 300};
+  const float down =
+      nav_scroll_begin(ui, nav_int(0), view, LOOM_VERTICAL, 600, 0, 0);
+  for (int row = 0; row < 3; row++) {
+    const loom_rect strip = {0, row * 200 - down, 500, 180};
+    const float across = nav_scroll_begin(
+        ui, nav_int(row), strip, LOOM_HORIZONTAL, 10 * 120 - 20, 120, 120);
+    row_scroll[row] = across;
+    for (int column = 0; column < 10; column++) {
+      const loom_rect card = {column * 120 - across, strip.y, 100, 180};
+      if (nav_item(ui, nav_int(column), card, view) & NAV_ACTIVATED)
+        chosen = row * 100 + column;
+    }
+    nav_scroll_end(ui);
+  }
+  nav_scroll_end(ui);
+  static const loom_color white = {255, 255, 255, 255};
+  nav_end(ui, white, 4);
+  return chosen;
+}
+
+static void test_nav(void) {
+  static nav ui;
+  loom_context ctx;
+  loom_init(&ctx);
+  float scroll[3];
+  nav_home(&ui, &ctx, scroll);
+  /* Nothing had focus: the first card declared takes it. */
+  nav_home(&ui, &ctx, scroll);
+  CHECK(!nav_move(&ui, NAV_LEFT));
+  CHECK(!nav_move(&ui, NAV_UP));
+  for (int i = 0; i < 2; i++) {
+    CHECK(nav_move(&ui, NAV_RIGHT));
+    nav_home(&ui, &ctx, scroll);
+  }
+  CHECK(scroll[0] == 0);
+  /* The fourth card's successor is past the edge: the strip moves one whole
+   * step. */
+  CHECK(nav_move(&ui, NAV_RIGHT));
+  nav_home(&ui, &ctx, scroll);
+  nav_home(&ui, &ctx, scroll);
+  CHECK(scroll[0] == 120);
+  /* Down lands under the ring, and back up lands under it again: rows do not
+   * remember where they were left. Column 1 of the unscrolled row sits
+   * under column 2 of the scrolled one. */
+  CHECK(nav_move(&ui, NAV_DOWN));
+  nav_home(&ui, &ctx, scroll);
+  CHECK(nav_move(&ui, NAV_LEFT));
+  nav_home(&ui, &ctx, scroll);
+  CHECK(nav_move(&ui, NAV_UP));
+  nav_home(&ui, &ctx, scroll);
+  nav_activate(&ui);
+  CHECK(nav_home(&ui, &ctx, scroll) == 2);
+  /* Reported once. */
+  CHECK(nav_home(&ui, &ctx, scroll) == -1);
+  /* The last row is off screen; moving into it scrolls the list. */
+  CHECK(nav_move(&ui, NAV_DOWN));
+  nav_home(&ui, &ctx, scroll);
+  CHECK(nav_move(&ui, NAV_DOWN));
+  nav_home(&ui, &ctx, scroll);
+  nav_home(&ui, &ctx, scroll);
+  nav_pointer(&ui, 10, 250);
+  nav_click(&ui);
+  CHECK(nav_home(&ui, &ctx, scroll) / 100 == 2);
+  /* Right at the end of a row stays there rather than climbing a row. */
+  for (int i = 0; i < 12; i++) {
+    nav_move(&ui, NAV_RIGHT);
+    nav_home(&ui, &ctx, scroll);
+  }
+  nav_activate(&ui);
+  CHECK(nav_home(&ui, &ctx, scroll) == 209);
+  /* The last card ends at the edge, not a card in. */
+  CHECK(scroll[2] == 10 * 120 - 20 - 500);
+
+  /* A seek bar whose hit area overlaps the buttons under it is still above
+   * them, and Down from it lands under its middle. */
+  static const loom_color white = {255, 255, 255, 255};
+  for (int frame = 0; frame < 4; frame++) {
+    loom_begin(&ctx, 500, 300);
+    nav_begin(&ui, &ctx, 1);
+    const loom_rect view = {0, 0, 500, 300};
+    nav_item(&ui, nav_str("bar"), (loom_rect){0, 150, 500, 48}, view);
+    for (int i = 0; i < 5; i++)
+      nav_item(&ui, nav_int(i), (loom_rect){i * 100.0f, 190, 100, 100}, view);
+    nav_end(&ui, white, 4);
+    if (frame == 0)
+      nav_focus(&ui, nav_int(0));
+    if (frame == 1) {
+      CHECK(nav_move(&ui, NAV_UP));
+      CHECK(ui.focus == nav_str("bar"));
+    }
+    if (frame == 2) {
+      CHECK(nav_move(&ui, NAV_DOWN));
+      CHECK(ui.focus == nav_int(2));
+    }
+  }
+  loom_destroy(&ctx);
 }
 
 /* Glyphs are packed with an implicit one-pixel gutter; two regions that touch would bleed
@@ -515,6 +621,7 @@ int main(void)
   test_clock();
   test_luna_event();
   test_virtual_list();
+  test_nav();
   test_skyline();
 #ifdef JF_HAVE_DEMUX
     test_demux_open_failure();

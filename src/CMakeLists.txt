@@ -29,6 +29,7 @@ add_library(jf-portable STATIC
         jf/clock.c
         ui/skyline.c
         ui/loom.c
+        ui/nav.c
         platform/luna_json.c)
 target_include_directories(jf-portable PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(jf-portable PUBLIC jf-os m pthread)
@@ -102,7 +103,7 @@ if (HAVE_PLATFORM)
 
     # The instanced UI batch and its glyph atlas.
     pkg_check_modules(FREETYPE REQUIRED freetype2)
-    add_library(jf-ui STATIC ui/loom.c ui/skyline.c ui/glyph_atlas.c ui/renderer.c)
+    add_library(jf-ui STATIC ui/loom.c ui/nav.c ui/skyline.c ui/glyph_atlas.c ui/renderer.c)
     target_include_directories(jf-ui PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(jf-ui SYSTEM PUBLIC ${FREETYPE_INCLUDE_DIRS})
     target_link_directories(jf-ui PUBLIC ${FREETYPE_LIBRARY_DIRS})
