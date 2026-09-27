@@ -51,7 +51,8 @@ ssize_t jf_os_udp_recv(jf_os_socket socket, void *buffer, size_t size) {
 
 void jf_os_udp_close(jf_os_socket socket) { close((int)socket); }
 
-/* The TV's own face first, then what a desktop distribution is likely to carry. */
+/* The TV's own face first, then what a desktop distribution is likely to carry.
+ */
 static const char *const candidates[] = {
     "/usr/share/fonts/LG_Smart_UI-Regular.ttf",
     "/usr/share/fonts/DroidSans.ttf",
@@ -67,14 +68,12 @@ static const char *const fallbacks[] = {
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 };
 
-const char *const *jf_os_font_candidates(size_t *count)
-{
-    *count = sizeof(candidates) / sizeof(*candidates);
-    return candidates;
+const char *const *jf_os_font_candidates(size_t *count) {
+  *count = sizeof(candidates) / sizeof(*candidates);
+  return candidates;
 }
 
-const char *const *jf_os_font_fallbacks(size_t *count)
-{
-    *count = sizeof(fallbacks) / sizeof(*fallbacks);
-    return fallbacks;
+const char *const *jf_os_font_fallbacks(size_t *count) {
+  *count = sizeof(fallbacks) / sizeof(*fallbacks);
+  return fallbacks;
 }

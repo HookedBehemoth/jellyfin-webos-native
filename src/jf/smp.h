@@ -1,10 +1,11 @@
 /*
  * A C façade over StarfishMediaAPIs, the C++ class exported by libplayerAPIs.
  *
- * Everything else in this program is C. The shim behind this header (smp_shim.cpp) is the
- * only C++ translation unit, and it contains no logic: each function is a try/catch around
- * one call into the library. The JSON payloads it takes are built in C, in smp_payload.c,
- * so they can be unit-tested on the host without libplayerAPIs.
+ * Everything else in this program is C. The shim behind this header
+ * (smp_shim.cpp) is the only C++ translation unit, and it contains no logic:
+ * each function is a try/catch around one call into the library. The JSON
+ * payloads it takes are built in C, in smp_payload.c, so they can be
+ * unit-tested on the host without libplayerAPIs.
  */
 #pragma once
 
@@ -40,12 +41,13 @@ enum {
 enum { SMP_ES_VIDEO = 1 };
 
 /* Invoked on the pipeline's own thread, not the caller's. */
-typedef void (smp_event_fn)(int type, int64_t num_value, const char *str_value);
+typedef void(smp_event_fn)(int type, int64_t num_value, const char *str_value);
 
-/* One session's worth of pipeline. The object is *not* reusable across load/unload: its
- * uMediaServer context is fixed at construction, and a second load comes up with its
- * resources granted but its sinks never registered - no sourceInfo, no picture. So
- * smp_close() really destroys it and smp_open() builds a new one. */
+/* One session's worth of pipeline. The object is *not* reusable across
+ * load/unload: its uMediaServer context is fixed at construction, and a second
+ * load comes up with its resources granted but its sinks never registered - no
+ * sourceInfo, no picture. So smp_close() really destroys it and smp_open()
+ * builds a new one. */
 bool smp_open(void);
 void smp_close(void);
 bool smp_is_open(void);
@@ -57,18 +59,20 @@ bool smp_pause(void);
 bool smp_push_eos(void);
 bool smp_notify_foreground(void);
 
-/* Seek takes milliseconds as a decimal string; flush and set_play_rate take JSON. Build
- * all three with the smp_payload_* helpers. */
+/* Seek takes milliseconds as a decimal string; flush and set_play_rate take
+ * JSON. Build all three with the smp_payload_* helpers. */
 bool smp_seek(const char *millis);
 bool smp_flush(const char *payload);
 bool smp_set_play_rate(const char *payload);
 
-/* Feed answers with a status *string*, not a boolean. `status` receives it so the caller
- * can classify it (and report it) without the shim knowing what the words mean. */
+/* Feed answers with a status *string*, not a boolean. `status` receives it so
+ * the caller can classify it (and report it) without the shim knowing what the
+ * words mean. */
 bool smp_feed(const char *payload, char *status, size_t status_len);
 
-/* The pipeline's own presentation clock in nanoseconds, negative when unavailable.
- * `option.queryPosition` in the load payload is what keeps it maintained. */
+/* The pipeline's own presentation clock in nanoseconds, negative when
+ * unavailable. `option.queryPosition` in the load payload is what keeps it
+ * maintained. */
 int64_t smp_get_current_playtime(void);
 
 /* Set when a shim call threw; empty otherwise. */

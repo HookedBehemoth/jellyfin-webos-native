@@ -1,15 +1,16 @@
 /*
  * Where playback actually is, taken from the pipeline rather than guessed at.
  *
- * The load payload sets `queryPosition`, and Starfish then reports the presentation
- * timestamp of each displayed frame as the numeric value of a FRAMEREADY event. That is
- * the whole clock: a pts paired with the host time the event arrived, sampled at the
- * moment of the flip.
+ * The load payload sets `queryPosition`, and Starfish then reports the
+ * presentation timestamp of each displayed frame as the numeric value of a
+ * FRAMEREADY event. That is the whole clock: a pts paired with the host time
+ * the event arrived, sampled at the moment of the flip.
  *
- * This replaces polling getCurrentPlaytime(). That call is frame-quantized and sometimes
- * slow, so reading it needed a sampling period, a slow-query rejection, a half-interval
- * bracket to guess when the frame had really flipped, and a stability probe before the
- * result could be trusted. An event that arrives *at* the flip needs none of it.
+ * This replaces polling getCurrentPlaytime(). That call is frame-quantized and
+ * sometimes slow, so reading it needed a sampling period, a slow-query
+ * rejection, a half-interval bracket to guess when the frame had really
+ * flipped, and a stability probe before the result could be trusted. An event
+ * that arrives *at* the flip needs none of it.
  */
 #pragma once
 
@@ -28,7 +29,8 @@ void jf_clock_sample(int64_t pts_ns, int64_t host_ns);
 void jf_clock_set_running(bool running);
 bool jf_clock_ready(void);
 
-/* Projected media position now, or JF_CLOCK_NONE when there is no usable anchor. */
+/* Projected media position now, or JF_CLOCK_NONE when there is no usable
+ * anchor. */
 int64_t jf_clock_pts(void);
 /* Host time at which media timestamp `pts_ns` is presented, or JF_CLOCK_NONE.
  * This is the line audio is pulled onto. */

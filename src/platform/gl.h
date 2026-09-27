@@ -1,10 +1,10 @@
 /*
  * OpenGL ES for the applications.
  *
- * The Zig build dlopen'd libGLESv2 and fetched every entry point by name so it needed no
- * sysroot. With the NDK in hand there is nothing to arrange: the headers and the library
- * are both there, so this is a plain include plus the drawable size everything above the
- * platform layer works in.
+ * The Zig build dlopen'd libGLESv2 and fetched every entry point by name so it
+ * needed no sysroot. With the NDK in hand there is nothing to arrange: the
+ * headers and the library are both there, so this is a plain include plus the
+ * drawable size everything above the platform layer works in.
  */
 #pragma once
 

@@ -3,3 +3,5 @@
 # definitions, 80 columns.
 BasedOnStyle: LLVM
 Language: Cpp
+# Headers here depend on their order (GLES2/gl2ext.h after gl3.h).
+SortIncludes: Never

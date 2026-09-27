@@ -7,21 +7,21 @@
 #include <stdint.h>
 
 typedef struct {
-    uint8_t *bytes; /* malloc'd; the consumer frees it */
-    int size;
-    int64_t pts;
+  uint8_t *bytes; /* malloc'd; the consumer frees it */
+  int size;
+  int64_t pts;
 } jf_chunk;
 
 #define JF_QUEUE_SLOTS 512
 #define JF_QUEUE_CAPACITY_BYTES (8u << 20)
 
 typedef struct {
-    jf_chunk slots[JF_QUEUE_SLOTS];
-    size_t head, tail, count, bytes;
-    bool closed;
-    pthread_mutex_t mutex;
-    pthread_cond_t room;   /* a slot or byte budget freed up */
-    pthread_cond_t filled; /* a chunk arrived, or the queue closed */
+  jf_chunk slots[JF_QUEUE_SLOTS];
+  size_t head, tail, count, bytes;
+  bool closed;
+  pthread_mutex_t mutex;
+  pthread_cond_t room;   /* a slot or byte budget freed up */
+  pthread_cond_t filled; /* a chunk arrived, or the queue closed */
 } jf_queue;
 
 void jf_queue_init(jf_queue *q);
