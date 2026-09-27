@@ -25,6 +25,7 @@ add_library(jf-portable STATIC
         jf/arena.c
         jf/blurhash.c
         jf/cfg.c
+        jf/codecs.c
         jf/packet_queue.c
         jf/clock.c
         ui/skyline.c
@@ -184,6 +185,8 @@ add_executable(jellyfin
         app/main.c
         jf/api.c
         jf/arena.c
+        jf/codecs.c
+        jf/decoders.c
         jf/blurhash.c
         jf/cfg.c
         jf/image.c

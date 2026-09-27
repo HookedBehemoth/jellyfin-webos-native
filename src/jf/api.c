@@ -328,6 +328,17 @@ static bool json_flag(json_object *object, const char *key)
     return json_object_object_get_ex(object, key, &value) && json_object_get_boolean(value);
 }
 
+/* A string into a fixed buffer, empty when missing. */
+static void json_copy(json_object *object, const char *key, char *out,
+                      size_t out_len) {
+  json_object *value = NULL;
+  const char *text = json_object_object_get_ex(object, key, &value) &&
+                             json_object_get_type(value) == json_type_string
+                         ? json_object_get_string(value)
+                         : "";
+  snprintf(out, out_len, "%s", text);
+}
+
 /* BackdropImageTags[0], or the parent's - the only backdrop this UI draws. */
 static const char *json_first_tag(jf_arena *arena, json_object *object, const char *key)
 {
@@ -404,6 +415,33 @@ static void parse_item(jf_arena *arena, json_object *object, jf_item *out)
         if ((out->has_unplayed_item_count = json_number(user_data, "UnplayedItemCount", &number)))
             out->unplayed_item_count = (uint32_t)number;
     }
+
+    json_object *streams = NULL;
+    if (json_object_object_get_ex(object, "MediaStreams", &streams) &&
+        json_object_get_type(streams) == json_type_array)
+      for (size_t i = 0;
+           i < json_object_array_length(streams) && !out->has_video; i++) {
+        json_object *stream = json_object_array_get_idx(streams, i);
+        char type[16];
+        json_copy(stream, "Type", type, sizeof(type));
+        if (strcmp(type, "Video") != 0)
+          continue;
+        out->has_video = true;
+        json_copy(stream, "Codec", out->video.codec, sizeof(out->video.codec));
+        json_copy(stream, "Profile", out->video.profile,
+                  sizeof(out->video.profile));
+        if (json_number(stream, "BitDepth", &number))
+          out->video.bit_depth = (uint32_t)number;
+        if (json_number(stream, "Width", &number))
+          out->video.width = (uint32_t)number;
+        if (json_number(stream, "Height", &number))
+          out->video.height = (uint32_t)number;
+        if (json_number(stream, "RealFrameRate", &number) ||
+            json_number(stream, "AverageFrameRate", &number))
+          out->video.frame_rate = (float)number;
+        if (json_number(stream, "BitRate", &number))
+          out->video.bit_rate = (uint32_t)number;
+      }
 }
 
 static bool parse_item_list(jf_arena *arena, const char *body, jf_item_list *out)
@@ -787,6 +825,41 @@ static http_result execute(CURL *curl, const jf_session *session, jf_task *task)
         parse_item(arena, root, &task->one);
         json_object_put(root);
         return HTTP_OK;
+    }
+
+    case JF_JOB_ENCODING: {
+      snprintf(url, sizeof(url), "%s/System/Configuration/encoding",
+               jf_session_base(session, base, sizeof(base)));
+      result =
+          send_request(curl, arena, session, "GET", url, NULL, &body, &size);
+      if (result != HTTP_OK)
+        return result;
+      json_object *root = json_tokener_parse((const char *)body);
+      if (root == NULL)
+        return HTTP_STATUS;
+      jf_server_transcode *out = &task->encoding;
+      memset(out, 0, sizeof(*out));
+      out->known = true;
+      char type[32];
+      json_copy(root, "HardwareAccelerationType", type, sizeof(type));
+      out->hardware = type[0] != '\0' && strcmp(type, "none") != 0 &&
+                      json_flag(root, "EnableHardwareEncoding");
+      json_object *codecs = NULL;
+      size_t used = (size_t)snprintf(out->codecs, sizeof(out->codecs), ",");
+      if (json_object_object_get_ex(root, "HardwareDecodingCodecs", &codecs) &&
+          json_object_get_type(codecs) == json_type_array)
+        for (size_t i = 0;
+             i < json_object_array_length(codecs) && used < sizeof(out->codecs);
+             i++)
+          used += (size_t)snprintf(
+              out->codecs + used, sizeof(out->codecs) - used, "%s,",
+              json_object_get_string(json_object_array_get_idx(codecs, i)));
+      out->hevc_10 = json_flag(root, "EnableDecodingColorDepth10Hevc");
+      out->vp9_10 = json_flag(root, "EnableDecodingColorDepth10Vp9");
+      out->hevc_rext_10 = json_flag(root, "EnableDecodingColorDepth10HevcRext");
+      out->hevc_rext_12 = json_flag(root, "EnableDecodingColorDepth12HevcRext");
+      json_object_put(root);
+      return HTTP_OK;
     }
 
     case JF_JOB_SEASONS: {

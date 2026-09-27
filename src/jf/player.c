@@ -50,6 +50,7 @@
 #define PLAYBACK_RATE_MILLIS 1000
 
 bool jf_player_audio = true;
+jf_decoders jf_player_decoders;
 bool jf_player_subtitles = true;
 const char *jf_player_audio_device = "default";
 
@@ -959,6 +960,21 @@ static void seek_to(void *demux, int target_ms, bool transcoded)
 
 /* --------------------------------------------------------------- the session */
 
+/* Points `uri` at the server's transcode, from the start. Straight into `uri`:
+ * it is where the source lives from here on, and a URL that does not fit must
+ * not be half-written into it. */
+static bool use_transcode(void) {
+  char id[40];
+  play_session_id(id, sizeof(id));
+  const int written = snprintf(
+      uri, sizeof(uri), "%s&PlaySessionId=%s&StartTimeTicks=0", fallback, id);
+  if (written <= 0 || (size_t)written >= sizeof(uri)) {
+    set_error("The server transcode URL is too long");
+    return false;
+  }
+  return true;
+}
+
 static void *session(void *unused)
 {
     (void)unused;
@@ -973,6 +989,17 @@ static void *session(void *unused)
     fprintf(stderr, "t=%lld session: opening the source\n", timing_ms());
     demux = jf_demux_open(uri);
     fprintf(stderr, "t=%lld session: source open\n", timing_ms());
+    /* A container this FFmpeg has no demuxer for (AVI, WMV, ...): the server's
+     * transcode is one it has. */
+    bool transcoded = false;
+    if (demux == NULL && fallback[0] != '\0') {
+      fprintf(stderr,
+              "Jellyfin: FFmpeg cannot open the original, transcoding\n");
+      if (!use_transcode())
+        goto done;
+      demux = jf_demux_open(uri);
+      transcoded = true;
+    }
     if (demux == NULL) {
         set_error("FFmpeg could not open the Jellyfin stream");
         goto done;
@@ -999,27 +1026,25 @@ static void *session(void *unused)
     atomic_store(&audio_track, played_audio_track);
     atomic_store(&audio_track_count, played_audio_track >= 0 ? audio_count : 0);
 
-    /* Before anything is read: a 10-bit or above-High source will never decode, so swap to
-     * the transcode URL while the demuxer is still fresh and let the discovery below run
-     * against what the server sends instead. */
-    bool transcoded = false;
-    if (jf_demux_video_unsupported(demux) && fallback[0] != '\0') {
-        fprintf(stderr, "Jellyfin: source is beyond the decoder, transcoding\n");
-        char id[40];
-        play_session_id(id, sizeof(id));
-        /* Straight into `uri`: it is where the transcode source lives from here on, and
-         * a URL that does not fit must not be half-written into it. */
-        const int written = snprintf(uri, sizeof(uri), "%s&PlaySessionId=%s&StartTimeTicks=0",
-                                     fallback, id);
-        if (written <= 0 || (size_t)written >= sizeof(uri)) {
-            set_error("The server transcode URL is too long");
-            goto done;
-        }
-        if (!jf_demux_reopen(demux, uri)) {
-            set_error("The server would not transcode this item");
-            goto done;
-        }
-        transcoded = true;
+    /* Before anything is read: a source beyond the TV's decoder will never
+     * decode, so swap to the transcode URL while the demuxer is still fresh and
+     * let the discovery below run against what the server sends instead. */
+    jf_video source;
+    if (!transcoded && jf_demux_video(demux, &source) &&
+        !jf_tv_decodes(&source, &jf_player_decoders) && fallback[0] != '\0') {
+      fprintf(
+          stderr,
+          "Jellyfin: %s %s %u-bit %ux%u@%.3g %u bit/s is beyond the decoder, "
+          "transcoding\n",
+          source.codec, source.profile, source.bit_depth, source.width,
+          source.height, source.frame_rate, source.bit_rate);
+      if (!use_transcode())
+        goto done;
+      if (!jf_demux_reopen(demux, uri)) {
+        set_error("The server would not transcode this item");
+        goto done;
+      }
+      transcoded = true;
     }
 
     int video_stream = -1, audio_stream = -1, codec = 0, width = 0, height = 0;

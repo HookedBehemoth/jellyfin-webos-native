@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,6 +14,7 @@
 #include <libavcodec/bsf.h>
 #include <libavformat/avformat.h>
 #include <libavutil/mathematics.h>
+#include <libavutil/pixdesc.h>
 #include <libswresample/swresample.h>
 
 #define PCM_SAMPLE_RATE 48000
@@ -508,19 +510,35 @@ int jf_demux_stream(void *opaque, int index, int *kind, int *video, int *width, 
     *height = p->height;
     return 1;
 }
-/// 1 when the video in this container is beyond what the TV's decoder takes:
-/// more than 8 bits per sample, or H.264 above High profile. Hardware decoders
-/// answer either with "Sequence Init Fail" and no picture, so the caller has
-/// to ask the server to transcode instead.
-int jf_demux_video_unsupported(void *opaque) {
-    struct jf_demux *d = opaque;
-    for (unsigned i = 0; i < d->format->nb_streams; i++) {
-        AVCodecParameters *p = d->format->streams[i]->codecpar;
-        if (p->codec_type != AVMEDIA_TYPE_VIDEO) continue;
-        if (p->bits_per_raw_sample > 8) return 1;
-        return p->codec_id == AV_CODEC_ID_H264 && p->profile > AV_PROFILE_H264_HIGH;
-    }
-    return 0;
+/// The first video stream in the names and units Jellyfin uses, which are
+/// FFmpeg's own, so jf_tv_decodes can judge it the way it judges the server's
+/// description.
+int jf_demux_video(void *opaque, jf_video *out) {
+  struct jf_demux *d = opaque;
+  memset(out, 0, sizeof(*out));
+  for (unsigned i = 0; i < d->format->nb_streams; i++) {
+    const AVStream *stream = d->format->streams[i];
+    const AVCodecParameters *p = stream->codecpar;
+    if (p->codec_type != AVMEDIA_TYPE_VIDEO)
+      continue;
+    const char *profile = avcodec_profile_name(p->codec_id, p->profile);
+    snprintf(out->codec, sizeof(out->codec), "%s",
+             avcodec_get_name(p->codec_id));
+    snprintf(out->profile, sizeof(out->profile), "%s", profile ? profile : "");
+    const AVPixFmtDescriptor *format = av_pix_fmt_desc_get(p->format);
+    out->bit_depth = format ? (uint32_t)format->comp[0].depth
+                            : (uint32_t)p->bits_per_raw_sample;
+    out->width = (uint32_t)p->width;
+    out->height = (uint32_t)p->height;
+    const AVRational fps = stream->avg_frame_rate.num ? stream->avg_frame_rate
+                                                      : stream->r_frame_rate;
+    if (fps.num > 0 && fps.den > 0)
+      out->frame_rate = (float)av_q2d(fps);
+    if (p->bit_rate > 0)
+      out->bit_rate = (uint32_t)p->bit_rate;
+    return 1;
+  }
+  return 0;
 }
 
 /// Route this video stream through a bitstream filter when the container

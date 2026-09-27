@@ -130,8 +130,8 @@ cd "$BUILD_DIR"
     --disable-avdevice --disable-avfilter --disable-swscale \
     --disable-encoders --disable-muxers --disable-devices --disable-filters \
     --disable-hwaccels --disable-decoders \
-    --disable-demuxers --disable-protocols \
-    --enable-demuxer=matroska,mov,mpegts,mp3,flac,ogg,wav,aac,ac3 \
+    --disable-protocols \
+    --disable-demuxer=hls,dash,rtsp,sdp,rtp,sap \
     --enable-decoder=aac,aac_latm,ac3,eac3,mp3,flac,opus,vorbis,alac,dca,truehd,mlp \
     --enable-decoder=pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le \
     --enable-decoder=ass,ssa,subrip,srt,webvtt,movtext,text \
@@ -147,14 +147,16 @@ make -j"$(nproc)"
 make install ${DESTDIR:+DESTDIR="$DESTDIR"}
 
 INSTALLED="${DESTDIR}${PREFIX}/lib"
-for want in HTTPS_PROTOCOL MATROSKA_DEMUXER MOV_DEMUXER MPEGTS_DEMUXER AAC_DECODER \
+for want in HTTPS_PROTOCOL MATROSKA_DEMUXER MOV_DEMUXER MPEGTS_DEMUXER AVI_DEMUXER AAC_DECODER \
             AC3_DECODER H264_MP4TOANNEXB_BSF HEVC_MP4TOANNEXB_BSF EXTRACT_EXTRADATA_BSF \
             H264_PARSER HEVC_PARSER ASS_DECODER SUBRIP_DECODER MOVTEXT_DECODER WEBVTT_DECODER \
             PGSSUB_DECODER DVDSUB_DECODER; do
     grep -q "^#define CONFIG_$want 1$" config_components.h || {
         echo "error: CONFIG_$want is off" >&2; exit 1; }
 done
-UNWANTED="HLS_DEMUXER AVFILTER"
+# Every container, so what a library holds opens; but nothing that makes FFmpeg fetch
+# further URLs or open sockets of its own.
+UNWANTED="HLS_DEMUXER DASH_DEMUXER RTSP_DEMUXER UDP_PROTOCOL AVFILTER"
 [ "$HOST_BUILD" = 1 ] || UNWANTED="H264_DECODER $UNWANTED"
 for unwanted in $UNWANTED; do
     if grep -qs "^#define CONFIG_$unwanted 1$" config_components.h config.h; then

@@ -26,6 +26,12 @@
 bool jf_luna_register_lifecycle(void (*on_quit)(void), void (*on_relaunch)(void));
 void jf_luna_deinit(void);
 
+/* Asks for tv.model.supportHDR; jf_luna_hdr is 1 or 0 once it answers, and -1
+ * before then or off the TV. After jf_luna_register_lifecycle, whose loop
+ * delivers the answer. */
+void jf_luna_query_hdr(void);
+int jf_luna_hdr(void);
+
 /* Print every lifecycle payload. */
 extern bool jf_luna_log;
 
@@ -33,3 +39,5 @@ extern bool jf_luna_log;
  * lifecycle payload arrives as a flat C string and one field of it is not worth a JSON
  * parser. */
 bool jf_luna_json_string(const char *payload, const char *key, char *out, size_t out_len);
+/* The same for a boolean, at any depth: getConfigs nests its answers. */
+bool jf_luna_json_bool(const char *payload, const char *key, bool *out);

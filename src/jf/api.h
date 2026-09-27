@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "arena.h"
+#include "codecs.h"
 #include "image.h"
 #include "store.h"
 
@@ -68,6 +69,10 @@ typedef struct {
     bool played;
     uint32_t unplayed_item_count;
     bool has_unplayed_item_count;
+
+    /* MediaStreams' first video stream: only a single item's fetch has them. */
+    jf_video video;
+    bool has_video;
 } jf_item;
 
 bool jf_item_has_poster(const jf_item *item);
@@ -187,6 +192,9 @@ typedef enum {
   JF_JOB_PLAYBACK_PROGRESS,
   JF_JOB_PLAYBACK_INFO,
   JF_JOB_ADJACENT,
+  /* The server's hardware transcoding; refused unless the user is an
+   * administrator. */
+  JF_JOB_ENCODING,
 } jf_job;
 
 typedef enum { JF_IMAGE_PRIMARY, JF_IMAGE_BACKDROP } jf_image_kind;
@@ -231,6 +239,7 @@ typedef struct {
     jf_image image;
     bool has_image;
     jf_playback_info playback;
+    jf_server_transcode encoding;
     /* Every item's blurhash, JF_BLUR_COLUMNS cells to a row, ready to go into
      * the UI's atlas in one upload. NULL when no item has one. */
     uint8_t *blur;

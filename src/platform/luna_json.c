@@ -30,3 +30,25 @@ bool jf_luna_json_string(const char *payload, const char *key, char *out, size_t
     return true;
 }
 
+bool jf_luna_json_bool(const char *payload, const char *key, bool *out) {
+  char quoted[64];
+  if ((size_t)snprintf(quoted, sizeof(quoted), "\"%s\"", key) >= sizeof(quoted))
+    return false;
+  const char *at = strstr(payload, quoted);
+  if (at == NULL)
+    return false;
+  at += strlen(quoted);
+  while (*at == ' ')
+    at++;
+  if (*at++ != ':') /* the key was matched as a value */
+    return false;
+  while (*at == ' ')
+    at++;
+  if (strncmp(at, "true", 4) == 0)
+    *out = true;
+  else if (strncmp(at, "false", 5) == 0)
+    *out = false;
+  else
+    return false;
+  return true;
+}

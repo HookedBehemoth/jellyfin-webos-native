@@ -14,11 +14,14 @@ bool jf_luna_register_lifecycle(void (*quit)(void), void (*relaunch)(void))
 }
 
 void jf_luna_deinit(void) {}
+void jf_luna_query_hdr(void) {}
+int jf_luna_hdr(void) { return -1; }
 
 #else
 
 #include <glib.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -55,6 +58,35 @@ static bool on_message(LSHandle *handle, LSMessage *message, void *user)
         on_relaunch();
     return true;
 }
+
+static HContext hdr_context;
+static atomic_int hdr = -1;
+
+static bool on_hdr(LSHandle *handle, LSMessage *message, void *user) {
+  (void)handle;
+  (void)user;
+  bool value = false;
+  const char *payload = HLunaServiceMessage(message);
+  if (payload != NULL &&
+      jf_luna_json_bool(payload, "tv.model.supportHDR", &value))
+    atomic_store(&hdr, value);
+  else
+    fprintf(stderr, "supportHDR: %s\n",
+            payload != NULL ? payload : "(no reply)");
+  return true;
+}
+
+void jf_luna_query_hdr(void) {
+  memset(&hdr_context, 0, sizeof(hdr_context));
+  hdr_context.callback = on_hdr;
+  hdr_context.pub = 1;
+  if (HLunaServiceCall("luna://com.webos.service.config/getConfigs",
+                       "{\"configNames\":[\"tv.model.supportHDR\"]}",
+                       &hdr_context) != 0)
+    fprintf(stderr, "supportHDR: call failed\n");
+}
+
+int jf_luna_hdr(void) { return atomic_load(&hdr); }
 
 static void *run_loop(void *unused)
 {

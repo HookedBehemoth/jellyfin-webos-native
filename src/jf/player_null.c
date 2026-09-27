@@ -17,6 +17,7 @@
 #include <string.h>
 
 bool jf_player_audio = true;
+jf_decoders jf_player_decoders;
 bool jf_player_subtitles = true;
 const char *jf_player_audio_device = "default";
 

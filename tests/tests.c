@@ -13,6 +13,7 @@
 #include "jf/blurhash.h"
 #include "jf/cfg.h"
 #include "jf/clock.h"
+#include "jf/codecs.h"
 #include "jf/smp_payload.h"
 #include "jf/store.h"
 #include "platform/luna.h"
@@ -161,6 +162,13 @@ static void test_luna_event(void)
     CHECK(!jf_luna_json_string("{\"event\":42}", "event", event, sizeof(event)));
     /* The key must not be matched inside some other value. */
     CHECK(!jf_luna_json_string("{\"reason\":\"event\"}", "event", event, sizeof(event)));
+    bool hdr = false;
+    CHECK(jf_luna_json_bool("{\"configs\":{\"tv.model.supportHDR\": "
+                            "true},\"returnValue\":true}",
+                            "tv.model.supportHDR", &hdr) &&
+          hdr);
+    CHECK(!jf_luna_json_bool("{\"missingConfigs\":[\"tv.model.supportHDR\"]}",
+                             "tv.model.supportHDR", &hdr));
 }
 
 static void test_virtual_list(void)
@@ -609,6 +617,47 @@ static void test_blurhash(void) {
   CHECK(rgb[0] == 7);
 }
 
+static void test_video_path(void) {
+  jf_decoders tv = {0};
+  tv.max_width[JF_H264] = tv.max_width[JF_HEVC] = 4096;
+  tv.max_height[JF_H264] = tv.max_height[JF_HEVC] = 2176;
+  jf_server_transcode server = {
+      true, true, ",h264,hevc,msmpeg4v3,", true, false, false, false};
+  jf_video h264 = {"h264", "High", 8, 1920, 1080, 0, 0};
+  CHECK(jf_video_path_for(&h264, &tv, &server) == JF_DIRECT);
+  jf_video high10 = {"h264", "High 10", 10, 1920, 1080, 0, 0};
+  CHECK(jf_video_path_for(&high10, &tv, &server) == JF_SERVER_SOFTWARE);
+  jf_video hevc10 = {"hevc", "Main 10", 10, 3840, 2160, 0, 0};
+  CHECK(jf_video_path_for(&hevc10, &tv, &server) == JF_SERVER_HARDWARE);
+  jf_video rext = {"hevc", "Rext", 10, 3840, 2160, 0, 0};
+  CHECK(jf_video_path_for(&rext, &tv, &server) == JF_SERVER_SOFTWARE);
+  jf_video av1 = {"av1", "Main", 8, 1920, 1080, 0, 0};
+  CHECK(jf_video_path_for(&av1, &tv, &server) == JF_SERVER_SOFTWARE);
+  jf_video big = {"h264", "High", 8, 7680, 4320, 0, 0};
+  CHECK(jf_video_path_for(&big, &tv, &server) == JF_SERVER_HARDWARE);
+  /* A server that would not say is never blamed. */
+  const jf_server_transcode unknown = {0};
+  CHECK(jf_video_path_for(&av1, &tv, &unknown) == JF_SERVER_HARDWARE);
+  /* A codec this client has no name for still counts on the server. */
+  jf_video divx = {"msmpeg4v3", "", 8, 640, 480, 0, 0};
+  CHECK(jf_video_path_for(&divx, &tv, &server) == JF_SERVER_HARDWARE);
+  server.hardware = false;
+  CHECK(jf_video_path_for(&hevc10, &tv, &server) == JF_SERVER_SOFTWARE);
+  /* A TV that shows HDR decodes 10 bits, but never H.264 High 10. */
+  tv.deep = true;
+  CHECK(jf_tv_decodes(&hevc10, &tv));
+  CHECK(!jf_tv_decodes(&high10, &tv));
+  CHECK(!jf_tv_decodes(&rext, &tv));
+  tv.max_frame_rate[JF_HEVC] = 60;
+  tv.max_bit_rate[JF_HEVC] = 50000000;
+  jf_video fast = {"hevc", "Main", 8, 1920, 1080, 59.94f, 0};
+  CHECK(jf_tv_decodes(&fast, &tv));
+  fast.frame_rate = 120;
+  CHECK(!jf_tv_decodes(&fast, &tv));
+  jf_video heavy = {"hevc", "Main 10", 10, 3840, 2160, 23.976f, 80000000};
+  CHECK(!jf_tv_decodes(&heavy, &tv));
+}
+
 int main(void)
 {
   test_cfg_round_trip();
@@ -622,6 +671,7 @@ int main(void)
   test_luna_event();
   test_virtual_list();
   test_nav();
+  test_video_path();
   test_skyline();
 #ifdef JF_HAVE_DEMUX
     test_demux_open_failure();

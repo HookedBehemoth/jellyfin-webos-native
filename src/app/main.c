@@ -766,6 +766,18 @@ static uint32_t grid_requested[WINDOW_PAGES];
 /* Details and season screens. */
 static card detail;
 static char detail_extra[96];
+/* The details item's video, and who would decode it. */
+static jf_video detail_video;
+static bool detail_has_video;
+static jf_decoders decoders;
+static jf_server_transcode server_transcode;
+
+/* The probe, and 10-bit once the TV has said it shows HDR. */
+static const jf_decoders *tv_decoders(void) {
+  if (jf_luna_hdr() == 1)
+    decoders.deep = true;
+  return &decoders;
+}
 /* Backdrops live longer than a details screen. Track their transition here
  * rather than on the cache slot, so opening another item also fades an
  * already-resident texture in, while moving between a series and its seasons
@@ -883,6 +895,7 @@ static void load_home(void)
     simple(JF_JOB_RESUME);
     simple(JF_JOB_NEXT_UP);
     simple(JF_JOB_VIEWS);
+    simple(JF_JOB_ENCODING);
 }
 
 static void restart_discovery(void)
@@ -936,6 +949,7 @@ static void open_details(const card *source) {
   }
   detail = *source;
   detail_extra[0] = '\0';
+  detail_has_video = false;
   seasons_row.count = 0;
   seasons_row.loading = false;
   screen = SCREEN_DETAILS;
@@ -1143,6 +1157,8 @@ static const char *job_name(jf_job job)
       return "playback_info";
     case JF_JOB_ADJACENT:
       return "adjacent";
+    case JF_JOB_ENCODING:
+      return "encoding";
     }
     return "?";
 }
@@ -1237,6 +1253,11 @@ static void on_failure(jf_task *task)
         }
         set_error("%s failed: %s", job_name(task->job), task->error);
         break;
+    /* Not an administrator: the details screen cannot tell a hardware
+     * transcode from a software one, and says less. */
+    case JF_JOB_ENCODING:
+      server_transcode.known = false;
+      break;
     default:
         set_error("%s failed: %s", job_name(task->job), task->error);
         break;
@@ -1357,7 +1378,13 @@ static void consume(jf_task *task)
           detail.blur_height = opened.blur_height;
         }
         set_text(detail_extra, sizeof(detail_extra), task->one.official_rating);
+        detail_video = task->one.video;
+        detail_has_video = task->one.has_video;
         break;
+
+    case JF_JOB_ENCODING:
+      server_transcode = task->encoding;
+      break;
 
     case JF_JOB_SEASONS:
         if (strcmp(task->a, detail.id) != 0)
@@ -1794,6 +1821,7 @@ static void start_playback(const char *id, const char *title,
   jf_transcode_url(&session, id, transcode, sizeof(transcode));
   const uint64_t resume_ms = resume_ticks / 10000ull;
   const int start_ms = resume_ms > INT32_MAX ? INT32_MAX : (int)resume_ms;
+  jf_player_decoders = *tv_decoders();
   if (!jf_player_play(stream, transcode, gl_width, gl_height, start_ms)) {
     set_error("Playback failed: %s", jf_player_error());
     return;
@@ -2816,6 +2844,35 @@ static void draw_grid(loom_context *ctx, float width, float height, float scale)
     }
 }
 
+/* The codec, and a warning when the TV cannot decode it: the server has to
+ * transcode, which delays the start and every seek, and without a hardware
+ * decoder for it may not keep up at all. */
+static void draw_video_path(loom_context *ctx, loom_rect rect, float scale) {
+  if (!detail_has_video)
+    return;
+  /* loom keeps the pointer until the frame is drawn. */
+  static char line[192];
+  const char *label = jf_codec_label(jf_codec_from_name(detail_video.codec));
+  int n = snprintf(
+      line, sizeof(line), "%s%s%s", label != NULL ? label : detail_video.codec,
+      detail_video.profile[0] != '\0' ? " " : "", detail_video.profile);
+  if (detail_video.height != 0 && n > 0 && (size_t)n < sizeof(line))
+    n += snprintf(line + n, sizeof(line) - (size_t)n, " \xc2\xb7 %up",
+                  detail_video.height);
+  const jf_video_path path =
+      jf_video_path_for(&detail_video, tv_decoders(), &server_transcode);
+  const char *warning = path == JF_SERVER_HARDWARE
+                            ? " \xc2\xb7 Server sided hardware transcode"
+                            : " \xc2\xb7 Server sided software transcode";
+  if (path != JF_DIRECT && n > 0 && (size_t)n < sizeof(line))
+    snprintf(line + n, sizeof(line) - (size_t)n, "%s", warning);
+  loom_label(ctx, rect, NULL, line,
+             path == JF_DIRECT            ? DIM
+             : path == JF_SERVER_HARDWARE ? YELLOW
+                                          : RED,
+             22 * scale);
+}
+
 static void draw_details(loom_context *ctx, float width, float scale)
 {
     const float margin = 64 * scale;
@@ -2898,6 +2955,7 @@ static void draw_details(loom_context *ctx, float width, float scale)
         return;
     }
 
+    draw_video_path(ctx, (loom_rect){x, 480 * scale, w, 34 * scale}, scale);
     if (draw_button(ctx, (loom_rect){x, 570 * scale, 250 * scale, 74 * scale},
                     "Play", nav_str("details.play"), scale) &
         NAV_ACTIVATED)
@@ -3025,9 +3083,11 @@ static void draw_season(loom_context *ctx, float width, float height, float scal
     }
     nav_scroll_end(&ui);
     ctx->mask = outer;
-    if (chosen != NULL)
-      start_playback(chosen->id, chosen->episode_title, chosen->series_id,
-                     chosen->playback_position_ticks);
+    if (chosen != NULL) {
+      const card copy = *chosen;
+      push();
+      open_details(&copy);
+    }
 }
 
 /* A column at the right, clear of where dialogue sits, so the line a choice
@@ -3857,6 +3917,7 @@ int main(int argc, char **argv) {
            "%s/conf/preferences.ini", jf_store_root());
   load_preferences();
   log_to_file();
+  jf_decoders_probe(&decoders);
   const bool restored = jf_session_load(&session);
   if (session.url[0] != '\0') {
     set_text(server_url, sizeof(server_url), session.url);
@@ -3870,6 +3931,8 @@ int main(int argc, char **argv) {
   /* How the TV asks the app to close. Absent off-device, where nothing asks. */
   if (!jf_luna_register_lifecycle(jf_window_post_quit, jf_window_post_raise))
     fprintf(stderr, "no webOS lifecycle\n");
+  else
+    jf_luna_query_hdr();
 
   glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
   glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);

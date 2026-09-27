@@ -7,10 +7,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "codecs.h"
+
 /* Read when playback starts. */
 extern bool jf_player_audio;
 extern bool jf_player_subtitles;
 extern const char *jf_player_audio_device;
+/* What the TV decodes; a source beyond it is swapped for the server's
+ * transcode before anything is fed. */
+extern jf_decoders jf_player_decoders;
 
 typedef enum { JF_IDLE, JF_LOADING, JF_PLAYING, JF_FAILED } jf_player_state;
 
