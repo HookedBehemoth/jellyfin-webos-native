@@ -549,9 +549,7 @@ static void *audio_thread(void *unused) {
 /* The server's tracks, then any in the container it does not list; appended,
  * so an index the UI already holds stays put. The server's embedded tracks are
  * the container's in the same order, which is how they pair up: its indices
- * count files beside the video first.
- * ponytail: pairs with the container's decodable subtitle streams only, so an
- * undecodable one ahead of the rest would shift them. tracks_lock held. */
+ * count files beside the video first. tracks_lock held. */
 static void merge_tracks(void) {
   sub_track_count = !jf_player_subtitles ? 0 : server_track_count;
   memcpy(sub_tracks, server_tracks,
@@ -814,22 +812,26 @@ static void play_session_id(char *out, size_t out_len) {
                                 0x0000ffffffffffffULL));
 }
 
-/* The transcode's audio, by the server's number for the chosen stream. The
- * server numbers files beside the video first; the subtitle list says how many.
- * ponytail: an audio file beside the video would shift it too, and is not
- * counted - PlaybackInfo's audio streams would say. */
-static const char *audio_parameter(void) {
-  static char parameter[40];
-  parameter[0] = '\0';
-  if (played_audio_track < 0)
-    return parameter;
+/* The server's number for an audio track. The server numbers files beside the
+ * video first; the subtitle list says how many. */
+int jf_player_audio_stream(int track) {
+  if (track < 0 || track >= atomic_load(&audio_track_count))
+    return -1;
   int external = 0;
   pthread_mutex_lock(&tracks_lock);
   for (int i = 0; i < server_track_count; i++)
     external += server_tracks[i].external;
   pthread_mutex_unlock(&tracks_lock);
-  snprintf(parameter, sizeof(parameter), "&AudioStreamIndex=%d",
-           audio_tracks[played_audio_track].stream + external);
+  return audio_tracks[track].stream + external;
+}
+
+/* The transcode's audio, by the server's number for the chosen stream. */
+static const char *audio_parameter(void) {
+  static char parameter[40];
+  parameter[0] = '\0';
+  if (played_audio_track >= 0)
+    snprintf(parameter, sizeof(parameter), "&AudioStreamIndex=%d",
+             jf_player_audio_stream(played_audio_track));
   return parameter;
 }
 

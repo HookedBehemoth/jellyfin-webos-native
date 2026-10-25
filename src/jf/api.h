@@ -103,15 +103,19 @@ typedef struct {
   uint32_t start_index;
 } jf_item_list;
 
-/* A subtitle stream as the server lists it for playback: the container's own
- * and any file beside the video. */
+/* An audio or subtitle stream as the server lists it for playback: the
+ * container's own and any file beside the video. */
 typedef struct {
   int index;
   const char *title; /* DisplayTitle: language, name, codec */
   bool external;
   bool text;
   bool styled; /* ASS or SSA: text libass draws as the script styles it */
-} jf_subtitle_stream;
+  /* Language and Title as the container tags them, or NULL: what a choice is
+   * matched by in the series' next episode. */
+  const char *language;
+  const char *name;
+} jf_media_stream;
 
 /* A subtitle a provider on the server offers for an item. */
 typedef struct {
@@ -136,8 +140,12 @@ typedef struct {
   const char *media_source_id;
   /* What the user's subtitle preferences pick, -1 for none. */
   int default_subtitle;
-  jf_subtitle_stream *subtitles;
+  jf_media_stream *subtitles;
   size_t subtitle_count;
+  /* And for the audio, which only an episode's remembered choice overrides. */
+  int default_audio;
+  jf_media_stream *audio;
+  size_t audio_count;
 } jf_playback_info;
 
 typedef struct {
@@ -249,6 +257,10 @@ typedef enum {
    * its version: one plugin that searches many subtitle sites, where the
    * official repository has only OpenSubtitles. */
   JF_JOB_ADD_REPOSITORY,
+  /* Item `a` marked played, or with `start` 0 unplayed. */
+  JF_JOB_MARK_PLAYED,
+  /* What was added to library `a` last, newest first. */
+  JF_JOB_LATEST,
 } jf_job;
 
 typedef enum { JF_IMAGE_PRIMARY, JF_IMAGE_BACKDROP } jf_image_kind;
@@ -361,6 +373,27 @@ void *jf_api_connect(void);
 void jf_api_disconnect(void *connection);
 const char *jf_api_execute(void *connection, const jf_session *session,
                            jf_task *task);
+
+/* One of the user's items as the server now has it, from its event socket. */
+typedef struct {
+  char item_id[40];
+  bool played;
+  uint64_t position_ticks;
+  double played_percentage;
+  bool has_played_percentage;
+  uint32_t unplayed_item_count; /* a series' or season's */
+  bool has_unplayed_item_count;
+} jf_user_data;
+
+/* The server's event socket, held open on a thread of its own: `changed` is
+ * called, from that thread, whenever the server says the user's items changed.
+ * With the items' new state when it says - played, resumed - and with none
+ * when it only says something did: added, removed, or a reconnect, which may
+ * have missed some. Starting again replaces the session; stop before signing
+ * out. api_http.c against a server, api_mock.c in the UI tests. */
+void jf_events_start(const jf_session *session,
+                     void (*changed)(const jf_user_data *items, size_t count));
+void jf_events_stop(void);
 
 /* Exposed for the host tests. */
 void jf_url_escape(char *out, size_t out_len, const char *value);

@@ -38,6 +38,11 @@ One translation unit is C++: `src/jf/smp_shim.cpp`, a try/catch façade over
   All three ship inside the ipk. Required for both targets;
   `tools/build-libass.sh --host` also enables the subtitle test. They install
   where `LIBASS_ROOT` defaults to; override it with `-DLIBASS_ROOT=/path`.
+- libcurl, from `tools/build-curl.sh`, after the FFmpeg build whose mbedTLS it
+  uses — the firmware's is 7.82, older than the WebSockets the server's event
+  socket needs. Linked statically and hidden, so the TV's media pipeline keeps
+  the firmware's own. TV only; a desktop build uses the system's. It installs
+  where `CURL_ROOT` defaults to; override it with `-DCURL_ROOT=/path`.
 
 ## Build
 

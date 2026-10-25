@@ -87,9 +87,12 @@ else
     # Prefer our packages over sysroot
     export PKG_CONFIG_LIBDIR="$SYSROOT$PREFIX/lib/pkgconfig:$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig"
     export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+    # The NDK's headers predate getrandom(2), so mbedTLS would read /dev/random for
+    # entropy instead - which the app's jail does not have, and every TLS and PSA
+    # init fails there. The kernel has the call; 384 is its number on ARM EABI.
     SSL_CMAKE_ARGS=(
         -DCMAKE_TOOLCHAIN_FILE="$SDK/share/buildroot/toolchainfile.cmake"
-        -DCMAKE_C_FLAGS="-mthumb -mcpu=cortex-a55 -mfpu=neon-vfpv4 -mfloat-abi=softfp"
+        -DCMAKE_C_FLAGS="-mthumb -mcpu=cortex-a55 -mfpu=neon-vfpv4 -mfloat-abi=softfp -DSYS_getrandom=384"
     )
 fi
 

@@ -43,6 +43,10 @@ extern const char *jf_atlas_font;
 /* A soft round falloff, for a glow behind something. Coverage, not a
  * distance: the renderer draws it as it is. */
 #define JF_ICON_GLOW_TEXT "\xee\x80\x88"
+/* A checkbox, ticked and not. */
+#define JF_ICON_CHECKED "\xee\x80\x89"
+#define JF_ICON_UNCHECKED "\xee\x80\x8a"
+#define JF_ICON_LAST 0xe00au
 
 typedef struct {
   skyline_region region;

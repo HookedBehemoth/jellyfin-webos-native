@@ -205,15 +205,41 @@ static void test_rows(void) {
   walk_row(false);
   animations_enabled = animated;
 
+  /* The server's order: libraries above, what was added below. */
   press(DOWN);
   CHECK(ui.focus == home_card(ROW_NEXT_UP, "episode-0-2-1"));
   press(DOWN);
+  CHECK(ui.focus == home_card(ROW_LATEST, "movie-100"));
+  CHECK(strcmp(rows[ROW_LATEST].title, "Recently Added in Movies") == 0);
+  CHECK(strcmp(rows[ROW_LATEST + 1].title, "Recently Added in Shows") == 0);
+  CHECK(rows[ROW_LATEST + 1].count == MOCK_LATEST &&
+        !row_shown(ROW_LATEST + 2));
+  press(DOWN);
+  CHECK(ui.focus == home_card(ROW_LATEST + 1, "series-0"));
+  CHECK(focus_in_view());
+  capture("home-latest");
+  presses(UP, 3);
+  CHECK(ui.focus == home_card(ROW_RESUME, "movie-0"));
+  press(UP);
   CHECK(ui.focus == home_card(ROW_LIBRARIES, "library-movies"));
   CHECK(focus_in_view());
-  press(UP);
-  CHECK(ui.focus == home_card(ROW_NEXT_UP, "episode-0-2-1"));
-  press(UP);
+  press(DOWN);
   CHECK(ui.focus == home_card(ROW_RESUME, "movie-0"));
+
+  /* The server says something changed: the rows are asked again at once on
+   * this screen, and on coming back to it from another. */
+  const unsigned asked = mock_calls(JF_JOB_RESUME);
+  mock_event(NULL, 0);
+  test_ui_settle();
+  CHECK(mock_calls(JF_JOB_RESUME) == asked + 1);
+  CHECK(ui.focus == home_card(ROW_RESUME, "movie-0"));
+  press(OK);
+  CHECK(screen == SCREEN_DETAILS);
+  mock_event(NULL, 0);
+  test_ui_settle();
+  CHECK(mock_calls(JF_JOB_RESUME) == asked + 1);
+  press(BACK);
+  CHECK(screen == SCREEN_HOME && mock_calls(JF_JOB_RESUME) == asked + 2);
 }
 
 /* A token the server stopped accepting mid-session: the stored password signs
@@ -288,9 +314,14 @@ static void test_grid_not_found(void) {
 
 static void test_series(void) {
   open_library("library-shows");
+  const unsigned items = mock_calls(JF_JOB_ITEM);
   press(OK);
   CHECK(screen == SCREEN_DETAILS);
   CHECK(strcmp(detail.id, "series-0") == 0);
+  /* One request: the grid card and the seasons carry the show. */
+  CHECK(mock_calls(JF_JOB_ITEM) == items);
+  CHECK(strcmp(detail.backdrop_id, "series-0") == 0);
+  CHECK(detail.remaining == (MOCK_SEASONS - 1) * MOCK_EPISODES);
   /* The first season is watched, so it opens on the second. */
   CHECK(ui.focus == in_list("series-0", "season-0-2"));
   press(LEFT);
@@ -503,6 +534,78 @@ static void test_playback(void) {
   CHECK(ui.focus == episode);
 }
 
+void player_mock_end(void);
+
+/* A subtitle and audio chosen in one episode are the next one's too, whatever
+ * the server picks; and an episode that plays out goes on into the next. */
+static void test_next_episode(void) {
+  open_library("library-shows");
+  press(OK);
+  press(OK);
+  press(OK);
+  press(OK);
+  CHECK(screen == SCREEN_PLAYBACK && next_episode.present);
+  press(KEY_SUBTITLE);
+  presses(DOWN, 2);
+  CHECK(strcmp(jf_player_subtitle_name(jf_player_subtitle_current()),
+               "German - ASS") == 0);
+  press(BACK);
+  CHECK(strstr(mock_saved_delays(), "\"sub:series-0\":\"ger_\"") != NULL);
+  jf_player_audio_select(1);
+
+  char next[sizeof(next_episode.id)];
+  set_text(next, sizeof(next), next_episode.id);
+  /* Before the credits, where it was is what is reported. */
+  jf_player_seek_to(35 * 60000);
+  player_mock_end();
+  test_ui_settle();
+  CHECK(screen == SCREEN_PLAYBACK);
+  CHECK(strcmp(playback_item_id, next) == 0);
+  CHECK(strcmp(jf_player_subtitle_name(jf_player_subtitle_current()),
+               "German - ASS") == 0);
+  CHECK(jf_player_audio_current() == 1);
+  CHECK(mock_progress_ms() == 35 * 60000);
+  /* Leaving during them is the end, which the server counts as watched. */
+  jf_player_seek_to(41 * 60000);
+  press(BACK);
+  test_ui_settle();
+  CHECK(mock_progress_ms() == (uint64_t)jf_player_duration());
+  CHECK(screen == SCREEN_DETAILS);
+
+  /* Beside Play, a checkbox that marks it played on the server, and back. */
+  press(RIGHT);
+  CHECK(ui.focus == nav_str("details.played"));
+  const bool played = detail.played;
+  press(OK);
+  CHECK(mock_calls(JF_JOB_MARK_PLAYED) == 1 && detail.played == !played);
+  capture("details-played");
+  press(OK);
+  CHECK(mock_calls(JF_JOB_MARK_PLAYED) == 2 && detail.played == played);
+
+  /* Another device's progress shows on every card of the item at once, and a
+   * season's count with it - nothing asked again. */
+  const unsigned episodes = mock_calls(JF_JOB_EPISODES);
+  jf_user_data elsewhere[2] = {
+      {.position_ticks = 600000000,
+       .played_percentage = 25,
+       .has_played_percentage = true},
+      {.unplayed_item_count = 0, .has_unplayed_item_count = true}};
+  set_text(elsewhere[0].item_id, sizeof(elsewhere[0].item_id), detail.id);
+  set_text(elsewhere[1].item_id, sizeof(elsewhere[1].item_id),
+           season_detail.id);
+  mock_event(elsewhere, 2);
+  test_ui_settle();
+  CHECK(!detail.played && detail.progress == 25 &&
+        detail.playback_position_ticks == 600000000);
+  CHECK(season_detail.played && season_detail.remaining == 0);
+  bool listed = false;
+  for (size_t i = 0; i < episodes_row.count; i++)
+    if (strcmp(episodes_row.cards[i].id, detail.id) == 0)
+      listed = episodes_row.cards[i].progress == 25;
+  CHECK(listed && mock_calls(JF_JOB_EPISODES) == episodes);
+  go_home();
+}
+
 static void test_settings(void) {
   go_home();
   nav_focus(&ui, home_card(ROW_RESUME, "movie-0"));
@@ -559,6 +662,7 @@ int main(int argc, char **argv) {
   test_series();
   test_slow_details();
   test_playback();
+  test_next_episode();
   test_settings();
 
   app_deinit();

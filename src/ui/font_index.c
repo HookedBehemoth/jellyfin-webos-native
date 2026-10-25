@@ -137,7 +137,9 @@ static void scan_dir(FT_Library library, const char *dir, int depth) {
     if (e->d_name[0] == '.')
       continue;
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+    if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >=
+        (int)sizeof(path))
+      continue; /* cut short, it would name some other file */
     if (is_font_file(e->d_name)) {
       font f;
       if (read_font(library, path, &f)) {

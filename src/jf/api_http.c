@@ -5,12 +5,16 @@
  */
 #include "api.h"
 
+#include <ctype.h>
 #include <curl/curl.h>
 #include <json.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "../platform/os.h"
 
@@ -316,8 +320,10 @@ static bool parse_item_list(jf_arena *arena, const char *body,
     return false;
   memset(out, 0, sizeof(*out));
 
-  json_object *items = NULL;
-  if (json_object_object_get_ex(root, "Items", &items) &&
+  /* A page of items, or - /Items/Latest - the items alone. */
+  json_object *items = root;
+  if ((json_object_get_type(root) == json_type_array ||
+       json_object_object_get_ex(root, "Items", &items)) &&
       json_object_get_type(items) == json_type_array) {
     const size_t count = json_object_array_length(items);
     out->items = jf_arena_alloc(arena, count * sizeof(jf_item));
@@ -616,6 +622,18 @@ static http_result execute(CURL *curl, const jf_session *session,
              jf_session_base(session, base, sizeof(base)), session->user_id);
     return get_list(curl, arena, session, url, &task->list);
 
+  case JF_JOB_LATEST: {
+    /* Episodes of one series come as the series, as on the server's own
+     * home screen. */
+    char parent[256];
+    jf_url_escape(parent, sizeof(parent), task->a);
+    snprintf(url, sizeof(url),
+             "%s/Items/Latest?userId=%s&parentId=%s&limit=24&fields=Overview",
+             jf_session_base(session, base, sizeof(base)), session->user_id,
+             parent);
+    return get_list(curl, arena, session, url, &task->list);
+  }
+
   case JF_JOB_CHILDREN: {
     /* sortBy=SortName keeps paging stable, which is the whole reason a virtual
      * grid can ask for the window [start, start+limit). */
@@ -687,7 +705,7 @@ static http_result execute(CURL *curl, const jf_session *session,
     jf_url_escape(series, sizeof(series), task->a);
     snprintf(url, sizeof(url),
              "%s/Shows/%s/"
-             "Seasons?userId=%s&fields=ChildCount,Overview&enableImages=true"
+             "Seasons?userId=%s&fields=ChildCount,Overview&imageTypeLimit=1"
              "&enableUserData=true",
              jf_session_base(session, base, sizeof(base)), series,
              session->user_id);
@@ -999,6 +1017,16 @@ static http_result execute(CURL *curl, const jf_session *session,
                         &size);
   }
 
+  case JF_JOB_MARK_PLAYED: {
+    char id[256];
+    jf_url_escape(id, sizeof(id), task->a);
+    snprintf(url, sizeof(url), "%s/UserPlayedItems/%s?userId=%s",
+             jf_session_base(session, base, sizeof(base)), id,
+             session->user_id);
+    return send_request(curl, arena, session, task->start ? "POST" : "DELETE",
+                        url, NULL, &body, &size);
+  }
+
   case JF_JOB_PLAYBACK_INFO: {
     char id[256];
     jf_url_escape(id, sizeof(id), task->a);
@@ -1015,15 +1043,15 @@ static http_result execute(CURL *curl, const jf_session *session,
   return HTTP_STATUS;
 }
 
-/* The first media source's subtitle streams. The server applies the user's
- * subtitle mode and language to pick the default, which is the point of asking
- * it rather than reading the container. */
+/* The first media source's audio and subtitle streams. The server applies the
+ * user's language preferences to pick the defaults, which is the point of
+ * asking it rather than reading the container. */
 static http_result parse_playback_info(jf_arena *arena, const char *body,
                                        jf_playback_info *out) {
   json_object *root = json_tokener_parse(body);
   if (root == NULL)
     return HTTP_STATUS;
-  *out = (jf_playback_info){NULL, -1, NULL, 0};
+  *out = (jf_playback_info){NULL, -1, NULL, 0, -1, NULL, 0};
   json_object *sources = NULL, *source = NULL, *streams = NULL;
   if (json_object_object_get_ex(root, "MediaSources", &sources) &&
       json_object_get_type(sources) == json_type_array &&
@@ -1034,22 +1062,31 @@ static http_result parse_playback_info(jf_arena *arena, const char *body,
     double number = 0;
     if (json_number(source, "DefaultSubtitleStreamIndex", &number))
       out->default_subtitle = (int)number;
+    if (json_number(source, "DefaultAudioStreamIndex", &number))
+      out->default_audio = (int)number;
     if (json_object_object_get_ex(source, "MediaStreams", &streams) &&
         json_object_get_type(streams) == json_type_array) {
       const size_t length = json_object_array_length(streams);
       out->subtitles = jf_arena_alloc(arena, (length ? length : 1) *
                                                  sizeof(*out->subtitles));
-      for (size_t i = 0; out->subtitles != NULL && i < length; i++) {
+      out->audio =
+          jf_arena_alloc(arena, (length ? length : 1) * sizeof(*out->audio));
+      for (size_t i = 0;
+           out->subtitles != NULL && out->audio != NULL && i < length; i++) {
         json_object *stream = json_object_array_get_idx(streams, i);
         const char *type = json_string(arena, stream, "Type");
-        if (type == NULL || strcmp(type, "Subtitle") != 0 ||
+        const bool audio = type != NULL && strcmp(type, "Audio") == 0;
+        if (type == NULL || (!audio && strcmp(type, "Subtitle") != 0) ||
             !json_number(stream, "Index", &number))
           continue;
-        jf_subtitle_stream *sub = &out->subtitles[out->subtitle_count++];
+        jf_media_stream *sub = audio ? &out->audio[out->audio_count++]
+                                     : &out->subtitles[out->subtitle_count++];
         sub->index = (int)number;
         sub->title = json_string(arena, stream, "DisplayTitle");
         if (sub->title == NULL)
           sub->title = "Subtitles";
+        sub->language = json_string(arena, stream, "Language");
+        sub->name = json_string(arena, stream, "Title");
         sub->external = json_flag(stream, "IsExternal");
         sub->text = json_flag(stream, "IsTextSubtitleStream");
         const char *codec = json_string(arena, stream, "Codec");
@@ -1078,7 +1115,11 @@ static const char *result_name(http_result result) {
 }
 
 static pthread_once_t curl_once = PTHREAD_ONCE_INIT;
-static void curl_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
+/* Without it every request fails before it is made, so it says why. */
+static void curl_init(void) {
+  const CURLcode result = curl_global_init(CURL_GLOBAL_DEFAULT);
+  fprintf(stderr, "%s: %s\n", curl_version(), curl_easy_strerror(result));
+}
 
 void *jf_api_connect(void) {
   pthread_once(&curl_once, curl_init);
@@ -1096,4 +1137,196 @@ const char *jf_api_execute(void *connection, const jf_session *session,
                                  ? execute(connection, session, task)
                                  : HTTP_REQUEST_FAILED;
   return result == HTTP_OK ? NULL : result_name(result);
+}
+
+/* ------------------------------------------------------------------ events
+ *
+ * curl's WebSocket in its callback mode: the transfer is the connection, the
+ * write callback gets the server's messages, and the progress callback - about
+ * once a second, idle or not - sends the keep-alive and notices a stop. */
+
+static struct {
+  pthread_t thread;
+  bool running; /* the UI thread's */
+  atomic_bool stop;
+  jf_session session;
+  void (*changed)(const jf_user_data *items, size_t count);
+  response message;
+  bool overflowed;
+  bool connected, ever_connected;
+  time_t keep_alive_at;
+} events;
+
+/* Bigger is a long LibraryChanged, which means a change all the same. */
+#define EVENT_MESSAGE_MAX (4u << 20)
+/* A UserDataChanged naming more is passed on as a change with none: the UI
+ * fetches what it shows again. */
+#define EVENT_ITEMS 64
+
+/* Its UserDataList, in `out`; false when there is more than fits. */
+static bool event_user_data(json_object *root, jf_user_data *out,
+                            size_t *count) {
+  json_object *data = NULL, *list = NULL;
+  *count = 0;
+  if (!json_object_object_get_ex(root, "Data", &data) ||
+      !json_object_object_get_ex(data, "UserDataList", &list) ||
+      json_object_get_type(list) != json_type_array)
+    return false;
+  const size_t length = json_object_array_length(list);
+  if (length > EVENT_ITEMS)
+    return false;
+  for (size_t i = 0; i < length; i++) {
+    json_object *entry = json_object_array_get_idx(list, i), *value = NULL;
+    jf_user_data *item = &out[*count];
+    *item = (jf_user_data){0};
+    if (!json_object_object_get_ex(entry, "ItemId", &value))
+      continue;
+    /* The API's own ids: hex, without the dashes a Guid may be sent with. */
+    size_t at = 0;
+    for (const char *c = json_object_get_string(value);
+         c != NULL && *c != '\0' && at + 1 < sizeof(item->item_id); c++)
+      if (*c != '-')
+        item->item_id[at++] = (char)tolower((unsigned char)*c);
+    double number = 0;
+    item->played = json_flag(entry, "Played");
+    if (json_number(entry, "PlaybackPositionTicks", &number) && number > 0)
+      item->position_ticks = (uint64_t)number;
+    item->has_played_percentage =
+        json_number(entry, "PlayedPercentage", &item->played_percentage);
+    item->has_unplayed_item_count =
+        json_number(entry, "UnplayedItemCount", &number);
+    item->unplayed_item_count = (uint32_t)number;
+    (*count)++;
+  }
+  return true;
+}
+
+static void event_message(void) {
+  static jf_user_data items[EVENT_ITEMS];
+  const char *type = NULL;
+  json_object *root =
+      events.overflowed
+          ? NULL
+          : json_tokener_parse((const char *)events.message.bytes);
+  json_object *value = NULL;
+  if (root != NULL && json_object_object_get_ex(root, "MessageType", &value))
+    type = json_object_get_string(value);
+  size_t count = 0;
+  if (same(type, "UserDataChanged") && event_user_data(root, items, &count))
+    events.changed(items, count);
+  else if (events.overflowed || same(type, "UserDataChanged") ||
+           same(type, "LibraryChanged"))
+    events.changed(NULL, 0);
+  json_object_put(root);
+}
+
+static size_t event_data(char *data, size_t size, size_t count, void *user) {
+  const size_t length = size * count;
+  const struct curl_ws_frame *frame = curl_ws_meta(user);
+  if (frame == NULL || !(frame->flags & CURLWS_TEXT))
+    return length;
+  /* The first word from the server is its keep-alive interval: connected. */
+  if (!events.connected) {
+    events.connected = true;
+    fprintf(stderr, "events: connected\n");
+    if (events.ever_connected)
+      events.changed(NULL, 0);
+    events.ever_connected = true;
+  }
+  if (events.message.size + length > EVENT_MESSAGE_MAX)
+    events.overflowed = true;
+  else if (collect(data, 1, length, &events.message) != length)
+    events.overflowed = true;
+  if (frame->bytesleft == 0 && !(frame->flags & CURLWS_CONT)) {
+    event_message();
+    events.message.size = 0;
+    events.overflowed = false;
+  }
+  return length;
+}
+
+static int event_tick(void *user, curl_off_t a, curl_off_t b, curl_off_t c,
+                      curl_off_t d) {
+  (void)a, (void)b, (void)c, (void)d;
+  if (atomic_load(&events.stop))
+    return 1;
+  /* The server drops a socket silent for its interval, a minute by default. */
+  const time_t now = time(NULL);
+  if (events.connected && now >= events.keep_alive_at) {
+    static const char keep_alive[] = "{\"MessageType\":\"KeepAlive\"}";
+    size_t sent = 0;
+    curl_ws_send(user, keep_alive, sizeof(keep_alive) - 1, &sent, 0,
+                 CURLWS_TEXT);
+    events.keep_alive_at = now + 30;
+  }
+  return 0;
+}
+
+static void *events_thread(void *unused) {
+  (void)unused;
+  pthread_once(&curl_once, curl_init);
+  CURL *curl = curl_easy_init();
+  if (curl == NULL)
+    fprintf(stderr, "events: no curl\n");
+  char authorization[768], header[832], base[512], url[600];
+  jf_session_authorization(&events.session, authorization,
+                           sizeof(authorization));
+  snprintf(header, sizeof(header), "Authorization: %s", authorization);
+  struct curl_slist *headers = curl_slist_append(NULL, header);
+  /* ws:// for http://, wss:// for https://. */
+  const char *address = jf_session_base(&events.session, base, sizeof(base));
+  snprintf(url, sizeof(url), "ws%s/socket", address + 4);
+  unsigned backoff = 1;
+  if (strncmp(address, "http", 4) != 0)
+    atomic_store(&events.stop, true);
+  while (curl != NULL && !atomic_load(&events.stop)) {
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, event_data);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, curl);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, event_tick);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, curl);
+    events.connected = false;
+    events.keep_alive_at = time(NULL) + 30;
+    events.message.size = 0;
+    events.overflowed = false;
+    const CURLcode result = curl_easy_perform(curl);
+    if (atomic_load(&events.stop))
+      break;
+    fprintf(stderr, "events: %s, again in %u s\n", curl_easy_strerror(result),
+            backoff);
+    backoff = events.connected ? 1 : backoff;
+    for (unsigned i = 0; i < backoff && !atomic_load(&events.stop); i++)
+      sleep(1);
+    backoff = backoff < 60 ? backoff * 2 : 60;
+  }
+  curl_slist_free_all(headers);
+  if (curl != NULL)
+    curl_easy_cleanup(curl);
+  free(events.message.bytes);
+  events.message = (response){NULL, 0, 0};
+  return NULL;
+}
+
+void jf_events_stop(void) {
+  if (!events.running)
+    return;
+  atomic_store(&events.stop, true);
+  pthread_join(events.thread, NULL);
+  events.running = false;
+}
+
+void jf_events_start(const jf_session *session,
+                     void (*changed)(const jf_user_data *items, size_t count)) {
+  jf_events_stop();
+  events.session = *session;
+  events.changed = changed;
+  events.ever_connected = false;
+  atomic_store(&events.stop, false);
+  events.running =
+      pthread_create(&events.thread, NULL, events_thread, NULL) == 0;
 }

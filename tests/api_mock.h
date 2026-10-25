@@ -20,6 +20,8 @@
 #define MOCK_SEASONS 3
 #define MOCK_EPISODES 12
 #define MOCK_RESUME 12
+/* Each library's recently added: films 100 on, or the first shows. */
+#define MOCK_LATEST 4
 #define MOCK_NEXT_UP 10
 
 /* Back to the library as above: no failures, nothing held, no calls counted.
@@ -39,6 +41,11 @@ void mock_release(jf_job job);
 unsigned mock_held(void);
 /* The JSON the last JF_JOB_SAVE_DELAYS sent; empty since reset. */
 const char *mock_saved_delays(void);
+/* The server's event socket saying the user's items changed: these, or with
+ * none, something. */
+void mock_event(const jf_user_data *items, size_t count);
+/* The position the last progress report gave, in milliseconds. */
+uint64_t mock_progress_ms(void);
 /* Requests of `job` answered or failed since reset. */
 unsigned mock_calls(jf_job job);
 

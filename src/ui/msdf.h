@@ -8,10 +8,6 @@
  *
  * Each texel is distance / range + 0.5, so 0.5 is the edge, above is inside,
  * and `range` pixels of distance span the whole byte.
- *
- * ponytail: no overlapping-contour combiner. Variable fonts with overlapping
- * contours can show a hairline where two contours cross; msdfgen's
- * OverlappingContourCombiner is the fix if one ever matters.
  */
 #pragma once
 

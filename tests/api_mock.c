@@ -8,12 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define JOBS (JF_JOB_ADD_REPOSITORY + 1)
+#define JOBS (JF_JOB_LATEST + 1)
 
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 /* What the server keeps: the delays last saved, and whether a subtitle was
  * downloaded, which lists one more file beside the video. */
 static char saved_delays[1024];
+static uint64_t progress_ticks;
 static bool downloaded;
 static unsigned listed_after;
 /* The subtitle sources, as the official repository has them: OpenSubtitles,
@@ -56,6 +57,7 @@ void mock_reset(void) {
 }
 
 const char *mock_saved_delays(void) { return saved_delays; }
+uint64_t mock_progress_ms(void) { return progress_ticks / 10000; }
 
 void mock_fail(jf_job job, int status, unsigned count) {
   pthread_mutex_lock(&mutex);
@@ -146,6 +148,8 @@ static void season(jf_arena *arena, unsigned s, unsigned n, jf_item *out) {
   out->series_id = text(arena, "series-%u", s);
   out->series_name = text(arena, "Series %02u", s);
   out->series_primary_image_tag = text(arena, "tag-series-%u", s);
+  out->parent_backdrop_item_id = out->series_id;
+  out->parent_backdrop_image_tag = text(arena, "tag-backdrop-%u", s);
   out->index_number = n;
   out->child_count = MOCK_EPISODES;
   out->has_child_count = true;
@@ -264,6 +268,17 @@ static const char *answer(const jf_session *session, jf_task *task) {
     }
     list(task, MOCK_RESUME, MOCK_RESUME);
     return NULL;
+  case JF_JOB_LATEST: {
+    const bool movies = strcmp(task->a, "library-movies") == 0;
+    task->list.items = items(arena, MOCK_LATEST);
+    for (unsigned i = 0; i < MOCK_LATEST; i++)
+      if (movies)
+        movie(arena, 100 + i, &task->list.items[i]);
+      else
+        series(arena, i, &task->list.items[i]);
+    list(task, MOCK_LATEST, MOCK_LATEST);
+    return NULL;
+  }
   case JF_JOB_NEXT_UP:
     task->list.items = items(arena, MOCK_NEXT_UP);
     for (unsigned i = 0; i < MOCK_NEXT_UP; i++)
@@ -321,11 +336,14 @@ static const char *answer(const jf_session *session, jf_task *task) {
     task->has_image = poster(task->a, &task->image);
     return task->has_image ? NULL : "HttpStatus";
   case JF_JOB_PLAYBACK_STARTED:
+    return NULL;
   case JF_JOB_PLAYBACK_PROGRESS:
+    progress_ticks = task->position_ticks;
     return NULL;
   case JF_JOB_PLAYBACK_INFO: {
     static const char *const titles[] = {"English - SRT", "German - ASS",
                                          "Japanese - PGS"};
+    static const char *const languages[] = {"eng", "ger", "jpn"};
     jf_playback_info *info = &task->playback;
     info->media_source_id = jf_arena_strdup(arena, task->a);
     info->default_subtitle = -1;
@@ -334,11 +352,18 @@ static const char *answer(const jf_session *session, jf_task *task) {
     if (listed_after > 0)
       listed_after--;
     else if (downloaded)
-      info->subtitles[info->subtitle_count++] =
-          (jf_subtitle_stream){1, "Thai - Downloaded", true, true, false};
+      info->subtitles[info->subtitle_count++] = (jf_media_stream){
+          1, "Thai - Downloaded", true, true, false, "tha", NULL};
     for (int i = 0; i < 3; i++)
-      info->subtitles[info->subtitle_count++] =
-          (jf_subtitle_stream){i + 2, titles[i], i == 0, i < 2, i == 1};
+      info->subtitles[info->subtitle_count++] = (jf_media_stream){
+          i + 2, titles[i], i == 0, i < 2, i == 1, languages[i], NULL};
+    /* The player mock's two audio tracks, numbered as it numbers them. */
+    info->default_audio = 0;
+    info->audio = jf_arena_alloc(arena, 2 * sizeof(*info->audio));
+    info->audio[info->audio_count++] =
+        (jf_media_stream){0, "English", false, false, false, "eng", NULL};
+    info->audio[info->audio_count++] =
+        (jf_media_stream){1, "Commentary", false, false, false, "eng", "Comm"};
     return NULL;
   }
   case JF_JOB_DELAYS: {
@@ -399,6 +424,7 @@ static const char *answer(const jf_session *session, jf_task *task) {
     subbuzz_listed = true;
     return NULL;
   case JF_JOB_RESTART:
+  case JF_JOB_MARK_PLAYED:
     return NULL;
   case JF_JOB_SUBTITLE_CHECK:
     return downloaded ? NULL : "ClientError";
@@ -429,6 +455,19 @@ static const char *failure(int status) {
 }
 
 /* --------------------------------------------------------------- transport */
+
+/* The event socket: nothing connects, and mock_event says what one would. */
+static void (*event_changed)(const jf_user_data *items, size_t count);
+void jf_events_start(const jf_session *session,
+                     void (*changed)(const jf_user_data *items, size_t count)) {
+  (void)session;
+  event_changed = changed;
+}
+void jf_events_stop(void) { event_changed = NULL; }
+void mock_event(const jf_user_data *items, size_t count) {
+  if (event_changed != NULL)
+    event_changed(items, count);
+}
 
 void *jf_api_connect(void) { return &rules; }
 void jf_api_disconnect(void *connection) { (void)connection; }

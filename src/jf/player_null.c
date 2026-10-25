@@ -54,6 +54,10 @@ const char *jf_player_audio_name(int track) {
   (void)track;
   return "";
 }
+int jf_player_audio_stream(int track) {
+  (void)track;
+  return -1;
+}
 int jf_player_audio_current(void) { return -1; }
 void jf_player_audio_select(int track) { (void)track; }
 

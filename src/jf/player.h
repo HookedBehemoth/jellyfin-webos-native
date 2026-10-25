@@ -40,6 +40,8 @@ int jf_player_chapters(const int **starts_ms);
  * to the current position with it. */
 int jf_player_audio_count(void);
 const char *jf_player_audio_name(int track);
+/* The server's index for audio track `track`, -1 for none. */
+int jf_player_audio_stream(int track);
 int jf_player_audio_current(void);
 void jf_player_audio_select(int track);
 

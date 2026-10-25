@@ -208,6 +208,15 @@ static float arc(float px, float py, float cx, float cy, float r, float width,
   return fminf(hypotf(px - ax, py - ay), hypotf(px - bx, py - by)) - width / 2;
 }
 
+/* A stroke of `width` from a to b, with round ends. */
+static float segment(float px, float py, float ax, float ay, float bx, float by,
+                     float width) {
+  const float dx = bx - ax, dy = by - ay;
+  const float t = fminf(
+      fmaxf(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy), 0), 1);
+  return hypotf(px - ax - t * dx, py - ay - t * dy) - width / 2;
+}
+
 static float icon_distance(uint32_t codepoint, float x, float y) {
   const float pi = (float)M_PI;
   switch (codepoint) {
@@ -245,6 +254,12 @@ static float icon_distance(uint32_t codepoint, float x, float y) {
                  fminf(arc(x, y, 12, 12, 4.5f, 2, -0.85f, 1.7f),
                        arc(x, y, 12, 12, 8, 2, -0.9f, 1.8f)));
   }
+  case JF_ICON_BASE + 9: /* checked: a filled box with the tick cut out */
+    return fmaxf(box(x, y, 3, 3, 18, 18, 3),
+                 -fminf(segment(x, y, 7, 12.5f, 10.5f, 16, 2.5f),
+                        segment(x, y, 10.5f, 16, 17, 8.5f, 2.5f)));
+  case JF_ICON_BASE + 10: /* unchecked: the box's outline alone */
+    return fabsf(box(x, y, 4, 4, 16, 16, 2)) - 1;
   }
   return INFINITY;
 }
@@ -286,7 +301,7 @@ static void ensure(jf_atlas *atlas, uint32_t codepoint) {
     return;
   slot->occupied = true;
   slot->codepoint = codepoint;
-  if (codepoint >= JF_ICON_BASE && codepoint <= JF_ICON_GLOW) {
+  if (codepoint >= JF_ICON_BASE && codepoint <= JF_ICON_LAST) {
     slot->found = rasterise_icon(atlas, codepoint, &slot->glyph);
     return;
   }

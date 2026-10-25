@@ -174,7 +174,21 @@ if (NOT HAVE_PLATFORM)
     return()
 endif ()
 
-pkg_check_modules(LIBCURL libcurl)
+if (TARGET_WEBOS)
+    # Ours, for WebSockets: static, and hidden in the binary so the firmware's own
+    # libcurl.so.4 stays the media pipeline's. See tools/build-curl.sh.
+    set(CURL_ROOT "${WEBOS_SDK}/arm-webos-linux-gnueabi/sysroot/usr/local/curl"
+            CACHE PATH "libcurl prefix")
+    if (NOT EXISTS "${CURL_ROOT}/lib/libcurl.a")
+        message(FATAL_ERROR "No libcurl at ${CURL_ROOT} - run tools/build-curl.sh")
+    endif ()
+    set(LIBCURL_FOUND ON)
+    set(LIBCURL_INCLUDE_DIRS "${CURL_ROOT}/include")
+    set(LIBCURL_LIBRARY_DIRS "${FFMPEG_ROOT}/lib")
+    set(LIBCURL_LIBRARIES "${CURL_ROOT}/lib/libcurl.a" mbedtls mbedx509 mbedcrypto z)
+else ()
+    pkg_check_modules(LIBCURL libcurl)
+endif ()
 pkg_check_modules(LIBPNG libpng16)
 if (TARGET_WEBOS)
     # Static: the NDK ships libjson-c.a, so nothing has to be bundled or assumed present
@@ -215,7 +229,8 @@ foreach (_license agpl_3_0|${CMAKE_SOURCE_DIR}/LICENSE.txt
         apache_2_0|${CMAKE_SOURCE_DIR}/assets/licenses/apache-2.0.txt
         libass|${CMAKE_SOURCE_DIR}/assets/licenses/libass.txt
         harfbuzz|${CMAKE_SOURCE_DIR}/assets/licenses/harfbuzz.txt
-        mit|${CMAKE_SOURCE_DIR}/assets/licenses/mit.txt)
+        mit|${CMAKE_SOURCE_DIR}/assets/licenses/mit.txt
+        curl|${CMAKE_SOURCE_DIR}/assets/licenses/curl.txt)
     string(REPLACE "|" ";" _parts "${_license}")
     list(GET _parts 0 _name)
     list(GET _parts 1 _path)
@@ -249,6 +264,10 @@ add_executable(jellyfin app/main.c jf/api_http.c)
 target_include_directories(jellyfin SYSTEM PRIVATE ${LIBCURL_INCLUDE_DIRS})
 target_link_directories(jellyfin PRIVATE ${LIBCURL_LIBRARY_DIRS})
 target_link_libraries(jellyfin PRIVATE jf-app ${LIBCURL_LIBRARIES})
+if (TARGET_WEBOS)
+    target_compile_definitions(jellyfin PRIVATE CURL_STATICLIB)
+    target_link_options(jellyfin PRIVATE "-Wl,--exclude-libs,libcurl.a")
+endif ()
 
 if (NOT TARGET_WEBOS)
     # The real player against a faked pipeline (jf/smp_host.c): audio, subtitles

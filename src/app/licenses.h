@@ -3,10 +3,10 @@
  *
  * Only what this package actually distributes. The ipk carries FFmpeg, Mbed
  * TLS, libass, FriBidi and HarfBuzz as shared objects of its own, and links
- * json-c statically out of the NDK, so those licences travel with it - the LGPL
+ * json-c and libcurl statically, so those licences travel with it - the LGPL
  * and the Apache licence both require the text, not a reference to it.
- * FreeType, libcurl, libpng, SDL2, zlib and GLib are the TV's own libraries:
- * linked against, never shipped, and so not listed.
+ * FreeType, libpng, SDL2, zlib and GLib are the TV's own libraries: linked
+ * against, never shipped, and so not listed.
  *
  * The files are embedded rather than staged beside the binary: an installed app
  * runs as a jail uid and reads nothing it does not own, and a licence that
@@ -28,6 +28,7 @@ JF_LICENSE_TEXT(license_apache_2_0)
 JF_LICENSE_TEXT(license_libass)
 JF_LICENSE_TEXT(license_harfbuzz)
 JF_LICENSE_TEXT(license_mit)
+JF_LICENSE_TEXT(license_curl)
 
 typedef struct {
   const char *library;
@@ -43,6 +44,7 @@ static const jf_license jf_licenses[] = {
     {"FriBidi", "GNU LGPL v2.1", license_lgpl_2_1},
     {"HarfBuzz", "Old MIT", license_harfbuzz},
     {"json-c", "MIT", license_mit},
+    {"libcurl", "curl", license_curl},
 };
 
 #define JF_LICENSE_COUNT (sizeof(jf_licenses) / sizeof(jf_licenses[0]))

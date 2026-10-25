@@ -16,6 +16,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,7 +129,8 @@ static struct {
   bool top;
   bool plain_ass;
   int search_language; /* index into search_languages */
-} sub_style = {0, 7, true, 3, false, 0, 5, false, false, 0};
+  bool bold;           /* every line, whatever the script marks */
+} sub_style = {0, 7, true, 3, false, 0, 5, false, false, 0, false};
 
 static int clampi(int value, int lo, int hi) {
   return value < lo ? lo : value > hi ? hi : value;
@@ -180,6 +182,8 @@ static void load_preferences(void) {
       sub_style.outline_color = cfg_int(&reader, sub_style.outline_color);
     else if (is(&reader, "subtitles", "ignore_inline_styles"))
       sub_style.ignore_inline = cfg_bool(&reader, sub_style.ignore_inline);
+    else if (is(&reader, "subtitles", "bold"))
+      sub_style.bold = cfg_bool(&reader, sub_style.bold);
     else if (is(&reader, "subtitles", "size_percent"))
       sub_style.size_percent = cfg_int(&reader, sub_style.size_percent);
     else if (is(&reader, "subtitles", "margin_percent"))
@@ -228,6 +232,7 @@ static void save_preferences(void) {
   cfg_write_int(&writer, "outline_width", sub_style.outline_width);
   cfg_write_int(&writer, "outline_color", sub_style.outline_color);
   cfg_write_bool(&writer, "ignore_inline_styles", sub_style.ignore_inline);
+  cfg_write_bool(&writer, "bold", sub_style.bold);
   cfg_write_int(&writer, "size_percent", sub_style.size_percent);
   cfg_write_int(&writer, "margin_percent", sub_style.margin_percent);
   cfg_write_bool(&writer, "top", sub_style.top);
@@ -513,6 +518,7 @@ typedef struct {
   char episode_title[128];
   char overview[1024];
   char rating[32];
+  char official_rating[16];
   char subtitle[72];
   char kind[16];
   char runtime[24];
@@ -686,6 +692,8 @@ static card card_from(const jf_item *item) {
   if (item->community_rating != 0)
     set_text(out.rating, sizeof(out.rating),
              build("%.1f", item->community_rating));
+  set_text(out.official_rating, sizeof(out.official_rating),
+           item->official_rating);
   set_text(out.kind, sizeof(out.kind), type);
   set_text(out.title, sizeof(out.title),
            strcmp(type, "Episode") == 0 && item->series_name != NULL
@@ -740,7 +748,10 @@ typedef enum { EDIT_NONE, EDIT_URL, EDIT_USERNAME, EDIT_PASSWORD } edit_field;
 #define CATEGORY_CAPACITY 256
 #define SEASONS_CAPACITY 128
 #define EPISODES_CAPACITY 512
-#define ROW_COUNT 3
+/* Libraries, Continue Watching, Next Up, and Recently Added for each library.
+ */
+#define LATEST_ROWS 8
+#define ROW_COUNT (3 + LATEST_ROWS)
 
 typedef struct {
   const char *title;
@@ -753,6 +764,9 @@ typedef struct {
   bool loading;
 } item_row;
 
+/* Every card showing the item, as the server now has it. */
+static void apply_user_data(const jf_user_data *item);
+
 static void row_fill(item_row *row, const jf_item *items, size_t count) {
   row->count = min_size(count, row->capacity);
   for (size_t i = 0; i < row->count; i++)
@@ -760,15 +774,18 @@ static void row_fill(item_row *row, const jf_item *items, size_t count) {
   row->loading = false;
 }
 
-/* Fixed home layout, top to bottom. Libraries last because the first two are
- * what a returning user actually wants. */
-enum { ROW_RESUME, ROW_NEXT_UP, ROW_LIBRARIES };
+/* The server's own home screen, top to bottom; the focus still starts on what
+ * a returning user wants, the first row to continue from. */
+enum { ROW_LIBRARIES, ROW_RESUME, ROW_NEXT_UP, ROW_LATEST };
 static card home_cards[ROW_COUNT][ROW_CAPACITY];
 static item_row rows[ROW_COUNT] = {
-    {"Continue Watching", false, NULL, ROW_CAPACITY, 0, false},
-    {"Up Next", false, NULL, ROW_CAPACITY, 0, false},
     {"Libraries", true, NULL, ROW_CAPACITY, 0, false},
+    {"Continue Watching", false, NULL, ROW_CAPACITY, 0, false},
+    {"Next Up", false, NULL, ROW_CAPACITY, 0, false},
 };
+/* Each Recently Added row's title, and the library it is for. */
+static char latest_titles[LATEST_ROWS][96];
+static char latest_parents[LATEST_ROWS][40];
 static card category_cards[CATEGORY_CAPACITY];
 static item_row categories_row = {"All categories",  true, NULL,
                                   CATEGORY_CAPACITY, 0,    false};
@@ -854,7 +871,6 @@ static uint32_t grid_requested[WINDOW_PAGES];
 
 /* Details and season screens. */
 static card detail;
-static char detail_extra[96];
 /* The details item's video, and who would decode it. */
 static jf_video detail_video;
 static bool detail_has_video;
@@ -883,6 +899,8 @@ static card season_detail;
 static char playback_title[160];
 static char playback_item_id[40];
 static char playback_source_id[40];
+/* The episode's series, "" for anything else. */
+static char playback_series_id[48];
 /* The episodes either side of the one playing, from the server; `present`
  * false when there is none, or the item is not an episode. */
 static card previous_episode, next_episode;
@@ -904,10 +922,17 @@ static bool subtitle_settings;
 static bool track_text[KNOWN_TRACKS], track_styled[KNOWN_TRACKS],
     track_external[KNOWN_TRACKS];
 static char track_key[KNOWN_TRACKS][80];
+/* And what choosing it is remembered as for the series (see series_choices):
+ * language and title, kept to what a JSON string takes as it is. */
+static char track_choice[KNOWN_TRACKS][48];
+/* The same for the audio, with the server's index for each; and the index
+ * still to select, once the player has opened the source. */
+static char audio_choice[KNOWN_TRACKS][48];
+static int audio_index[KNOWN_TRACKS], audio_known, audio_wanted = -1;
 /* Milliseconds a track is shown late by: tracks cut for another release are
  * off by their own amount. Kept on the server as this client's display
  * preferences (JF_JOB_DELAYS), so they follow the user from TV to TV; read
- * at the first playback, written when the panel closes on a change. */
+ * with the home rows, written when the panel closes on a change. */
 #define SAVED_DELAYS 256
 static struct {
   char key[80];
@@ -915,6 +940,17 @@ static struct {
 } saved_delays[SAVED_DELAYS];
 static size_t saved_delay_count;
 static bool delays_asked, delays_changed;
+/* The subtitle and audio last chosen in each series, "-" for no subtitle. The
+ * server remembers a choice for that one episode, and otherwise goes by the
+ * release's default flags, so a show switches language from one episode to the
+ * next. Saved with the delays, under "sub:<series id>" and "audio:<series
+ * id>". */
+#define SERIES_CHOICES 128
+static struct {
+  char key[56];
+  char choice[48];
+} series_choices[SERIES_CHOICES];
+static size_t series_choice_count;
 /* Deleting takes a second OK on the row, which this remembers. */
 static bool delete_armed;
 /* The list refreshed after a delete, which shows the track gone and none
@@ -1071,14 +1107,18 @@ static void simple(jf_job job) {
     jf_fetcher_start(&fetcher, task);
 }
 
+/* Also a refresh: rows keep what they show until the answer replaces it. */
 static void load_home(void) {
-  for (size_t i = 0; i < ROW_COUNT; i++)
+  for (size_t i = 0; i < ROW_LATEST; i++)
     rows[i].loading = true;
   categories_row.loading = true;
   simple(JF_JOB_RESUME);
   simple(JF_JOB_NEXT_UP);
   simple(JF_JOB_VIEWS);
   simple(JF_JOB_ENCODING);
+  /* Before any playback: the series' subtitle choices pick its first track. */
+  if (!delays_asked)
+    delays_asked = (simple(JF_JOB_DELAYS), true);
 }
 
 static void restart_discovery(void) {
@@ -1128,28 +1168,21 @@ static void open_details(const card *source) {
     backdrop_fade_started_at = 0;
   }
   detail = *source;
-  detail_extra[0] = '\0';
   detail_has_video = false;
   seasons_row.count = 0;
   seasons_row.loading = false;
   screen = SCREEN_DETAILS;
 
-  /* An episode plays as itself; a series needs its seasons before anything on
-   * this screen can be selected. */
-  jf_task *task = request(JF_JOB_ITEM, 0);
+  /* A series card from a list already says everything this screen shows, and
+   * its seasons bring the backdrop the list left out. An episode or movie needs
+   * the item itself for its video stream. */
+  const bool series = card_is(&detail, "Series");
+  seasons_row.loading = series;
+  jf_task *task = request(series ? JF_JOB_SEASONS : JF_JOB_ITEM, 0);
   if (task == NULL)
     return;
   set_text(task->a, sizeof(task->a), detail.id);
   jf_fetcher_start(&fetcher, task);
-
-  if (card_is(&detail, "Series")) {
-    seasons_row.loading = true;
-    jf_task *seasons = request(JF_JOB_SEASONS, 0);
-    if (seasons == NULL)
-      return;
-    set_text(seasons->a, sizeof(seasons->a), detail.id);
-    jf_fetcher_start(&fetcher, seasons);
-  }
 }
 
 static void open_season(const card *source) {
@@ -1234,6 +1267,26 @@ static void pop(void) {
 
 /* ------------------------------------------------------------ sign-in flow */
 
+/* The server's event socket said the user's items changed (see
+ * jf_events_start), and the home rows have not been asked again since: they
+ * also change which items they hold. Set from its thread, with the items' new
+ * state queued for the next frame. */
+static atomic_bool items_changed;
+static bool home_stale;
+#define CHANGES_QUEUED 64
+static pthread_mutex_t changes_lock = PTHREAD_MUTEX_INITIALIZER;
+static jf_user_data changes[CHANGES_QUEUED];
+static size_t change_count;
+
+static void on_items_changed(const jf_user_data *items, size_t count) {
+  pthread_mutex_lock(&changes_lock);
+  for (size_t i = 0; i < count && change_count < CHANGES_QUEUED; i++)
+    changes[change_count++] = items[i];
+  pthread_mutex_unlock(&changes_lock);
+  atomic_store(&items_changed, true);
+  jf_window_wake();
+}
+
 /* Re-authentications attempted since the last success. Bounded, or a server
  * that rejects a valid-looking password turns into a login loop. */
 static unsigned relogin_attempts;
@@ -1248,6 +1301,7 @@ static void signed_in(const jf_auth *auth, const char *used_password) {
   set_text(session.password, sizeof(session.password), used_password);
   jf_fetcher_set_session(&fetcher, &session);
   jf_session_save(&session);
+  jf_events_start(&session, on_items_changed);
   relogin_attempts = 0;
   set_status("Signed in as %s", session.user_name);
   if (silent) {
@@ -1286,8 +1340,10 @@ static bool reauthenticate(void) {
 
 static void sign_out(void) {
   auth_generation++;
+  jf_events_stop();
   /* The next user's delays are their own. */
   saved_delay_count = 0;
+  series_choice_count = 0;
   delays_asked = false;
   session.token[0] = '\0';
   session.user_id[0] = '\0';
@@ -1372,6 +1428,10 @@ static const char *job_name(jf_job job) {
     return "restart";
   case JF_JOB_ADD_REPOSITORY:
     return "add_repository";
+  case JF_JOB_MARK_PLAYED:
+    return "mark_played";
+  case JF_JOB_LATEST:
+    return "latest";
   }
   return "?";
 }
@@ -1504,6 +1564,10 @@ static void on_failure(jf_task *task) {
   case JF_JOB_SUBTITLE_DELETE:
     set_error("Could not delete the subtitle: %s", task->error);
     break;
+  case JF_JOB_MARK_PLAYED:
+    set_error("Could not mark it %s: %s", task->start ? "played" : "unplayed",
+              task->error);
+    break;
   default:
     set_error("%s failed: %s", job_name(task->job), task->error);
     break;
@@ -1595,8 +1659,34 @@ static void consume(jf_task *task) {
     }
     row_fill(&rows[ROW_LIBRARIES], keep, count);
     row_fill(&categories_row, keep, count);
+    /* Not for collections, which are made by hand rather than added to. */
+    size_t latest = 0;
+    for (size_t i = 0; i < count && latest < LATEST_ROWS; i++) {
+      const char *kind = keep[i].collection_type;
+      jf_task *fetch = kind != NULL && strcmp(kind, "boxsets") == 0
+                           ? NULL
+                           : request(JF_JOB_LATEST, (uint32_t)latest);
+      if (fetch == NULL)
+        continue;
+      snprintf(latest_titles[latest], sizeof(latest_titles[0]),
+               "Recently Added in %s",
+               keep[i].name != NULL ? keep[i].name : "");
+      set_text(latest_parents[latest], sizeof(latest_parents[0]), keep[i].id);
+      rows[ROW_LATEST + latest].title = latest_titles[latest];
+      set_text(fetch->a, sizeof(fetch->a), keep[i].id);
+      jf_fetcher_start(&fetcher, fetch);
+      latest++;
+    }
+    for (; latest < LATEST_ROWS; latest++)
+      rows[ROW_LATEST + latest].count = 0;
     break;
   }
+  case JF_JOB_LATEST:
+    if (task->tag < LATEST_ROWS &&
+        strcmp(task->a, latest_parents[task->tag]) == 0)
+      row_fill(&rows[ROW_LATEST + task->tag], task->list.items,
+               task->list.count);
+    break;
 
   case JF_JOB_CHILDREN: {
     grid_loading = false;
@@ -1625,7 +1715,6 @@ static void consume(jf_task *task) {
       detail.blur_width = opened.blur_width;
       detail.blur_height = opened.blur_height;
     }
-    set_text(detail_extra, sizeof(detail_extra), task->one.official_rating);
     detail_video = task->one.video;
     detail_has_video = task->one.has_video;
     break;
@@ -1637,6 +1726,19 @@ static void consume(jf_task *task) {
   case JF_JOB_DELAYS:
     /* What this playback already changed wins over what was saved. */
     for (size_t i = 0; i < task->pair_count; i++) {
+      if (strncmp(task->keys[i], "sub:", 4) == 0 ||
+          strncmp(task->keys[i], "audio:", 6) == 0) {
+        bool known = false;
+        for (size_t j = 0; j < series_choice_count && !known; j++)
+          known = strcmp(series_choices[j].key, task->keys[i]) == 0;
+        if (known || series_choice_count == SERIES_CHOICES)
+          continue;
+        set_text(series_choices[series_choice_count].key,
+                 sizeof(series_choices[0].key), task->keys[i]);
+        set_text(series_choices[series_choice_count++].choice,
+                 sizeof(series_choices[0].choice), task->values[i]);
+        continue;
+      }
       bool known = false;
       for (size_t j = 0; j < saved_delay_count && !known; j++)
         known = strcmp(saved_delays[j].key, task->keys[i]) == 0;
@@ -1661,6 +1763,13 @@ static void consume(jf_task *task) {
   case JF_JOB_ADD_REPOSITORY:
     sources_done(task);
     break;
+  case JF_JOB_MARK_PLAYED: {
+    /* Either way, no position to resume from. */
+    jf_user_data item = {.played = task->start != 0};
+    snprintf(item.item_id, sizeof(item.item_id), "%.39s", task->a);
+    apply_user_data(&item);
+    break;
+  }
   case JF_JOB_SUBTITLE_DELETE: {
     /* Gone from the server: its list, asked again, no longer has it. */
     awaiting_delete = true;
@@ -1676,6 +1785,19 @@ static void consume(jf_task *task) {
     if (strcmp(task->a, detail.id) != 0)
       return;
     row_fill(&seasons_row, task->list.items, task->list.count);
+    /* The card may predate what was just watched; its seasons do not. */
+    detail.remaining = 0;
+    for (size_t i = 0; i < seasons_row.count; i++)
+      detail.remaining += seasons_cards[i].remaining;
+    detail.has_remaining = seasons_row.count != 0;
+    detail.played = detail.has_remaining && detail.remaining == 0;
+    /* Seasons inherit the series' backdrop. */
+    if (detail.backdrop_id[0] == '\0' && seasons_row.count != 0) {
+      set_text(detail.backdrop_id, sizeof(detail.backdrop_id),
+               seasons_cards[0].backdrop_id);
+      set_text(detail.backdrop_tag, sizeof(detail.backdrop_tag),
+               seasons_cards[0].backdrop_tag);
+    }
     break;
 
   case JF_JOB_EPISODES:
@@ -1708,6 +1830,11 @@ static void consume(jf_task *task) {
   case JF_JOB_ADJACENT:
     if (strcmp(task->a, playback_item_id) != 0)
       break;
+    /* Started without its series, which the lookup found: the choice made
+     * now is still the series'. */
+    if (playback_series_id[0] == '\0')
+      snprintf(playback_series_id, sizeof(playback_series_id), "%.47s",
+               task->b);
     for (size_t i = 0; i < task->list.count; i++) {
       if (strcmp(task->list.items[i].id, playback_item_id) != 0)
         continue;
@@ -1721,8 +1848,28 @@ static void consume(jf_task *task) {
 }
 
 static void report_playback(jf_job job);
+static void report_leaving(void);
+static void remember_choice(void);
 
 static void pump(void) {
+  /* Changes show on every card at once, and reach the home rows when they are
+   * next in view. */
+  if (atomic_exchange(&items_changed, false)) {
+    static jf_user_data incoming[CHANGES_QUEUED];
+    pthread_mutex_lock(&changes_lock);
+    const size_t count = change_count;
+    memcpy(incoming, changes, count * sizeof(*changes));
+    change_count = 0;
+    pthread_mutex_unlock(&changes_lock);
+    for (size_t i = 0; i < count; i++)
+      apply_user_data(&incoming[i]);
+    home_stale = true;
+    jf_window_frame_requested = true;
+  }
+  if (home_stale && screen == SCREEN_HOME) {
+    home_stale = false;
+    load_home();
+  }
   for (jf_task *task = jf_fetcher_finished(&fetcher); task != NULL;
        task = jf_fetcher_finished(&fetcher)) {
     if (task->job != JF_JOB_QUICK_POLL || task->state != JF_TASK_READY ||
@@ -1942,7 +2089,7 @@ static void go_back(void) {
     return;
   }
   if (screen == SCREEN_PLAYBACK) {
-    report_playback(JF_JOB_PLAYBACK_PROGRESS);
+    report_leaving();
     jf_player_stop();
     playback_paused = false;
     playback_item_id[0] = '\0';
@@ -2055,7 +2202,7 @@ static bool button_shown(size_t index) {
   }
 }
 
-static void report_playback(jf_job job) {
+static void report_position(jf_job job, int position_ms) {
   if (playback_item_id[0] == '\0')
     return;
   jf_task *task = request(job, 0);
@@ -2065,34 +2212,115 @@ static void report_playback(jf_job job) {
   set_text(task->b, sizeof(task->b), playback_source_id);
   task->subtitle_stream =
       jf_player_subtitle_stream(jf_player_subtitle_current());
-  const int position_ms = jf_player_position();
   task->position_ticks =
       (uint64_t)(position_ms > 0 ? position_ms : 0) * 10000ull;
   jf_fetcher_start(&fetcher, task);
 }
 
+static void report_playback(jf_job job) {
+  report_position(job, jf_player_position());
+}
+
+/* The last report before going: inside a closing chapter it says the end, as
+ * leaving during the credits is having watched it. The server counts 90%,
+ * which an hour's six minutes of credits start before. "Closing" is a last
+ * chapter in the final 15%. */
+static void report_leaving(void) {
+  /* The subtitle too, which a panel still open has not remembered yet. */
+  remember_choice();
+  const int *starts = NULL;
+  const int chapters = jf_player_chapters(&starts);
+  const int duration = jf_player_duration();
+  const int last = chapters > 1 ? starts[chapters - 1] : INT_MAX;
+  const int position = jf_player_position();
+  report_position(JF_JOB_PLAYBACK_PROGRESS,
+                  last >= duration * 0.85 && position >= last ? duration
+                                                              : position);
+}
+
 /* The server's subtitle streams, with its pick for the user's preferences
  * selected. */
+/* `text` appended at `at`, kept to characters a JSON string takes as they
+ * are; returns the new end. */
+static int append_plain(char *out, int at, int size, const char *text) {
+  for (const char *c = text; c != NULL && *c != '\0' && at + 1 < size; c++)
+    out[at++] =
+        (*c >= '0' && *c <= '9') || ((*c | 0x20) >= 'a' && (*c | 0x20) <= 'z')
+            ? *c
+            : '_';
+  out[at] = '\0';
+  return at;
+}
+
 /* What a track's delay is saved under, and how a new one is told from the
  * ones before it. Not the server's index: files beside the video are numbered
  * first, so a download would shift every embedded track's. `embedded` counts
  * the embedded tracks so far. */
-static void stream_key(const jf_subtitle_stream *stream, int *embedded,
+static void stream_key(const jf_media_stream *stream, int *embedded,
                        char out[80]) {
   if (!stream->external) {
     snprintf(out, 80, "%.40s:e%d", playback_item_id, (*embedded)++);
     return;
   }
   /* Files beside the video come in whatever order the server lists them,
-   * which a download changes: by name, kept to characters a JSON key takes as
-   * they are. */
-  int at = snprintf(out, 80, "%.40s:x:", playback_item_id);
-  for (const char *c = stream->title; *c != '\0' && at + 1 < 80; c++)
-    out[at++] =
-        (*c >= '0' && *c <= '9') || ((*c | 0x20) >= 'a' && (*c | 0x20) <= 'z')
-            ? *c
-            : '_';
-  out[at] = '\0';
+   * which a download changes: by name. */
+  append_plain(out, snprintf(out, 80, "%.40s:x:", playback_item_id), 80,
+               stream->title);
+}
+
+/* Language, then title: "eng_Full", "_" for neither. */
+static void stream_choice(const jf_media_stream *stream, char out[48]) {
+  const int at = append_plain(out, 0, 48, stream->language);
+  out[at] = '_';
+  append_plain(out, at + 1, 48, stream->name);
+}
+
+/* The current series' remembered choice of `kind`, "sub" or "audio", made
+ * empty on `create`; NULL outside a series. */
+static char *series_choice(const char *kind, bool create) {
+  if (playback_series_id[0] == '\0')
+    return NULL;
+  char key[56];
+  snprintf(key, sizeof(key), "%s:%.47s", kind, playback_series_id);
+  for (size_t i = 0; i < series_choice_count; i++)
+    if (strcmp(series_choices[i].key, key) == 0)
+      return series_choices[i].choice;
+  if (!create || series_choice_count == SERIES_CHOICES)
+    return NULL;
+  set_text(series_choices[series_choice_count].key,
+           sizeof(series_choices[0].key), key);
+  series_choices[series_choice_count].choice[0] = '\0';
+  return series_choices[series_choice_count++].choice;
+}
+
+/* The track among `choices` a remembered choice names: the same language and
+ * title, else the first in the language; `fallback` when the episode has
+ * neither, or nothing is remembered. */
+static int chosen_track(const char *wanted, char choices[][48], int count,
+                        int fallback) {
+  if (wanted == NULL || wanted[0] == '\0')
+    return fallback;
+  if (strcmp(wanted, "-") == 0)
+    return -1;
+  const size_t language = strcspn(wanted, "_") + 1;
+  int same_language = -1;
+  for (int i = 0; i < count; i++) {
+    if (strcmp(choices[i], wanted) == 0)
+      return i;
+    if (same_language < 0 && strncmp(choices[i], wanted, language) == 0)
+      same_language = i;
+  }
+  return same_language >= 0 ? same_language : fallback;
+}
+
+/* The audio track wanted, once the player lists the source's: matched by the
+ * server's index. */
+static void select_wanted_audio(void) {
+  for (int i = 0; audio_wanted >= 0 && i < jf_player_audio_count(); i++)
+    if (jf_player_audio_stream(i) == audio_wanted) {
+      jf_player_audio_select(i);
+      audio_wanted = -1;
+    }
 }
 
 static void use_playback_info(const jf_playback_info *info) {
@@ -2101,8 +2329,9 @@ static void use_playback_info(const jf_playback_info *info) {
   static jf_player_track tracks[KNOWN_TRACKS];
   int count = 0, selected = -1, embedded = 0;
   memset(track_key, 0, sizeof(track_key));
+  memset(track_choice, 0, sizeof(track_choice));
   for (size_t i = 0; i < info->subtitle_count && count < KNOWN_TRACKS; i++) {
-    const jf_subtitle_stream *stream = &info->subtitles[i];
+    const jf_media_stream *stream = &info->subtitles[i];
     /* A bitmap file beside the video has no source here: the server
      * converts only text, and it is not in the container. */
     if (!stream->text && stream->external)
@@ -2112,6 +2341,7 @@ static void use_playback_info(const jf_playback_info *info) {
     track_styled[count] = stream->styled;
     track_external[count] = stream->external;
     stream_key(stream, &embedded, track_key[count]);
+    stream_choice(stream, track_choice[count]);
     *track = (jf_player_track){
         stream->index, stream->external, stream->text, "", "", -1};
     set_text(track->name, sizeof(track->name), stream->title);
@@ -2122,6 +2352,8 @@ static void use_playback_info(const jf_playback_info *info) {
       selected = count;
     count++;
   }
+  selected =
+      chosen_track(series_choice("sub", false), track_choice, count, selected);
   /* A track just deleted: none selected, and back in the picker on "off". */
   if (awaiting_delete) {
     awaiting_delete = false;
@@ -2151,6 +2383,19 @@ static void use_playback_info(const jf_playback_info *info) {
     }
   }
   jf_player_subtitle_tracks(tracks, count, selected);
+  int audio = -1;
+  audio_known = 0;
+  for (size_t i = 0; i < info->audio_count && audio_known < KNOWN_TRACKS; i++) {
+    audio_index[audio_known] = info->audio[i].index;
+    stream_choice(&info->audio[i], audio_choice[audio_known]);
+    if (info->audio[i].index == info->default_audio)
+      audio = audio_known;
+    audio_known++;
+  }
+  audio = chosen_track(series_choice("audio", false), audio_choice, audio_known,
+                       audio);
+  audio_wanted = audio >= 0 ? audio_index[audio] : -1;
+  select_wanted_audio();
   fprintf(stderr, "Playback info: %d subtitle track(s), default stream %d\n",
           count, info->default_subtitle);
 }
@@ -2182,12 +2427,13 @@ static void start_playback(const char *id, const char *title,
   set_text(playback_title, sizeof(playback_title), title);
   set_text(playback_item_id, sizeof(playback_item_id), id);
   set_text(playback_source_id, sizeof(playback_source_id), id);
+  set_text(playback_series_id, sizeof(playback_series_id), series_id);
+  audio_known = 0;
+  audio_wanted = -1;
   subtitle_picker = false;
   subtitle_settings = false;
   search.open = false;
   sources.open = false;
-  if (!delays_asked)
-    delays_asked = (simple(JF_JOB_DELAYS), true);
   jf_task *info = request(JF_JOB_PLAYBACK_INFO, 0);
   if (info != NULL) {
     set_text(info->a, sizeof(info->a), id);
@@ -2251,9 +2497,36 @@ static void open_subtitle_picker(void) {
   picker_focus_pending = true;
 }
 
+static void save_delays(void);
+
+/* `now` as the series' choice of `kind`; whether that changed it. */
+static bool remember(const char *kind, const char *now) {
+  char *choice = now[0] != '\0' ? series_choice(kind, true) : NULL;
+  if (choice == NULL || strcmp(choice, now) == 0)
+    return false;
+  snprintf(choice, sizeof(series_choices[0].choice), "%.47s", now);
+  return true;
+}
+
+/* The tracks playing, for the series' next episode. */
+static void remember_choice(void) {
+  const int track = jf_player_subtitle_current();
+  bool changed = remember("sub", track < 0              ? "-"
+                                 : track < KNOWN_TRACKS ? track_choice[track]
+                                                        : "");
+  /* Not before the wanted one is in: what plays is only the first. */
+  const int audio = jf_player_audio_stream(jf_player_audio_current());
+  for (int i = 0; audio_wanted < 0 && audio >= 0 && i < audio_known; i++)
+    if (audio_index[i] == audio)
+      changed |= remember("audio", audio_choice[i]);
+  if (changed)
+    save_delays();
+}
+
 static void close_subtitle_picker(void) {
   subtitle_picker = false;
   jf_player_subtitle_preview(false);
+  remember_choice();
   report_playback(JF_JOB_PLAYBACK_PROGRESS);
   nav_focus(&ui, picker_return_focus);
 }
@@ -2265,6 +2538,7 @@ typedef enum {
   SETTING_OUTLINE_WIDTH,
   SETTING_OUTLINE_COLOR,
   SETTING_INLINE,
+  SETTING_BOLD,
   SETTING_SIZE,
   SETTING_MARGIN,
   SETTING_SIDE,
@@ -2335,7 +2609,8 @@ static void save_delays(void) {
   jf_task *task = request(JF_JOB_SAVE_DELAYS, 0);
   if (task == NULL)
     return;
-  size_t length = 0, capacity = 128 + saved_delay_count * 100;
+  size_t length = 0,
+         capacity = 128 + (saved_delay_count + series_choice_count) * 100;
   char *body = jf_arena_alloc(&task->arena, capacity);
   if (body == NULL) {
     jf_fetcher_release(&fetcher, task);
@@ -2353,6 +2628,12 @@ static void save_delays(void) {
     length += (size_t)snprintf(body + length, capacity - length,
                                "%s\"%s\":\"%d\"", first ? "" : ",",
                                saved_delays[i].key, saved_delays[i].ms);
+    first = false;
+  }
+  for (size_t i = 0; i < series_choice_count; i++) {
+    length += (size_t)snprintf(body + length, capacity - length,
+                               "%s\"%s\":\"%s\"", first ? "" : ",",
+                               series_choices[i].key, series_choices[i].choice);
     first = false;
   }
   snprintf(body + length, capacity - length, "}}");
@@ -2402,7 +2683,7 @@ static void suggest_delay(void) {
  * left and right's alone, so a stray click never nudges it. */
 static bool setting_is_toggle(subtitle_setting row) {
   return row == SETTING_PLAIN_ASS || row == SETTING_OUTLINE ||
-         row == SETTING_INLINE || row == SETTING_SIDE ||
+         row == SETTING_INLINE || row == SETTING_BOLD || row == SETTING_SIDE ||
          row == SETTING_SUGGEST || row == SETTING_DELETE;
 }
 
@@ -2440,6 +2721,9 @@ static void change_setting(subtitle_setting row, int step) {
     break;
   case SETTING_INLINE:
     sub_style.ignore_inline = !sub_style.ignore_inline;
+    break;
+  case SETTING_BOLD:
+    sub_style.bold = !sub_style.bold;
     break;
   case SETTING_SIZE:
     sub_style.size_percent += 10 * step;
@@ -2822,7 +3106,8 @@ static void search_failed(const jf_task *task) {
   }
   search.phase = DOWNLOAD_NONE;
   search.error_is_warning = false;
-  snprintf(search.error, sizeof(search.error), "%s: %s",
+  /* The failure's name is a word (see jf_api_execute). */
+  snprintf(search.error, sizeof(search.error), "%s: %.32s",
            task->job == JF_JOB_SUBTITLE_CHECK
                ? "The download is listed but cannot be read"
            : strcmp(task->error, "Unauthorized") == 0
@@ -2839,7 +3124,7 @@ static void search_listed(const jf_playback_info *info) {
     return;
   int embedded = 0;
   for (size_t i = 0; i < info->subtitle_count; i++) {
-    const jf_subtitle_stream *stream = &info->subtitles[i];
+    const jf_media_stream *stream = &info->subtitles[i];
     char key[80];
     stream_key(stream, &embedded, key);
     bool known = false;
@@ -2994,7 +3279,7 @@ static void play_adjacent(const card *episode) {
   const card chosen = *episode;
   const screen_id back = playback_return_screen;
   const nav_id back_focus = playback_return_focus;
-  report_playback(JF_JOB_PLAYBACK_PROGRESS);
+  report_leaving();
   jf_player_stop();
   start_playback(chosen.id, chosen.episode_title, chosen.series_id,
                  chosen.playback_position_ticks);
@@ -3724,10 +4009,11 @@ static void draw_quick(loom_context *ctx, float width, float scale) {
 
 /* A horizontal row of poster cards. Only the focused row scrolls; a TV row
  * holds few enough items that the whole row is one strip with an offset. */
-/* Returns the card activated in this row, if any. */
+/* Returns the card activated in this row, if any. A screen with no focus yet
+ * starts on its first card when `starts_here`. */
 static const card *draw_row(loom_context *ctx, const item_row *row, size_t id,
                             float top, float width, loom_rect clip,
-                            float scale) {
+                            bool starts_here, float scale) {
   const float margin = 64 * scale;
   const float card_w = (row->wide ? 356.0f : 200.0f) * scale;
   const float card_h = (row->wide ? 278.0f : 378.0f) * scale;
@@ -3769,6 +4055,8 @@ static const card *draw_row(loom_context *ctx, const item_row *row, size_t id,
     if (x >= width)
       break;
     const loom_rect rect = {x, strip.y, card_w, card_h};
+    if (index == 0 && starts_here)
+      nav_default(&ui);
     const unsigned flags =
         nav_item(&ui, nav_str(row->cards[index].id), rect, clip);
     if (flags & NAV_FOCUSED) {
@@ -3787,33 +4075,55 @@ static const card *draw_row(loom_context *ctx, const item_row *row, size_t id,
   return chosen;
 }
 
+/* As the server's home screen: a row with nothing in it is left out, and a
+ * Recently Added row shows once it has something. */
+static bool row_shown(size_t id) {
+  return id == ROW_LIBRARIES || rows[id].count > 0 ||
+         (id < ROW_LATEST && rows[id].loading);
+}
+
+/* Still on its first load: a refresh keeps the cards it had. */
+static bool row_arriving(size_t id) {
+  return rows[id].loading && rows[id].count == 0;
+}
+
 static void draw_home(loom_context *ctx, float width, float height,
                       float scale) {
-  if (rows[ROW_LIBRARIES].loading) {
+  if (row_arriving(ROW_LIBRARIES)) {
     draw_spinner(ctx, width / 2, height / 2, 26 * scale, NULL, scale);
     return;
   }
-  const float row_height = 470 * scale;
-  const float extent = ROW_COUNT * row_height;
+  /* Title, cards, and a gap: the libraries' banners are shorter. */
+  float row_height[ROW_COUNT], extent = 0;
+  for (size_t id = 0; id < ROW_COUNT; id++) {
+    row_height[id] = row_shown(id) ? (rows[id].wide ? 370 : 470) * scale : 0;
+    extent += row_height[id];
+  }
   const float fade_height = 78 * scale;
   /* A card is revealed with its row's title clear of the fade above it. */
   const float scroll =
       nav_scroll_begin(&ui, nav_str("home"), (loom_rect){0, 0, width, height},
                        LOOM_VERTICAL, extent, fade_height + 46 * scale, 0);
-  /* Nothing takes focus until every row is in, or the first card declared
-   * would be a library and the focus would start on the bottom row. */
+  /* Nothing takes focus until the rows to continue from are in, or it would
+   * start on a library. */
   const bool inert = ui.inert;
   nav_set_inert(&ui,
-                inert || rows[ROW_RESUME].loading || rows[ROW_NEXT_UP].loading);
+                inert || row_arriving(ROW_RESUME) || row_arriving(ROW_NEXT_UP));
+  const size_t start = rows[ROW_RESUME].count > 0    ? ROW_RESUME
+                       : rows[ROW_NEXT_UP].count > 0 ? ROW_NEXT_UP
+                                                     : ROW_LIBRARIES;
   const loom_mask outer = ctx->mask;
   loom_fade(ctx, LOOM_VERTICAL, 0, height, scroll, maxf(0, extent - height),
             fade_height);
   const card *chosen = NULL;
   size_t chosen_row = 0;
+  float top = -scroll;
   for (size_t id = 0; id < ROW_COUNT; id++) {
-    const card *activated =
-        draw_row(ctx, &rows[id], id, (float)id * row_height - scroll, width,
-                 ctx->viewport, scale);
+    if (!row_shown(id))
+      continue;
+    const card *activated = draw_row(ctx, &rows[id], id, top, width,
+                                     ctx->viewport, id == start, scale);
+    top += row_height[id];
     if (activated != NULL) {
       chosen = activated;
       chosen_row = id;
@@ -3979,7 +4289,7 @@ static void draw_details(loom_context *ctx, float width, float scale) {
   loom_label(ctx, (loom_rect){x, 150 * scale, w, 34 * scale}, NULL,
              detail.subtitle, TEXT, 24 * scale);
   draw_metadata(ctx, (loom_rect){x, 195 * scale, w, 34 * scale}, NULL,
-                detail_extra, detail.rating, 20 * scale, DIM);
+                detail.official_rating, detail.rating, 20 * scale, DIM);
   draw_wrapped(ctx, (loom_rect){x, 255 * scale, w, 180 * scale},
                detail.overview, 22 * scale);
 
@@ -4041,6 +4351,52 @@ static void draw_details(loom_context *ctx, float width, float scale) {
       NAV_ACTIVATED)
     start_playback(detail.id, detail.title, detail.series_id,
                    detail.playback_position_ticks);
+  if (draw_button(
+          ctx,
+          (loom_rect){x + 280 * scale, 570 * scale, 250 * scale, 74 * scale},
+          detail.played ? JF_ICON_CHECKED "  Played"
+                        : JF_ICON_UNCHECKED "  Played",
+          nav_str("details.played"), scale) &
+      NAV_ACTIVATED) {
+    jf_task *task = request(JF_JOB_MARK_PLAYED, 0);
+    if (task != NULL) {
+      set_text(task->a, sizeof(task->a), detail.id);
+      task->start = !detail.played;
+      jf_fetcher_start(&fetcher, task);
+    }
+  }
+}
+
+/* As card_from would make it: a show or season with nothing left is watched. */
+static void update_card(card *c, const jf_user_data *item) {
+  if (strcmp(c->id, item->item_id) != 0)
+    return;
+  const bool folder = card_is(c, "Series") || card_is(c, "Season");
+  c->played = item->played || (folder && item->has_unplayed_item_count &&
+                               item->unplayed_item_count == 0);
+  c->playback_position_ticks = item->position_ticks;
+  c->progress =
+      item->has_played_percentage ? (float)item->played_percentage : 0;
+  if (folder && item->has_unplayed_item_count) {
+    c->has_remaining = true;
+    c->remaining = c->played ? 0 : item->unplayed_item_count;
+  }
+}
+
+static void apply_user_data(const jf_user_data *item) {
+  card *const one[] = {&detail, &season_detail, &previous_episode,
+                       &next_episode};
+  for (size_t i = 0; i < sizeof(one) / sizeof(one[0]); i++)
+    update_card(one[i], item);
+  for (size_t i = 0; i < WINDOW_SIZE; i++)
+    update_card(&grid_cards[i], item);
+  for (size_t r = 0; r < ROW_COUNT; r++)
+    for (size_t i = 0; i < rows[r].count; i++)
+      update_card(&rows[r].cards[i], item);
+  item_row *const lists[] = {&seasons_row, &episodes_row};
+  for (size_t l = 0; l < sizeof(lists) / sizeof(lists[0]); l++)
+    for (size_t i = 0; i < lists[l]->count; i++)
+      update_card(&lists[l]->cards[i], item);
 }
 
 static void draw_season(loom_context *ctx, float width, float height,
@@ -4453,6 +4809,8 @@ static const char *setting_value(subtitle_setting row) {
     return swatches[sub_style.outline_color].name;
   case SETTING_INLINE:
     return sub_style.ignore_inline ? "Ignore" : "Keep";
+  case SETTING_BOLD:
+    return sub_style.bold ? "On" : "Off";
   case SETTING_SIZE:
     return fmt("%d%%", 100 + sub_style.size_percent);
   case SETTING_MARGIN:
@@ -4477,6 +4835,7 @@ static void draw_subtitle_settings(loom_context *ctx, float width, float height,
       [SETTING_OUTLINE_WIDTH] = "Width",
       [SETTING_OUTLINE_COLOR] = "Colour",
       [SETTING_INLINE] = "Bold and italic",
+      [SETTING_BOLD] = "Always bold",
       [SETTING_SIZE] = "Size",
       [SETTING_MARGIN] = "Edge margin",
       [SETTING_SIDE] = "Position",
@@ -4993,15 +5352,16 @@ static void draw_plain_subtitles(loom_context *ctx, const char *text,
     copy[length] = '\0';
     used += length + 1;
     p += length;
+    const uint8_t look = style | (sub_style.bold ? 1 : 0);
     const float width =
-        jf_renderer_measure_styled(renderer, copy, size, &styles[style]);
+        jf_renderer_measure_styled(renderer, copy, size, &styles[look]);
     if (word_start == count) { /* a word starts here */
       if (space_pending)
         x += space;
       space_pending = false;
       word_x = x;
     }
-    runs[count] = (text_run){copy, x, width, row, style};
+    runs[count] = (text_run){copy, x, width, row, look};
     x += width;
     count++;
     /* Too wide: the whole word moves down a row, unless it is alone there. */
@@ -5396,14 +5756,7 @@ static void build_ui(loom_context *ctx) {
 /* -------------------------------------------------------------------- main */
 
 /* How often the subtitle overlay is asked whether it has changed; only a change
- * draws a frame.
- *
- * ponytail: a poll, not a schedule. libass knows when the next event starts but
- * not when the current one ends, so there is no single wake-up to ask it for;
- * at this period a line appears within one frame of its time at 30 Hz and the
- * check costs one ass_render_frame against an unchanged time. A karaoke or
- * sign-heavy script animates at this rate rather than the display's - drive it
- * from jf_player_needs_frame if that ever matters. */
+ * draws a frame. */
 #define SUBTITLE_TICK_NS (33 * 1000000ull)
 
 /* Only these UI features have time-dependent work in normal operation. */
@@ -5592,8 +5945,10 @@ static const char *autoplay;
 static char launch_play[64];
 
 static bool app_init(int argc, char **argv) {
-  for (size_t i = 0; i < ROW_COUNT; i++)
+  for (size_t i = 0; i < ROW_COUNT; i++) {
     rows[i].cards = home_cards[i];
+    rows[i].capacity = ROW_CAPACITY;
+  }
   categories_row.cards = category_cards;
   seasons_row.cards = seasons_cards;
   episodes_row.cards = episodes_cards;
@@ -5651,6 +6006,7 @@ static bool app_init(int argc, char **argv) {
     screen = SCREEN_HOME;
     set_status("Signed in as %s", session.user_name);
     load_home();
+    jf_events_start(&session, on_items_changed);
   } else {
     /* Development convenience, and the only way a script can sign in: the
      * fields start filled from the environment. Nothing is read from there once
@@ -5706,7 +6062,16 @@ static bool app_step(int *wait_ms) {
   }
   const jf_player_state state = jf_player_state_get();
   if (state != last_state) {
+    /* The stream ran out by itself, as a stop would have left the screen: on
+     * into the next episode, or back to where playback started. */
+    const bool ended = last_state == JF_PLAYING && state == JF_IDLE &&
+                       screen == SCREEN_PLAYBACK;
     last_state = state;
+    select_wanted_audio();
+    if (ended && next_episode.present)
+      play_adjacent(&next_episode);
+    else if (ended)
+      go_back();
     if (screen == SCREEN_PLAYBACK)
       jf_window_frame_requested = true;
   }
@@ -5826,6 +6191,7 @@ static bool app_step(int *wait_ms) {
 }
 
 static void app_deinit(void) {
+  jf_events_stop();
   jf_player_deinit();
   jf_fetcher_deinit(&fetcher);
   loom_destroy(&ctx);
