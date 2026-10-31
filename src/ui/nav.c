@@ -124,6 +124,7 @@ void nav_activate(nav *ui) {
 void nav_focus(nav *ui, nav_id id) {
   ui->focus = id;
   ui->reveal = true;
+  ui->focus_for_next = ui->building;
 }
 void nav_wheel(nav *ui, float delta) { ui->wheel += delta; }
 void nav_step(nav *ui, int steps) { ui->steps += steps; }
@@ -171,6 +172,8 @@ void nav_begin(nav *ui, loom_context *ctx, uint64_t now) {
   ui->want_default = false;
   ui->default_id = 0;
   ui->wheel_across = NULL;
+  ui->building = true;
+  ui->focus_for_next = false;
 }
 
 /* Scopes deeper than NAV_DEPTH share the deepest one's ids. */
@@ -361,7 +364,7 @@ bool nav_end(nav *ui, const loom_color color, float width) {
    * The fallback takes over next frame; only a default is scrolled to, as
    * anything else is on screen already and the wheel may be what moved the
    * old focus off it. */
-  if (focused == NULL && ui->count[ui->current] > 0) {
+  if (focused == NULL && ui->count[ui->current] > 0 && !ui->focus_for_next) {
     ui->focus = fallback(ui)->id;
     ui->reveal = ui->focus == ui->default_id;
     running = true;
@@ -395,5 +398,9 @@ bool nav_end(nav *ui, const loom_color color, float width) {
   ui->activated = 0;
   ui->wheel = 0;
   ui->steps = 0;
+  ui->building = false;
+  /* The new screen is built next: whatever changed it wants that frame. */
+  running |= ui->focus_for_next;
+  ui->focus_for_next = false;
   return running;
 }

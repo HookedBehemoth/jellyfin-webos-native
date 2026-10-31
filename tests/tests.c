@@ -20,6 +20,7 @@
 #include "ui/loom.h"
 #include "ui/nav.h"
 #include "ui/skyline.h"
+#include "ui/stack.h"
 #ifdef JF_HAVE_DEMUX
 #include "jf/demux.h"
 #endif
@@ -304,6 +305,55 @@ static void test_nav(void) {
       CHECK(ui.focus == nav_int(2));
     }
   }
+  loom_destroy(&ctx);
+}
+
+/* Back returns to each screen on the item it was left on, however deep; past
+ * capacity the oldest screen goes, not the newest. */
+static void test_stack(void) {
+  typedef struct {
+    ui_view view;
+    int item;
+  } entry;
+  static nav ui;
+  entry storage[3];
+  ui_stack stack;
+  ui_stack_init(&stack, storage, sizeof(entry), 3);
+  CHECK(ui_stack_pop(&stack, &ui) == NULL);
+  for (int screen = 0; screen < 4; screen++) {
+    nav_focus(&ui, nav_int((uint64_t)screen + 100));
+    ui_stack_push(&stack, &ui, &(entry){{screen, 0}, screen * 10});
+    /* The next screen starts on its own default. */
+    CHECK(ui.focus == 0);
+  }
+  CHECK(ui_stack_depth(&stack) == 3);
+  for (int screen = 3; screen >= 1; screen--) {
+    const entry *back = ui_stack_pop(&stack, &ui);
+    CHECK(back != NULL && back->view.screen == screen &&
+          back->item == screen * 10);
+    CHECK(ui.focus == nav_int((uint64_t)screen + 100));
+  }
+  CHECK(ui_stack_pop(&stack, &ui) == NULL);
+  ui_stack_push(&stack, &ui, &(entry){{7, 0}, 0});
+  ui_stack_clear(&stack);
+  CHECK(ui_stack_peek(&stack) == NULL);
+
+  /* Back from an activation, mid-frame: the focus given back is for the
+   * screen built next, not replaced by an item of the screen being left. */
+  static const loom_color white = {255, 255, 255, 255};
+  loom_context ctx;
+  loom_init(&ctx);
+  const nav_id left = nav_child(nav_str("list"), nav_int(2));
+  nav_focus(&ui, left);
+  ui_stack_push(&stack, &ui, &(entry){{0, 0}, 0});
+  loom_begin(&ctx, 500, 300);
+  nav_begin(&ui, &ctx, 1);
+  for (int i = 0; i < 3; i++)
+    nav_item(&ui, nav_child(nav_str("choices"), nav_int(i)),
+             (loom_rect){0, i * 100.0f, 100, 100}, (loom_rect){0, 0, 500, 300});
+  ui_stack_pop(&stack, &ui);
+  CHECK(nav_end(&ui, white, 4)); /* and asks for that frame */
+  CHECK(ui.focus == left);
   loom_destroy(&ctx);
 }
 
@@ -816,6 +866,7 @@ int main(void) {
   test_luna_event();
   test_virtual_list();
   test_nav();
+  test_stack();
   test_video_path();
   test_skyline();
 #ifdef JF_HAVE_MSDF

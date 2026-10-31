@@ -1,12 +1,14 @@
 # webos-native
 
-Native C applications for LG webOS TVs. The project contains three programs:
+Native C applications for LG webOS TVs. The project contains four programs:
 
 - `jellyfin` — a native Jellyfin client.
+- `home` — a Home screen in place of LG's, until the next reboot; see
+  [docs/home.md](docs/home.md).
 - `xmb` — a full-screen shader and a frame-time overlay.
 - `gltri` — 3000 instanced triangles and the same overlay.
 
-All three use the same SDL2 platform layer for webOS windowing, input and OpenGL
+All of them use the same SDL2 platform layer for webOS windowing, input and OpenGL
 ES context creation. Jellyfin links a deliberately small target FFmpeg build for
 container demuxing and audio decode, and packages those shared libraries with
 the app; everything else it needs is already on the TV.
@@ -120,8 +122,9 @@ fields, which is what lets a script get past them.
 ## Test
 
 The backend-agnostic code — the Starfish payloads, the A/V sync arithmetic, the
-clock projection, the atlas packer and the virtual-list geometry — runs here
-too:
+clock projection, the atlas packer, the virtual-list geometry and the
+navigation stack — runs here too, and so do both applications against stand-ins
+for what they talk to (a Jellyfin server, and the TV's Luna services):
 
 ```sh
 ctest --preset host

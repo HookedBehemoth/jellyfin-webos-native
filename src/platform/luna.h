@@ -29,11 +29,31 @@ bool jf_luna_register_lifecycle(void (*on_quit)(void),
                                 void (*on_relaunch)(void));
 void jf_luna_deinit(void);
 
+/* Whether the last relaunch was the Home key, as against SAM opening Home
+ * because nothing else is left in front. Read in on_relaunch. */
+bool jf_luna_relaunch_home_key(void);
+
 /* Asks for tv.model.supportHDR; jf_luna_hdr is 1 or 0 once it answers, and -1
  * before then or off the TV. After jf_luna_register_lifecycle, whose loop
  * delivers the answer. */
 void jf_luna_query_hdr(void);
 int jf_luna_hdr(void);
+
+/* Registers on the bus under `service` itself, for every call that follows,
+ * rather than leaving the name to libhelpers. libhelpers works the name out
+ * from where the executable is, which only an app in its own directory has:
+ * a system app run from /usr/bin - the launcher in LG's Home's place - gets
+ * no connection at all from it. The bus allows the name only to the
+ * executable its role file names. Before any other call here. */
+void jf_luna_set_name(const char *service);
+
+/* Any one-shot call: `reply` gets the answer's payload, or NULL when the bus
+ * gave none. It runs on the GLib thread, like the callbacks above, and the
+ * payload is valid for the call only. False when the call could not be sent,
+ * and always off the TV. Starts the GLib loop if nothing has yet. */
+typedef void (*jf_luna_reply_fn)(const char *payload, void *user);
+bool jf_luna_call(const char *uri, const char *payload, jf_luna_reply_fn reply,
+                  void *user);
 
 /* Print every lifecycle payload. */
 extern bool jf_luna_log;

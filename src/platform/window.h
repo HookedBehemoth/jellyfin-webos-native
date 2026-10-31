@@ -1,6 +1,9 @@
 /*
  * The platform layer: window, GL context, input and the webOS on-screen
- * keyboard, all through SDL2.
+ * keyboard. Two implementations: window.c, through SDL2, everywhere; and
+ * window_wayland.c, the TV's compositor directly, for a window SDL cannot
+ * make (jf_window_set_type), without the keyboard and the exported video
+ * window so far. The rest of this comment is window.c's.
  *
  * SDL is what makes one binary work across webOS releases: talking Wayland
  * directly means binding wl_proxy_marshal_flags, which libwayland-client only
@@ -64,6 +67,12 @@ typedef void (*jf_event_fn)(const jf_event *event);
 
 bool jf_window_init(const char *app_id, const char *title, uint32_t width,
                     uint32_t height);
+/* The compositor's kind of window, "_WEBOS_WINDOW_TYPE_OVERLAY" for one laid
+ * over the app in front, which keeps playing; without it every window is a
+ * card, which sends that app to the background. Before jf_window_init. Only
+ * window_wayland.c can: the TV's SDL sets it only along with a surface group,
+ * and an app SAM starts that way is killed (docs/home.md). */
+void jf_window_set_type(const char *type);
 void jf_window_deinit(void);
 void jf_window_set_handler(jf_event_fn handler);
 
@@ -75,6 +84,12 @@ bool jf_window_wait(void);
 bool jf_window_wait_timeout(int milliseconds);
 
 void jf_window_swap(void);
+
+/* Out of the way, the app beneath in front again; jf_window_post_raise, or the
+ * launcher opening it again, brings it back. */
+void jf_window_minimize(void);
+/* Whether the window has the remote: shown, and nothing over it. */
+bool jf_window_focused(void);
 
 /* Safe from any thread: SDL_PushEvent is the one part of SDL that is. */
 void jf_window_post_quit(void);

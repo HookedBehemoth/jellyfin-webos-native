@@ -18,10 +18,14 @@
 
 typedef struct {
   uint32_t width, height;
-  uint8_t *rgb; /* width * height * 3 bytes, malloc'd; free() it */
+  /* width * height * 3 bytes, malloc'd; free() it. Four bytes a pixel, alpha
+   * last and not premultiplied, from jf_image_decode_rgba. */
+  uint8_t *rgb;
 } jf_image;
 
 bool jf_image_decode(const uint8_t *data, size_t size, jf_image *out);
+/* With its alpha, for artwork drawn over something: an app's icon. */
+bool jf_image_decode_rgba(const uint8_t *data, size_t size, jf_image *out);
 void jf_image_free(jf_image *image);
 /* Logs the libpng version once, so a decode failure on device can be placed. */
 void jf_image_report_version(void);

@@ -31,7 +31,7 @@ static int failures;
 /* Frames until nothing is left to do: every request not held by the mock
  * answered and consumed, and no animation asking for another frame. */
 static void test_ui_settle(void) {
-  const uint64_t deadline = now_ns() + 10000000000ull;
+  const uint64_t deadline = ui_now_ns() + 10000000000ull;
   for (;;) {
     jf_window_poll();
     int wait_ms;
@@ -39,7 +39,7 @@ static void test_ui_settle(void) {
     const bool busy = jf_fetcher_pending(&fetcher) > mock_held();
     if (!drew && !busy)
       return;
-    if (now_ns() > deadline) {
+    if (ui_now_ns() > deadline) {
       fprintf(stderr, "FAIL: the UI did not settle (screen %d, %zu pending)\n",
               (int)screen, jf_fetcher_pending(&fetcher));
       failures++;
@@ -89,7 +89,7 @@ static void capture(const char *name) {
     return;
   char path[512];
   snprintf(path, sizeof(path), "%s/%s.ppm", dir, name);
-  capture_frame(path);
+  ui_capture(path);
 }
 
 /* Ids as the screens declare them, scopes and all. */
@@ -114,7 +114,7 @@ static size_t grid_focus(void) {
 static void go_home(void) {
   if (sidebar_open)
     press(BACK);
-  while (screen != SCREEN_HOME && depth > 0)
+  while (screen != SCREEN_HOME && ui_stack_depth(&stack) > 0)
     press(BACK);
   CHECK(screen == SCREEN_HOME);
 }
@@ -144,6 +144,26 @@ static void test_sign_in(void) {
   press(OK);
   CHECK(screen == SCREEN_AUTH);
   CHECK(ui.focus == nav_str("auth.username"));
+  /* Back to the list lands on the server it was left from, not the top. */
+  press(BACK);
+  CHECK(screen == SCREEN_SERVER);
+  CHECK(ui.focus == nav_str("http://mock.test"));
+  press(OK);
+  CHECK(screen == SCREEN_AUTH);
+  /* And out of Quick Connect, on the button that opened it. */
+  mock_hold(JF_JOB_QUICK_POLL);
+  nav_focus(&ui, nav_str("auth.quick"));
+  test_ui_settle();
+  press(OK);
+  CHECK(screen == SCREEN_QUICK);
+  press(BACK);
+  CHECK(screen == SCREEN_AUTH);
+  CHECK(ui.focus == nav_str("auth.quick"));
+  mock_release(JF_JOB_QUICK_POLL);
+  test_ui_settle();
+  CHECK(screen == SCREEN_AUTH);
+  nav_focus(&ui, nav_str("auth.username"));
+  test_ui_settle();
 
   set_text(username, sizeof(username), "tester");
   set_text(password, sizeof(password), "secret");
@@ -631,6 +651,15 @@ static void test_settings(void) {
   press(BACK);
   CHECK(screen == SCREEN_SETTINGS);
   CHECK(ui.focus == nav_str("settings.licenses"));
+  press(BACK);
+  CHECK(screen == SCREEN_HOME);
+  CHECK(ui.focus == home_card(ROW_RESUME, "movie-0"));
+
+  /* A library opened from the sidebar comes back to the card the sidebar
+   * opened over. */
+  press(LEFT);
+  press(OK);
+  CHECK(screen == SCREEN_GRID);
   press(BACK);
   CHECK(screen == SCREEN_HOME);
   CHECK(ui.focus == home_card(ROW_RESUME, "movie-0"));

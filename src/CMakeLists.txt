@@ -31,6 +31,7 @@ add_library(jf-portable STATIC
         ui/skyline.c
         ui/loom.c
         ui/nav.c
+        ui/stack.c
         platform/luna_json.c)
 target_include_directories(jf-portable PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(jf-portable PUBLIC jf-os m pthread)
@@ -61,7 +62,7 @@ if (TARGET_WEBOS)
     pkg_check_modules(GLIB REQUIRED glib-2.0)
     # The NDK's sysroot carries libEGL and libGLESv2 but no pkg-config files for them.
     set(GL_LIBRARIES GLESv2 EGL)
-    set(PLATFORM_EXTRA ${GLIB_LIBRARIES} helpers)
+    set(PLATFORM_EXTRA ${GLIB_LIBRARIES} helpers luna-service2)
     set(HAVE_PLATFORM ON)
 else ()
     # A desktop without these still builds jf-portable and its tests; it just gets no
@@ -88,23 +89,35 @@ else ()
 endif ()
 
 if (HAVE_PLATFORM)
-    # Window, GL context, input and the webOS lifecycle. Off the TV the webOS-only halves
-    # compile out and SDL picks an ordinary desktop backend, so the probes run either way.
-    add_library(jf-platform STATIC platform/window.c platform/luna.c platform/luna_json.c)
+    # GL and the webOS lifecycle. Off the TV the webOS-only halves compile out.
+    add_library(jf-platform STATIC platform/luna.c platform/luna_json.c)
     target_include_directories(jf-platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_include_directories(jf-platform SYSTEM PUBLIC ${SDL2_INCLUDE_DIRS}
+    target_include_directories(jf-platform SYSTEM PUBLIC
             ${GLIB_INCLUDE_DIRS} ${GLESV2_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS})
-    target_link_directories(jf-platform PUBLIC ${SDL2_LIBRARY_DIRS})
-    target_link_libraries(jf-platform PUBLIC jf-os ${SDL2_LIBRARIES} ${GL_LIBRARIES}
-            ${PLATFORM_EXTRA} pthread)
+    target_link_libraries(jf-platform PUBLIC jf-os ${GL_LIBRARIES} ${PLATFORM_EXTRA} pthread)
     if (TARGET_WEBOS)
         target_compile_definitions(jf-platform PUBLIC JF_WEBOS=1)
+    endif ()
+
+    # The window, its GL context and input (platform/window.h), one of two ways. SDL
+    # everywhere: off the TV it picks an ordinary desktop backend, so everything runs
+    # there, headless tests included. An application links one of these.
+    add_library(jf-window-sdl STATIC platform/window.c)
+    target_include_directories(jf-window-sdl SYSTEM PUBLIC ${SDL2_INCLUDE_DIRS})
+    target_link_directories(jf-window-sdl PUBLIC ${SDL2_LIBRARY_DIRS})
+    target_link_libraries(jf-window-sdl PUBLIC jf-platform ${SDL2_LIBRARIES})
+    # And the TV's compositor directly, for a window SDL cannot make: an overlay over
+    # the app in front. No on-screen keyboard or exported video window yet.
+    if (TARGET_WEBOS)
+        add_library(jf-window-wayland STATIC platform/window_wayland.c)
+        target_link_libraries(jf-window-wayland PUBLIC jf-platform dl)
     endif ()
 
 
     # The instanced UI batch and its glyph atlas.
     pkg_check_modules(FREETYPE REQUIRED freetype2)
-    add_library(jf-ui STATIC ui/glyph_atlas.c ui/font_index.c ui/msdf.c ui/renderer.c)
+    add_library(jf-ui STATIC ui/glyph_atlas.c ui/font_index.c ui/msdf.c ui/renderer.c
+            ui/kit.c)
     target_include_directories(jf-ui PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
     target_include_directories(jf-ui SYSTEM PUBLIC ${FREETYPE_INCLUDE_DIRS})
     target_link_directories(jf-ui PUBLIC ${FREETYPE_LIBRARY_DIRS})
@@ -136,7 +149,7 @@ if (HAVE_PLATFORM)
     # the ASCII framebuffer dump.
     add_library(jf-probe STATIC apps/probe.c ui/text.c)
     target_include_directories(jf-probe PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-    target_link_libraries(jf-probe PUBLIC jf-platform m)
+    target_link_libraries(jf-probe PUBLIC jf-window-sdl m)
     webos_embed(jf-probe SYMBOL font8x16 FILE "${CMAKE_SOURCE_DIR}/assets/font8x16.bin")
     webos_add_shader(jf-probe SYMBOL text_vs SRC "${CMAKE_CURRENT_SOURCE_DIR}/shaders/text.slang"
             ENTRY vsText STAGE vertex)
@@ -174,6 +187,59 @@ if (NOT HAVE_PLATFORM)
     return()
 endif ()
 
+pkg_check_modules(LIBPNG libpng16)
+if (TARGET_WEBOS)
+    # Static: the NDK ships libjson-c.a, so nothing has to be bundled or assumed present
+    # on the TV for four endpoints' worth of parsing.
+    find_library(JSONC_LIBRARY NAMES libjson-c.a REQUIRED)
+    find_path(JSONC_INCLUDE_DIR NAMES json.h PATH_SUFFIXES json-c REQUIRED)
+    set(JSONC_LIBRARIES "${JSONC_LIBRARY}")
+    set(JSONC_INCLUDE_DIRS "${JSONC_INCLUDE_DIR}")
+    set(JSONC_FOUND ON)
+else ()
+    pkg_check_modules(JSONC json-c)
+endif ()
+
+# ---------------------------------------------------------------------- home
+#
+# The Home screen replacement. What it asks of the TV is src/tv: over the Luna bus on
+# the TV, and off it a TV in the process (tv/transport_mock.c), which is also what the
+# launcher's tests run against.
+
+if (LIBPNG_FOUND AND JSONC_FOUND)
+    add_library(jf-tv STATIC tv/tv.c)
+    target_include_directories(jf-tv PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(jf-tv SYSTEM PUBLIC ${JSONC_INCLUDE_DIRS})
+    target_link_directories(jf-tv PUBLIC ${JSONC_LIBRARY_DIRS})
+    target_link_libraries(jf-tv PUBLIC ${JSONC_LIBRARIES} pthread)
+    if (TARGET_WEBOS)
+        target_sources(jf-tv PRIVATE tv/transport_luna.c)
+        target_link_libraries(jf-tv PUBLIC jf-platform)
+    else ()
+        target_sources(jf-tv PRIVATE tv/transport_mock.c)
+        target_compile_definitions(jf-tv PRIVATE JF_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    endif ()
+
+    # Everything the launcher is but its main(), for tests/home_tests.c.
+    add_library(home-app STATIC jf/image.c)
+    target_include_directories(home-app SYSTEM PUBLIC ${LIBPNG_INCLUDE_DIRS})
+    target_link_directories(home-app PUBLIC ${LIBPNG_LIBRARY_DIRS})
+    target_link_libraries(home-app PUBLIC jf-tv jf-ui ${LIBPNG_LIBRARIES} m pthread)
+
+    add_executable(home home/main.c)
+    target_link_libraries(home PRIVATE home-app)
+    # Laid over the app in front, which SDL cannot do on the TV (docs/home.md).
+    if (TARGET_WEBOS)
+        target_link_libraries(home-app PUBLIC jf-window-wayland)
+    else ()
+        target_link_libraries(home-app PUBLIC jf-window-sdl)
+    endif ()
+    webos_add_ipk(TARGET home APPID dev.hookedbehemoth.home TITLE "Home" VERSION 0.0.1
+            COLOR "#090d16" ICON "${CMAKE_SOURCE_DIR}/assets/icon.png" WEBOS_VERSIONS ">=5")
+else ()
+    message(STATUS "No libpng/json-c here - skipping home")
+endif ()
+
 if (TARGET_WEBOS)
     # Ours, for WebSockets: static, and hidden in the binary so the firmware's own
     # libcurl.so.4 stays the media pipeline's. See tools/build-curl.sh.
@@ -188,18 +254,6 @@ if (TARGET_WEBOS)
     set(LIBCURL_LIBRARIES "${CURL_ROOT}/lib/libcurl.a" mbedtls mbedx509 mbedcrypto z)
 else ()
     pkg_check_modules(LIBCURL libcurl)
-endif ()
-pkg_check_modules(LIBPNG libpng16)
-if (TARGET_WEBOS)
-    # Static: the NDK ships libjson-c.a, so nothing has to be bundled or assumed present
-    # on the TV for four endpoints' worth of parsing.
-    find_library(JSONC_LIBRARY NAMES libjson-c.a REQUIRED)
-    find_path(JSONC_INCLUDE_DIR NAMES json.h PATH_SUFFIXES json-c REQUIRED)
-    set(JSONC_LIBRARIES "${JSONC_LIBRARY}")
-    set(JSONC_INCLUDE_DIRS "${JSONC_INCLUDE_DIR}")
-    set(JSONC_FOUND ON)
-else ()
-    pkg_check_modules(JSONC json-c)
 endif ()
 
 if (NOT (LIBCURL_FOUND AND LIBPNG_FOUND AND JSONC_FOUND))

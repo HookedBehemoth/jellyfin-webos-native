@@ -45,6 +45,8 @@ static void emit(const jf_event *event) {
 }
 
 void jf_window_set_handler(jf_event_fn value) { handler = value; }
+/* See window.h: not through SDL. */
+void jf_window_set_type(const char *type) { (void)type; }
 
 static jf_fixed to_fixed(int value) { return value << 8; }
 static jf_fixed pointer_x(int value) {
@@ -261,6 +263,21 @@ void jf_window_post_quit(void) {
   SDL_PushEvent(&event);
 }
 
+bool jf_window_focused(void) {
+  return window != NULL && jf_window_drawable &&
+         (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+}
+
+/* Not every driver reports the minimising back - the offscreen one does not
+ * - so the window is taken as out of sight here, as a raise takes it as back.
+ */
+void jf_window_minimize(void) {
+  if (window == NULL)
+    return;
+  SDL_MinimizeWindow(window);
+  jf_window_drawable = false;
+}
+
 void jf_window_post_raise(void) {
   SDL_Event event;
   memset(&event, 0, sizeof(event));
@@ -312,8 +329,11 @@ static void translate(const SDL_Event *event) {
   /* Only the main thread may touch the window, so post_raise comes back through
    * the queue to be acted on here. */
   case EV_RAISE:
-    if (window != NULL)
+    if (window != NULL) {
+      SDL_RestoreWindow(window);
       SDL_RaiseWindow(window);
+    }
+    jf_window_drawable = true;
     jf_window_frame_requested = true;
     break;
 

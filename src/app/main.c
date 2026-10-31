@@ -39,35 +39,19 @@
 #include "../ui/glyph_atlas.h"
 #include "../ui/loom.h"
 #include "../ui/nav.h"
+#include "../ui/kit.h"
 #include "../ui/renderer.h"
+#include "../ui/stack.h"
+#include "../ui/theme.h"
 #include "licenses.h"
 #include "text_fs.h"
 #include "text_vs.h"
 
 #define APP_ID "dev.hookedbehemoth.jellyfin"
 
-static const loom_color BG = {9, 13, 22, 255};
-static const loom_color PANEL = {20, 27, 40, 255};
-static const loom_color CARD = {27, 36, 52, 255};
-static const loom_color HOT = {38, 51, 70, 255};
-static const loom_color SELECTED = {27, 69, 91, 255};
-static const loom_color ACCENT = {0, 164, 220, 255};
-static const loom_color RED = {228, 96, 96, 255};
-static const loom_color TEXT = {239, 244, 250, 255};
-static const loom_color DIM = {148, 163, 182, 255};
-static const loom_color BORDER = {55, 70, 91, 255};
-static const loom_color WHITE = {255, 255, 255, 255};
-static const loom_color YELLOW = {255, 206, 64, 255};
-
 static jf_renderer *renderer;
 static jf_fetcher fetcher;
 static jf_session session;
-
-static uint64_t now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
 
 /* Where the render thread's time goes, for the stats overlay: the worst frame
  * of each phase over the last second, in thread CPU time. The subtitle render
@@ -89,14 +73,6 @@ static double thread_ms(void) {
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
   return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
-
-typedef struct {
-  float value, start, target;
-  uint64_t started_at, duration;
-} animated_float;
-
-#define NAVIGATION_ANIMATION_NS 180000000ull
-#define SIDEBAR_ANIMATION_NS 280000000ull
 
 static bool animations_enabled = true;
 static bool stats_overlay;
@@ -248,48 +224,6 @@ static void save_preferences(void) {
   jf_arena_destroy(&arena);
 }
 
-static bool animated_float_running(const animated_float *value) {
-  return value->started_at != 0;
-}
-
-static void animated_float_snap(animated_float *value, float target) {
-  value->value = target;
-  value->start = target;
-  value->target = target;
-  value->started_at = 0;
-  value->duration = 0;
-}
-
-static void animated_float_update(animated_float *value, uint64_t now) {
-  if (!animated_float_running(value))
-    return;
-  const float progress =
-      value->duration == 0 ? 1.0f
-                           : (float)(now - value->started_at) / value->duration;
-  if (progress >= 1.0f) {
-    animated_float_snap(value, value->target);
-    return;
-  }
-  /* Ease-out exponential: quick feedback, with the last few pixels settling
-   * softly. */
-  const float eased = 1.0f - powf(2.0f, -10.0f * progress);
-  value->value = value->start + (value->target - value->start) * eased;
-}
-
-static void animated_float_set(animated_float *value, float target,
-                               uint64_t duration) {
-  if (!animations_enabled || fabsf(value->target - target) < 0.01f) {
-    if (!animations_enabled)
-      animated_float_snap(value, target);
-    return;
-  }
-  animated_float_update(value, now_ns());
-  value->start = value->value;
-  value->target = target;
-  value->started_at = now_ns();
-  value->duration = duration;
-}
-
 static uint64_t frame_index;
 
 static size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
@@ -300,24 +234,6 @@ static size_t dec(size_t value) { return value > 0 ? value - 1 : 0; }
 
 static void set_text(char *out, size_t out_len, const char *value) {
   snprintf(out, out_len, "%s", value != NULL ? value : "");
-}
-
-/* Per-frame scratch for formatted labels. A draw command borrows the string
- * until the renderer has consumed it, so these must outlive the layout pass -
- * but only that, hence a ring reset every frame. Sized for a full grid page:
- * every card formats a title and a subtitle to fit its width. */
-static char scratch[256][160];
-static size_t scratch_used;
-
-static const char *fmt(const char *pattern, ...) {
-  if (scratch_used == sizeof(scratch) / sizeof(scratch[0]))
-    return "...";
-  char *out = scratch[scratch_used++];
-  va_list args;
-  va_start(args, pattern);
-  vsnprintf(out, sizeof(scratch[0]), pattern, args);
-  va_end(args);
-  return out;
 }
 
 /* Formatting for text that is copied into fixed storage immediately, which is
@@ -451,24 +367,6 @@ static const poster_slot *artwork(const char *id, const char *tag,
 
 static const poster_slot *poster(const char *id, const char *tag) {
   return artwork(id, tag, JF_IMAGE_PRIMARY, POSTER_W, POSTER_H);
-}
-
-/* The renderer's primitive is a rounded rectangle, so an eight-dot spinner is
- * cheaper than a separate texture or shader program. Its highlighted dot
- * advances with time. */
-static void draw_spinner(loom_context *ctx, float x, float y, float radius,
-                         const loom_rect *clip, float scale) {
-  jf_window_frame_requested = true;
-  const unsigned phase = (unsigned)(now_ns() / 90000000ull) % 8;
-  for (unsigned i = 0; i < 8; i++) {
-    const float angle = ((float)i / 8.0f) * 6.2831853f - 1.5707963f;
-    const float dot = 7.0f * scale;
-    loom_color color = {DIM[0], DIM[1], DIM[2], i == phase ? 255 : 72};
-    loom_fill(ctx,
-              (loom_rect){x + cosf(angle) * radius - dot / 2,
-                          y + sinf(angle) * radius - dot / 2, dot, dot},
-              clip, color, dot / 2);
-  }
 }
 
 /* Texture coordinates that fill `rect` with the image, cropping the long axis
@@ -796,6 +694,8 @@ static uint32_t auth_generation;
 static screen_id screen = SCREEN_SERVER;
 /* Focus and scrolling, for every screen and overlay. */
 static nav ui;
+/* The controls every screen draws with, over `ui` and the renderer. */
+static ui_kit kit = {.nav = &ui, .scale = 1};
 
 /* Where Back goes, as a stack rather than a rule per screen.
  *
@@ -806,16 +706,17 @@ static nav ui;
  * it - re-entering refetches, which is what keeps a details screen current
  * after playback marks something watched. */
 typedef struct {
-  screen_id screen;
+  ui_view view;
   /* The grid's library, the details item, or the season. */
   card card;
   /* The series a season belongs to, so a season can be re-entered. */
   card series;
-  nav_id nav_focus;
 } stack_entry;
 
-static stack_entry stack[12];
-static size_t depth;
+/* Deeper than any real path through this app; past it the oldest goes. */
+static stack_entry stack_entries[12];
+static ui_stack stack = {(unsigned char *)stack_entries, sizeof(stack_entry),
+                         12, 0};
 
 /* Third-party licences. The list is static; the text of one is split into lines
  * when it is opened, so only the licence being read costs anything, and the
@@ -1024,8 +925,6 @@ static void poll_download(void);
 static nav_id picker_row_id(size_t row);
 static size_t track_row(int track);
 static bool playback_paused;
-static screen_id playback_return_screen;
-static nav_id playback_return_focus;
 static uint64_t playback_started_at;
 static uint64_t playback_progress_at;
 /* The player chrome is deliberately transient: it never covers a scene for more
@@ -1035,7 +934,7 @@ static uint64_t playback_controls_until;
 /* Hidden with Up from the seek bar, until the next key or pointer movement. */
 static bool chrome_dismissed;
 /* How far the chrome is in, 0 to 1, and where the focus glow is. */
-static animated_float chrome_motion, glow_x, glow_y;
+static ui_anim chrome_motion, glow_x, glow_y;
 static bool glow_placed;
 
 static bool playback_chrome_wanted(uint64_t now) {
@@ -1045,7 +944,7 @@ static bool playback_chrome_wanted(uint64_t now) {
 
 static void show_playback_chrome(void) {
   chrome_dismissed = false;
-  playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
+  playback_controls_until = ui_now_ns() + PLAYBACK_CONTROLS_NS;
 }
 /* evdev's KEY_SUBTITLE: F10 on a keyboard, Yellow on the remote. */
 #define KEY_SUBTITLE 370
@@ -1062,8 +961,7 @@ static bool capture_requested;
  * settings row. */
 static bool sidebar_open;
 static bool sidebar_closing;
-static animated_float sidebar_slide;
-static screen_id sidebar_return_screen;
+static ui_anim sidebar_slide;
 /* Where the focus was on the screen the sidebar opened over. */
 static nav_id sidebar_return_focus;
 
@@ -1124,7 +1022,7 @@ static void load_home(void) {
 static void restart_discovery(void) {
   discovered_count = 0;
   discovering = true;
-  discovery_until = now_ns() + 30000000000ull;
+  discovery_until = ui_now_ns() + 30000000000ull;
   simple(JF_JOB_DISCOVER);
 }
 
@@ -1213,33 +1111,29 @@ static card library_card(void) {
 static stack_entry here(void) {
   stack_entry entry;
   memset(&entry, 0, sizeof(entry));
-  entry.screen = screen;
+  entry.view.screen = (int)screen;
   entry.card = screen == SCREEN_GRID     ? library_card()
                : screen == SCREEN_SEASON ? season_detail
                                          : detail;
   entry.series = detail;
-  entry.nav_focus = ui.focus;
   return entry;
 }
 
+/* Every step forward: Back comes here again, on the item it left. */
 static void push(void) {
-  if (depth == sizeof(stack) / sizeof(stack[0])) {
-    /* Deeper than any real path through this app; drop the oldest rather than
-     * refuse to navigate. */
-    memmove(&stack[0], &stack[1], (depth - 1) * sizeof(stack[0]));
-    depth--;
-  }
-  stack[depth++] = here();
+  const stack_entry entry = here();
+  ui_stack_push(&stack, &ui, &entry);
 }
 
+/* Back past the first screen closes the app. */
 static void pop(void) {
-  if (depth == 0) {
+  const stack_entry *top = ui_stack_pop(&stack, &ui);
+  if (top == NULL) {
     jf_window_running = false;
     return;
   }
-  const stack_entry entry = stack[--depth];
-  nav_focus(&ui, entry.nav_focus);
-  switch (entry.screen) {
+  const stack_entry entry = *top;
+  switch ((screen_id)entry.view.screen) {
   case SCREEN_HOME:
     screen = SCREEN_HOME;
     break;
@@ -1259,10 +1153,21 @@ static void pop(void) {
     open_season(&entry.card);
     break;
   default:
-    /* Nothing above the sign-in screens is ever pushed. */
-    screen = entry.screen;
+    /* The sign-in screens, Settings and the licence list: all they show is
+     * already here. */
+    screen = (screen_id)entry.view.screen;
     break;
   }
+}
+
+/* Signed out, or the session given up on: the sign-in screen, with only the
+ * server list to go back to. */
+static void return_to_auth(void) {
+  ui_stack_clear(&stack);
+  nav_focus(&ui, 0);
+  screen = SCREEN_SERVER;
+  push();
+  screen = SCREEN_AUTH;
 }
 
 /* ------------------------------------------------------------ sign-in flow */
@@ -1312,7 +1217,7 @@ static void signed_in(const jf_auth *auth, const char *used_password) {
   }
   screen = SCREEN_HOME;
   nav_focus(&ui, 0);
-  depth = 0;
+  ui_stack_clear(&stack);
   load_home();
 }
 
@@ -1357,9 +1262,7 @@ static void sign_out(void) {
   for (size_t i = 0; i < ROW_COUNT; i++)
     rows[i].count = 0;
   categories_row.count = 0;
-  depth = 0;
-  screen = SCREEN_AUTH;
-  nav_focus(&ui, 0);
+  return_to_auth();
   status_text[0] = '\0';
   status_error = false;
 }
@@ -1470,8 +1373,7 @@ static void on_failure(jf_task *task) {
     if (strcmp(task->error, "ClientError") == 0 ||
         strcmp(task->error, "Unauthorized") == 0 ||
         strcmp(task->error, "ServerError") == 0) {
-      screen = SCREEN_AUTH;
-      nav_focus(&ui, 0);
+      return_to_auth();
       set_error("%s for %s at %s",
                 strcmp(task->error, "ServerError") == 0
                     ? "Internal server error"
@@ -1494,8 +1396,7 @@ static void on_failure(jf_task *task) {
     }
     if (strcmp(task->error, "ClientError") == 0 ||
         strcmp(task->error, "ServerError") == 0) {
-      screen = SCREEN_AUTH;
-      nav_focus(&ui, 0);
+      return_to_auth();
       set_error("%s for %s at %s",
                 strcmp(task->error, "ServerError") == 0
                     ? "Internal server error"
@@ -1526,8 +1427,7 @@ static void on_failure(jf_task *task) {
     if (strcmp(task->error, "ClientError") == 0 ||
         strcmp(task->error, "Unauthorized") == 0 ||
         strcmp(task->error, "ServerError") == 0) {
-      screen = SCREEN_AUTH;
-      nav_focus(&ui, 0);
+      return_to_auth();
       set_error("%s for %s at %s",
                 strcmp(task->error, "ServerError") == 0
                     ? "Internal server error"
@@ -1601,7 +1501,7 @@ static void consume(jf_task *task) {
                sizeof(discovered[0].address), task->servers[incoming].address);
       discovered_count++;
     }
-    if (now_ns() < discovery_until) {
+    if (ui_now_ns() < discovery_until) {
       simple(JF_JOB_DISCOVER);
     } else {
       discovering = false;
@@ -1623,6 +1523,8 @@ static void consume(jf_task *task) {
   case JF_JOB_QUICK_INITIATE:
     set_text(quick_code, sizeof(quick_code), task->quick.code);
     set_text(quick_secret, sizeof(quick_secret), task->quick.secret);
+    if (screen == SCREEN_AUTH)
+      push();
     screen = SCREEN_QUICK;
     set_status("Waiting for approval");
     /* Also on stdout: on a TV the log is often easier to reach than the screen,
@@ -1879,8 +1781,8 @@ static void pump(void) {
     jf_fetcher_release(&fetcher, task);
   }
   if (screen == SCREEN_QUICK && quick_secret[0] != '\0' &&
-      now_ns() > quick_poll_at) {
-    quick_poll_at = now_ns() + 2000000000ull;
+      ui_now_ns() > quick_poll_at) {
+    quick_poll_at = ui_now_ns() + 2000000000ull;
     jf_task *task = request(JF_JOB_QUICK_POLL, 0);
     if (task != NULL) {
       set_text(task->a, sizeof(task->a), quick_secret);
@@ -1891,9 +1793,9 @@ static void pump(void) {
   poll_sources();
   if (screen == SCREEN_PLAYBACK && !playback_paused &&
       playback_item_id[0] != '\0' && jf_player_state_get() == JF_PLAYING &&
-      now_ns() >= playback_progress_at) {
+      ui_now_ns() >= playback_progress_at) {
     report_playback(JF_JOB_PLAYBACK_PROGRESS);
-    playback_progress_at = now_ns() + 15000000000ull;
+    playback_progress_at = ui_now_ns() + 15000000000ull;
   }
 }
 
@@ -1991,8 +1893,9 @@ static void use_server(const char *address, const char *name) {
   set_text(server_name, sizeof(server_name),
            name != NULL && name[0] != '\0' ? name : address);
   jf_fetcher_set_session(&fetcher, &session);
+  if (screen == SCREEN_SERVER)
+    push();
   screen = SCREEN_AUTH;
-  nav_focus(&ui, 0);
   status_text[0] = '\0';
   status_error = false;
 }
@@ -2050,6 +1953,7 @@ static void open_license(size_t index) {
     license_text_width =
         maxf(license_text_width,
              jf_renderer_measure(renderer, license_lines[i], 1.0f));
+  push();
   screen = SCREEN_LICENSE;
 }
 
@@ -2057,9 +1961,8 @@ static void open_sidebar(void) {
   end_edit();
   sidebar_open = true;
   sidebar_closing = false;
-  sidebar_return_screen = screen;
   sidebar_return_focus = ui.focus;
-  animated_float_set(&sidebar_slide, 1.0f, SIDEBAR_ANIMATION_NS);
+  ui_anim_set(&sidebar_slide, 1.0f, UI_SLIDE_NS, animations_enabled);
 }
 
 static void close_sidebar(void) {
@@ -2067,7 +1970,7 @@ static void close_sidebar(void) {
     return;
   sidebar_closing = true;
   nav_focus(&ui, sidebar_return_focus);
-  animated_float_set(&sidebar_slide, 0.0f, NAVIGATION_ANIMATION_NS);
+  ui_anim_set(&sidebar_slide, 0.0f, UI_NAVIGATION_NS, animations_enabled);
 }
 
 /* Row `index` of the sidebar: a category, or past the last one, Settings. */
@@ -2080,6 +1983,7 @@ static void activate_sidebar(size_t index) {
     open_grid(&chosen);
     return;
   }
+  push();
   screen = SCREEN_SETTINGS;
 }
 
@@ -2093,9 +1997,8 @@ static void go_back(void) {
     jf_player_stop();
     playback_paused = false;
     playback_item_id[0] = '\0';
-    screen = playback_return_screen;
-    nav_focus(&ui, playback_return_focus);
     set_status("Stopped playback");
+    pop();
     return;
   }
   if (screen == SCREEN_SERVER && connecting) {
@@ -2107,38 +2010,22 @@ static void go_back(void) {
     end_edit();
     return;
   }
+  /* What leaving each screen undoes; where it goes is the stack's. */
   switch (screen) {
-  case SCREEN_SERVER:
-    jf_window_running = false;
-    break;
   case SCREEN_AUTH:
     auth_generation++;
-    screen = SCREEN_SERVER;
-    nav_focus(&ui, 0);
     break;
   case SCREEN_QUICK:
     auth_generation++;
     quick_secret[0] = '\0';
-    screen = SCREEN_AUTH;
-    nav_focus(&ui, 0);
-    break;
-  case SCREEN_SETTINGS:
-    screen = sidebar_return_screen;
-    nav_focus(&ui, sidebar_return_focus);
-    break;
-  case SCREEN_LICENSES:
-    screen = SCREEN_SETTINGS;
-    nav_focus(&ui, nav_str("settings.licenses"));
     break;
   case SCREEN_LICENSE:
-    nav_focus(&ui, nav_child(nav_str("licenses"), nav_int(license_open)));
     open_license(JF_LICENSE_COUNT); /* frees the text */
-    screen = SCREEN_LICENSES;
     break;
   default:
-    pop();
     break;
   }
+  pop();
 }
 
 /* The transport row. The play/pause button is the one that toggles; the rest
@@ -2447,13 +2334,14 @@ static void start_playback(const char *id, const char *title,
     jf_fetcher_start(&fetcher, adjacent);
   }
   playback_paused = false;
-  playback_started_at = now_ns();
+  playback_started_at = ui_now_ns();
   playback_progress_at = playback_started_at + 15000000000ull;
-  playback_return_screen = screen;
-  playback_return_focus = ui.focus;
+  /* One episode into the next replaces it: Back still goes where it went. */
+  if (screen != SCREEN_PLAYBACK)
+    push();
   nav_focus(&ui, button_id(PLAY_PAUSE_INDEX));
   glow_placed = false;
-  animated_float_snap(&chrome_motion, 0);
+  ui_anim_snap(&chrome_motion, 0);
   show_playback_chrome();
   screen = SCREEN_PLAYBACK;
   report_playback(JF_JOB_PLAYBACK_STARTED);
@@ -3008,7 +2896,7 @@ static void sources_done(const jf_task *task) {
     /* Installing happens in the background: the list says when it is done. */
     snprintf(sources.installing, sizeof(sources.installing), "%.95s", task->a);
     sources.polls = 0;
-    sources.poll_at = now_ns();
+    sources.poll_at = ui_now_ns();
     return;
   case JF_JOB_SOURCE_TOGGLE:
     sources.changed = true;
@@ -3031,9 +2919,9 @@ static void sources_done(const jf_task *task) {
 /* Looks at the list while an install finishes. From pump. */
 static void poll_sources(void) {
   if (sources.installing[0] == '\0' || sources.loading ||
-      now_ns() < sources.poll_at)
+      ui_now_ns() < sources.poll_at)
     return;
-  sources.poll_at = now_ns() + 1500000000ull;
+  sources.poll_at = ui_now_ns() + 1500000000ull;
   refresh_sources();
 }
 
@@ -3153,7 +3041,7 @@ static void search_listed(const jf_playback_info *info) {
 /* Asks for the list while a download waits to be listed. From pump. */
 static void poll_download(void) {
   if (search.phase != DOWNLOAD_LISTING || search.poll_in_flight ||
-      now_ns() < search.poll_at)
+      ui_now_ns() < search.poll_at)
     return;
   jf_task *info = request(JF_JOB_PLAYBACK_INFO, DOWNLOAD_POLL_TAG);
   if (info == NULL)
@@ -3161,7 +3049,7 @@ static void poll_download(void) {
   set_text(info->a, sizeof(info->a), playback_item_id);
   jf_fetcher_start(&fetcher, info);
   search.poll_in_flight = true;
-  search.poll_at = now_ns() + DOWNLOAD_POLL_NS;
+  search.poll_at = ui_now_ns() + DOWNLOAD_POLL_NS;
 }
 
 static void search_done(const jf_task *task) {
@@ -3178,7 +3066,7 @@ static void search_done(const jf_task *task) {
   if (task->job == JF_JOB_SUBTITLE_DOWNLOAD) {
     search.phase = DOWNLOAD_LISTING;
     search.polls = 0;
-    search.poll_at = now_ns();
+    search.poll_at = ui_now_ns();
     poll_download();
     return;
   }
@@ -3277,18 +3165,14 @@ static void play_adjacent(const card *episode) {
   if (!episode->present)
     return;
   const card chosen = *episode;
-  const screen_id back = playback_return_screen;
-  const nav_id back_focus = playback_return_focus;
   report_leaving();
   jf_player_stop();
   start_playback(chosen.id, chosen.episode_title, chosen.series_id,
                  chosen.playback_position_ticks);
-  playback_return_screen = back;
-  playback_return_focus = back_focus;
 }
 
 static void activate_playback(size_t index) {
-  playback_controls_until = now_ns() + PLAYBACK_CONTROLS_NS;
+  playback_controls_until = ui_now_ns() + PLAYBACK_CONTROLS_NS;
   switch (playback_buttons[index].action) {
   case ACTION_BACK_30:
     jf_player_seek(-30);
@@ -3346,7 +3230,7 @@ static void end_scrub(void) {
 }
 
 static void scrub(int direction, bool repeat) {
-  const uint64_t now = now_ns();
+  const uint64_t now = ui_now_ns();
   if (!repeat) {
     end_scrub();
     jf_player_seek(direction * 10);
@@ -3370,7 +3254,7 @@ static void scrub(int direction, bool repeat) {
 }
 
 static void playback_key(uint32_t code, bool repeat) {
-  const bool shown = playback_chrome_wanted(now_ns());
+  const bool shown = playback_chrome_wanted(ui_now_ns());
   show_playback_chrome();
   const bool ok = code == 28 || code == 96 || code == 352;
   if (!shown) {
@@ -3438,7 +3322,7 @@ static void toggle_animations(void) {
   animations_enabled = !animations_enabled;
   save_preferences();
   if (!animations_enabled) {
-    animated_float_snap(&sidebar_slide, sidebar_open ? 1.0f : 0.0f);
+    ui_anim_snap(&sidebar_slide, sidebar_open ? 1.0f : 0.0f);
   }
 }
 
@@ -3607,45 +3491,12 @@ static void draw_heading_and_status(loom_context *ctx, float width,
   if (heading[0] != '\0')
     loom_label(ctx,
                (loom_rect){margin, 40 * scale, width - margin * 2, 50 * scale},
-               NULL, heading, TEXT, 32 * scale);
+               NULL, heading, UI_TEXT, 32 * scale);
   if (status_text[0] != '\0' && status_error)
     loom_label(ctx,
                (loom_rect){margin, height - 46 * scale, width - margin * 2,
                            32 * scale},
-               NULL, status_text, status_error ? RED : DIM, 19 * scale);
-}
-
-/* Controls declare themselves to nav and draw; the flags they return say what
- * happened to them this frame. */
-static unsigned draw_button(loom_context *ctx, loom_rect rect,
-                            const char *label, nav_id id, float scale) {
-  const unsigned flags = nav_item(&ui, id, rect, ctx->viewport);
-  const bool focused = flags & NAV_FOCUSED;
-  loom_fill(ctx, rect, NULL, flags & NAV_HOVERED ? HOT : CARD, 12 * scale);
-  loom_stroke(ctx, rect, NULL, focused ? ACCENT : BORDER,
-              focused ? 4 * scale : 2 * scale, 12 * scale);
-  loom_label(ctx,
-             (loom_rect){rect.x + 24 * scale,
-                         rect.y + (rect.h - 30 * scale) / 2,
-                         rect.w - 48 * scale, 38 * scale},
-             &rect, label, TEXT, 25 * scale);
-  return flags;
-}
-
-static unsigned draw_action_button(loom_context *ctx, loom_rect rect,
-                                   const char *label, nav_id id, float scale) {
-  const unsigned flags = nav_item(&ui, id, rect, ctx->viewport);
-  const bool focused = flags & NAV_FOCUSED;
-  loom_fill(ctx, rect, NULL, flags & NAV_HOVERED ? SELECTED : ACCENT,
-            12 * scale);
-  loom_stroke(ctx, rect, NULL, focused ? WHITE : ACCENT,
-              focused ? 4 * scale : 2 * scale, 12 * scale);
-  loom_label(ctx,
-             (loom_rect){rect.x + 24 * scale,
-                         rect.y + (rect.h - 30 * scale) / 2,
-                         rect.w - 48 * scale, 38 * scale},
-             &rect, label, WHITE, 25 * scale);
-  return flags;
+               NULL, status_text, status_error ? UI_RED : UI_DIM, 19 * scale);
 }
 
 /* Activating a field starts editing it. */
@@ -3655,11 +3506,11 @@ static void draw_field(loom_context *ctx, loom_rect rect, const char *label,
   const bool editing = active_field == which;
   const bool lit = (flags & NAV_FOCUSED) || editing;
   loom_fill(ctx, rect, NULL,
-            editing               ? SELECTED
-            : flags & NAV_HOVERED ? HOT
-                                  : CARD,
+            editing               ? UI_SELECTED
+            : flags & NAV_HOVERED ? UI_HOT
+                                  : UI_CARD,
             10 * scale);
-  loom_stroke(ctx, rect, NULL, lit ? ACCENT : BORDER,
+  loom_stroke(ctx, rect, NULL, lit ? UI_ACCENT : UI_BORDER,
               lit ? 4 * scale : 2 * scale, 10 * scale);
 
   size_t capacity = 0;
@@ -3675,32 +3526,10 @@ static void draw_field(loom_context *ctx, loom_rect rect, const char *label,
   loom_label(ctx,
              (loom_rect){rect.x + 22 * scale, rect.y + 17 * scale,
                          rect.w - 44 * scale, 38 * scale},
-             &rect, empty ? label : contents, empty ? DIM : TEXT, 24 * scale);
+             &rect, empty ? label : contents, empty ? UI_DIM : UI_TEXT,
+             24 * scale);
   if (flags & NAV_ACTIVATED)
     begin_edit(which, rect);
-}
-
-/* Trim `text` to `width`, adding an ellipsis. Measured against the real glyph
- * advances, and backing up over whole UTF-8 sequences so a cut never lands
- * inside one. */
-static const char *ellipsize(const char *text, float width, float size) {
-  if (jf_renderer_measure(renderer, text, size) <= width)
-    return text;
-  const float dots = jf_renderer_measure(renderer, "...", size);
-  char probe[256];
-  size_t take = min_size(strlen(text), sizeof(probe) - 1);
-  while (take > 1) {
-    memcpy(probe, text, take);
-    probe[take] = '\0';
-    if (jf_renderer_measure(renderer, probe, size) <= width - dots)
-      break;
-    take--;
-    while (take > 0 && ((unsigned char)text[take] & 0xc0) == 0x80)
-      take--;
-  }
-  memcpy(probe, text, take);
-  probe[take] = '\0';
-  return fmt("%s...", probe);
 }
 
 /* The card whose poster stands for this one. Seasons may omit both SeriesId and
@@ -3731,7 +3560,7 @@ static bool draw_blur(loom_context *ctx, loom_rect rect, loom_rect clip,
   const float uv[4] = {(x + 0.5f) / width, (y + 0.5f) / height,
                        (x + source->blur_width - 0.5f) / width,
                        (y + source->blur_height - 0.5f) / height};
-  loom_textured(ctx, rect, &clip, blur_atlas, uv, WHITE, radius);
+  loom_textured(ctx, rect, &clip, blur_atlas, uv, UI_WHITE, radius);
   return true;
 }
 
@@ -3749,17 +3578,17 @@ static void draw_watch_badge(loom_context *ctx, loom_rect art, loom_rect clip,
       return;
   }
   const char *label =
-      episode ? "\xe2\x9c\x93" : fmt("%u", count); /* U+2713 CHECK MARK */
+      episode ? "\xe2\x9c\x93" : ui_fmt("%u", count); /* U+2713 CHECK MARK */
   const float size = 22 * scale;
   const float measured = jf_renderer_measure(renderer, label, size);
   const float w = maxf(36 * scale, measured + 16 * scale);
   const loom_rect badge = {art.x + art.w - w - 8 * scale, art.y + 8 * scale, w,
                            36 * scale};
-  loom_fill(ctx, badge, &clip, ACCENT, 6 * scale);
+  loom_fill(ctx, badge, &clip, UI_ACCENT, 6 * scale);
   loom_label(ctx,
              (loom_rect){badge.x + (badge.w - measured) / 2,
                          badge.y + 3 * scale, badge.w, badge.h},
-             &clip, label, WHITE, size);
+             &clip, label, UI_WHITE, size);
 }
 
 /* One poster card. Returns true when a pointer click landed on it, so the
@@ -3779,34 +3608,34 @@ static void draw_card(loom_context *ctx, loom_rect rect, loom_rect clip,
   if (slot != NULL) {
     float uv[4];
     cover_uv(slot, art, uv);
-    loom_textured(ctx, art, &clip, slot->texture, uv, WHITE, 10 * scale);
+    loom_textured(ctx, art, &clip, slot->texture, uv, UI_WHITE, 10 * scale);
   } else if (!draw_blur(ctx, art, clip, poster_card(source), 10 * scale)) {
-    loom_fill(ctx, art, &clip, hot ? HOT : CARD, 10 * scale);
+    loom_fill(ctx, art, &clip, hot ? UI_HOT : UI_CARD, 10 * scale);
     if (artwork_loading(source->poster_id, source->poster_tag, JF_IMAGE_PRIMARY,
                         POSTER_W, POSTER_H))
-      draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale, &clip,
-                   scale);
+      ui_spinner(&kit, ctx, art.x + art.w / 2, art.y + art.h / 2, 18 * scale,
+                 &clip);
   }
   draw_watch_badge(ctx, art, clip, source, scale);
 
   if (source->progress > 1) {
     const loom_rect bar = {art.x + 5 * scale, art.y + art.h - 10 * scale,
                            art.w - 10 * scale, 6 * scale};
-    loom_fill(ctx, bar, &clip, BORDER, 3 * scale);
+    loom_fill(ctx, bar, &clip, UI_BORDER, 3 * scale);
     loom_fill(ctx,
               (loom_rect){bar.x, bar.y,
                           bar.w * minf(source->progress, 100) / 100, bar.h},
-              &clip, ACCENT, 3 * scale);
+              &clip, UI_ACCENT, 3 * scale);
   }
   const loom_rect text_clip = loom_intersect(rect, clip);
   loom_label(
       ctx, (loom_rect){rect.x, art.y + art.h + 12 * scale, rect.w, 32 * scale},
-      &text_clip, ellipsize(source->title, rect.w, 21 * scale),
-      focused ? TEXT : DIM, 21 * scale);
+      &text_clip, ui_ellipsize(&kit, source->title, rect.w, 21 * scale),
+      focused ? UI_TEXT : UI_DIM, 21 * scale);
   loom_label(
       ctx, (loom_rect){rect.x, art.y + art.h + 44 * scale, rect.w, 28 * scale},
-      &text_clip, ellipsize(source->subtitle, rect.w, 17 * scale), DIM,
-      17 * scale);
+      &text_clip, ui_ellipsize(&kit, source->subtitle, rect.w, 17 * scale),
+      UI_DIM, 17 * scale);
 }
 
 static void draw_metadata(loom_context *ctx, loom_rect rect,
@@ -3821,75 +3650,26 @@ static void draw_metadata(loom_context *ctx, loom_rect rect,
   if (rating != NULL && rating[0] != '\0') {
     static const char star[] = "\xe2\x98\x85"; /* U+2605 BLACK STAR */
     loom_label(ctx, (loom_rect){x, rect.y, size * 1.5f, rect.h}, clip, star,
-               YELLOW, size);
+               UI_YELLOW, size);
     x += jf_renderer_measure(renderer, star, size) + size * 0.3f;
     loom_label(ctx,
                (loom_rect){x, rect.y, maxf(0, rect.x + rect.w - x), rect.h},
-               clip, rating, TEXT, size);
-  }
-}
-
-/* Greedy word wrap against the real glyph advances. The renderer clips a label
- * to its rect but does not break it, so an overview needs splitting before it
- * becomes draw commands. */
-static void draw_wrapped(loom_context *ctx, loom_rect rect, const char *text,
-                         float size) {
-  float y = rect.y;
-  const char *rest = text;
-  char line[512];
-  while (*rest != '\0' && y + size * 1.4f <= rect.y + rect.h) {
-    const char *newline = strchr(rest, '\n');
-    size_t limit = newline != NULL ? (size_t)(newline - rest) : strlen(rest);
-    if (limit == 0) {
-      rest++;
-      y += size * 1.45f;
-      continue;
-    }
-    if (limit > sizeof(line) - 1)
-      limit = sizeof(line) - 1;
-    size_t take = limit;
-    for (;;) {
-      memcpy(line, rest, take);
-      line[take] = '\0';
-      if (jf_renderer_measure(renderer, line, size) <= rect.w)
-        break;
-      const char *space = NULL;
-      for (size_t i = take; i > 0; i--)
-        if (rest[i - 1] == ' ') {
-          space = rest + i - 1;
-          break;
-        }
-      if (space == NULL)
-        break;
-      take = (size_t)(space - rest);
-    }
-    if (take == 0)
-      break;
-    memcpy(line, rest, take);
-    line[take] = '\0';
-    loom_label(ctx, (loom_rect){rect.x, y, rect.w, size * 1.4f}, &rect,
-               fmt("%s", line), TEXT, size);
-    rest += take;
-    if (take == limit && newline != NULL)
-      rest++;
-    while (*rest == ' ' || *rest == '\t' || *rest == '\r')
-      rest++;
-    y += size * 1.45f;
+               clip, rating, UI_TEXT, size);
   }
 }
 
 static void draw_server(loom_context *ctx, float width, float scale) {
   const loom_rect panel = {390 * scale, 80 * scale, width - 780 * scale,
                            920 * scale};
-  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
-  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_fill(ctx, panel, NULL, UI_PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, UI_BORDER, 2 * scale, 18 * scale);
   const float x = panel.x + 54 * scale;
   const float w = panel.w - 108 * scale;
   draw_field(ctx, (loom_rect){x, panel.y + 48 * scale, w, 70 * scale},
              "Server URL", EDIT_URL, nav_str("server.url"), scale);
-  if (draw_action_button(ctx,
-                         (loom_rect){x, panel.y + 142 * scale, w, 70 * scale},
-                         "Connect", nav_str("server.connect"), scale) &
+  if (ui_action_button(&kit, ctx,
+                       (loom_rect){x, panel.y + 142 * scale, w, 70 * scale},
+                       "Connect", nav_str("server.connect")) &
       NAV_ACTIVATED)
     connect_server();
 
@@ -3902,70 +3682,72 @@ static void draw_server(loom_context *ctx, float width, float scale) {
     const bool focused = flags & NAV_FOCUSED;
     if (flags & NAV_ACTIVATED)
       chosen = index;
-    loom_fill(ctx, rect, &panel, flags & NAV_HOVERED ? HOT : CARD, 13 * scale);
-    loom_stroke(ctx, rect, &panel, focused ? ACCENT : BORDER,
+    loom_fill(ctx, rect, &panel, flags & NAV_HOVERED ? UI_HOT : UI_CARD,
+              13 * scale);
+    loom_stroke(ctx, rect, &panel, focused ? UI_ACCENT : UI_BORDER,
                 focused ? 4 * scale : 2 * scale, 13 * scale);
     loom_fill(ctx,
               (loom_rect){rect.x + 18 * scale, rect.y + 14 * scale, 40 * scale,
                           40 * scale},
-              &rect, ACCENT, 22 * scale);
+              &rect, UI_ACCENT, 22 * scale);
     loom_label(ctx,
                (loom_rect){rect.x + 78 * scale, rect.y + 7 * scale,
                            w - 96 * scale, 30 * scale},
-               &rect, discovered[index].name, TEXT, 26 * scale);
+               &rect, discovered[index].name, UI_TEXT, 26 * scale);
     loom_label(ctx,
                (loom_rect){rect.x + 78 * scale, rect.y + 38 * scale,
                            w - 96 * scale, 24 * scale},
-               &rect, discovered[index].address, DIM, 20 * scale);
+               &rect, discovered[index].address, UI_DIM, 20 * scale);
     y += 80 * scale;
   }
-  if (draw_button(ctx, (loom_rect){x, y + 8 * scale, w, 62 * scale},
-                  "Search again", nav_str("server.search"), scale) &
+  if (ui_button(&kit, ctx, (loom_rect){x, y + 8 * scale, w, 62 * scale},
+                "Search again", nav_str("server.search")) &
       NAV_ACTIVATED)
     restart_discovery();
   else if (chosen < discovered_count)
     use_server(discovered[chosen].address, discovered[chosen].name);
   if (discovering || connecting)
-    draw_spinner(ctx, panel.x + panel.w - 46 * scale,
-                 panel.y + panel.h - 46 * scale, 18 * scale, &panel, scale);
+    ui_spinner(&kit, ctx, panel.x + panel.w - 46 * scale,
+               panel.y + panel.h - 46 * scale, 18 * scale, &panel);
   if (connecting) {
     const loom_rect modal = {width / 2 - 190 * scale, 440 * scale, 380 * scale,
                              150 * scale};
-    loom_fill(ctx, modal, NULL, CARD, 16 * scale);
-    loom_stroke(ctx, modal, NULL, ACCENT, 2 * scale, 16 * scale);
-    draw_spinner(ctx, modal.x + 48 * scale, modal.y + modal.h / 2, 16 * scale,
-                 &modal, scale);
+    loom_fill(ctx, modal, NULL, UI_CARD, 16 * scale);
+    loom_stroke(ctx, modal, NULL, UI_ACCENT, 2 * scale, 16 * scale);
+    ui_spinner(&kit, ctx, modal.x + 48 * scale, modal.y + modal.h / 2,
+               16 * scale, &modal);
     loom_label(ctx,
                (loom_rect){modal.x + 90 * scale, modal.y + 54 * scale,
                            modal.w - 116 * scale, 42 * scale},
-               &modal, "Connecting...", TEXT, 26 * scale);
+               &modal, "Connecting...", UI_TEXT, 26 * scale);
   }
 }
 
 static void draw_auth(loom_context *ctx, float width, float scale) {
   const loom_rect panel = {430 * scale, 180 * scale, width - 860 * scale,
                            680 * scale};
-  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
-  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_fill(ctx, panel, NULL, UI_PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, UI_BORDER, 2 * scale, 18 * scale);
   const float x = panel.x + 64 * scale;
   const float w = panel.w - 128 * scale;
   loom_label(ctx, (loom_rect){x, panel.y + 38 * scale, w, 50 * scale}, &panel,
-             server_name, TEXT, 34 * scale);
+             server_name, UI_TEXT, 34 * scale);
   loom_label(ctx, (loom_rect){x, panel.y + 92 * scale, w, 32 * scale}, &panel,
-             session.url, DIM, 20 * scale);
+             session.url, UI_DIM, 20 * scale);
   draw_field(ctx, (loom_rect){x, panel.y + 180 * scale, w, 70 * scale},
              "Username", EDIT_USERNAME, nav_str("auth.username"), scale);
   draw_field(ctx, (loom_rect){x, panel.y + 320 * scale, w, 70 * scale},
              "Password", EDIT_PASSWORD, nav_str("auth.password"), scale);
-  if (draw_action_button(
-          ctx, (loom_rect){x, panel.y + 450 * scale, 280 * scale, 72 * scale},
-          "Sign in", nav_str("auth.sign_in"), scale) &
+  if (ui_action_button(
+          &kit, ctx,
+          (loom_rect){x, panel.y + 450 * scale, 280 * scale, 72 * scale},
+          "Sign in", nav_str("auth.sign_in")) &
       NAV_ACTIVATED)
     sign_in();
-  if (draw_action_button(ctx,
-                         (loom_rect){x + 310 * scale, panel.y + 450 * scale,
-                                     330 * scale, 72 * scale},
-                         "Quick Connect", nav_str("auth.quick"), scale) &
+  if (ui_action_button(&kit, ctx,
+                       (loom_rect){x + 310 * scale, panel.y + 450 * scale,
+                                   330 * scale, 72 * scale},
+                       "Quick Connect", nav_str("auth.quick")) &
       NAV_ACTIVATED) {
     simple(JF_JOB_QUICK_INITIATE);
     set_status("Requesting a Quick Connect code...");
@@ -3975,17 +3757,17 @@ static void draw_auth(loom_context *ctx, float width, float scale) {
 static void draw_quick(loom_context *ctx, float width, float scale) {
   const loom_rect panel = {470 * scale, 200 * scale, width - 940 * scale,
                            640 * scale};
-  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
-  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_fill(ctx, panel, NULL, UI_PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, UI_BORDER, 2 * scale, 18 * scale);
   loom_label(ctx,
              (loom_rect){panel.x + 70 * scale, panel.y + 50 * scale,
                          panel.w - 140 * scale, 42 * scale},
-             &panel, "Enter this code in a signed-in Jellyfin client", TEXT,
+             &panel, "Enter this code in a signed-in Jellyfin client", UI_TEXT,
              25 * scale);
   const loom_rect code = {panel.x + 150 * scale, panel.y + 140 * scale,
                           panel.w - 300 * scale, 160 * scale};
-  loom_fill(ctx, code, &panel, CARD, 15 * scale);
-  loom_stroke(ctx, code, &panel, ACCENT, 3 * scale, 15 * scale);
+  loom_fill(ctx, code, &panel, UI_CARD, 15 * scale);
+  loom_stroke(ctx, code, &panel, UI_ACCENT, 3 * scale, 15 * scale);
   const char *text = quick_code[0] != '\0' ? quick_code : "------";
   /* Centred by measuring, because the code is six digits in a proportional font
    * and eyeballing an offset is wrong at every scale. */
@@ -3994,15 +3776,16 @@ static void draw_quick(loom_context *ctx, float width, float scale) {
   loom_label(ctx,
              (loom_rect){code.x + code.w / 2 - half, code.y + 46 * scale,
                          code.w, 80 * scale},
-             &code, text, ACCENT, size);
+             &code, text, UI_ACCENT, size);
   loom_label(ctx,
              (loom_rect){panel.x + 70 * scale, panel.y + 340 * scale,
                          panel.w - 140 * scale, 34 * scale},
-             &panel, "Approval is polled every two seconds.", DIM, 20 * scale);
-  if (draw_button(ctx,
-                  (loom_rect){panel.x + 150 * scale, panel.y + 440 * scale,
-                              260 * scale, 72 * scale},
-                  "Cancel", nav_str("quick.cancel"), scale) &
+             &panel, "Approval is polled every two seconds.", UI_DIM,
+             20 * scale);
+  if (ui_button(&kit, ctx,
+                (loom_rect){panel.x + 150 * scale, panel.y + 440 * scale,
+                            260 * scale, 72 * scale},
+                "Cancel", nav_str("quick.cancel")) &
       NAV_ACTIVATED)
     go_back();
 }
@@ -4023,15 +3806,15 @@ static const card *draw_row(loom_context *ctx, const item_row *row, size_t id,
   const loom_rect title = {margin, top, 600 * scale, 36 * scale};
 
   if (row->count == 0) {
-    loom_label(ctx, title, &clip, row->title, DIM, 25 * scale);
+    loom_label(ctx, title, &clip, row->title, UI_DIM, 25 * scale);
     if (row->loading)
-      draw_spinner(ctx, strip.x + 30 * scale, strip.y + 30 * scale, 14 * scale,
-                   &clip, scale);
+      ui_spinner(&kit, ctx, strip.x + 30 * scale, strip.y + 30 * scale,
+                 14 * scale, &clip);
     else
       loom_label(
           ctx,
           (loom_rect){margin, strip.y + 30 * scale, 700 * scale, 32 * scale},
-          &clip, "Nothing here", DIM, 20 * scale);
+          &clip, "Nothing here", UI_DIM, 20 * scale);
     return NULL;
   }
 
@@ -4070,7 +3853,7 @@ static const card *draw_row(loom_context *ctx, const item_row *row, size_t id,
   }
   nav_scroll_end(&ui);
   ctx->mask = outer;
-  loom_label(ctx, title, &clip, row->title, row_focused ? TEXT : DIM,
+  loom_label(ctx, title, &clip, row->title, row_focused ? UI_TEXT : UI_DIM,
              25 * scale);
   return chosen;
 }
@@ -4090,7 +3873,7 @@ static bool row_arriving(size_t id) {
 static void draw_home(loom_context *ctx, float width, float height,
                       float scale) {
   if (row_arriving(ROW_LIBRARIES)) {
-    draw_spinner(ctx, width / 2, height / 2, 26 * scale, NULL, scale);
+    ui_spinner(&kit, ctx, width / 2, height / 2, 26 * scale, NULL);
     return;
   }
   /* Title, cards, and a gap: the libraries' banners are shorter. */
@@ -4158,14 +3941,14 @@ static void draw_grid(loom_context *ctx, float width, float height,
   if (grid_total == 0) {
     loom_label(ctx,
                (loom_rect){margin, 40 * scale, width - margin * 2, 50 * scale},
-               NULL, grid_title, TEXT, 32 * scale);
+               NULL, grid_title, UI_TEXT, 32 * scale);
     if (grid_loading)
-      draw_spinner(ctx, width / 2, height / 2, 24 * scale, NULL, scale);
+      ui_spinner(&kit, ctx, width / 2, height / 2, 24 * scale, NULL);
     else
       loom_label(ctx,
                  (loom_rect){margin, grid_rect.y + 40 * scale, 800 * scale,
                              36 * scale},
-                 NULL, "Nothing here", DIM, 24 * scale);
+                 NULL, "Nothing here", UI_DIM, 24 * scale);
     return;
   }
 
@@ -4182,7 +3965,7 @@ static void draw_grid(loom_context *ctx, float width, float height,
   loom_label(
       ctx,
       (loom_rect){margin, 40 * scale - scroll, width - margin * 2, 50 * scale},
-      NULL, grid_title, TEXT, 32 * scale);
+      NULL, grid_title, UI_TEXT, 32 * scale);
   /* Grid padding reserves room for the first and last fully visible rows. It is
    * not a scissor: neighbouring rows extend into that margin and disappear at
    * the viewport fade. */
@@ -4221,12 +4004,12 @@ static void draw_grid(loom_context *ctx, float width, float height,
                            grid_rect.h};
   if (max_scroll > 0) {
     const float thumb_h = maxf(40 * scale, track.h * grid_rect.h / extent);
-    loom_fill(ctx, track, NULL, BORDER, track.w / 2);
+    loom_fill(ctx, track, NULL, UI_BORDER, track.w / 2);
     loom_fill(ctx,
               (loom_rect){track.x,
                           track.y + (track.h - thumb_h) * (scroll / max_scroll),
                           track.w, thumb_h},
-              NULL, ACCENT, track.w / 2);
+              NULL, UI_ACCENT, track.w / 2);
   }
   if (chosen != NULL) {
     const card copy = *chosen;
@@ -4259,9 +4042,9 @@ static void draw_video_path(loom_context *ctx, loom_rect rect, float scale) {
   if (path != JF_DIRECT && n > 0 && (size_t)n < sizeof(line))
     snprintf(line + n, sizeof(line) - (size_t)n, "%s", warning);
   loom_label(ctx, rect, NULL, line,
-             path == JF_DIRECT            ? DIM
-             : path == JF_SERVER_HARDWARE ? YELLOW
-                                          : RED,
+             path == JF_DIRECT            ? UI_DIM
+             : path == JF_SERVER_HARDWARE ? UI_YELLOW
+                                          : UI_RED,
              22 * scale);
 }
 
@@ -4272,36 +4055,37 @@ static void draw_details(loom_context *ctx, float width, float scale) {
   if (slot != NULL) {
     float uv[4];
     cover_uv(slot, art, uv);
-    loom_textured(ctx, art, NULL, slot->texture, uv, WHITE, 16 * scale);
+    loom_textured(ctx, art, NULL, slot->texture, uv, UI_WHITE, 16 * scale);
   } else if (!draw_blur(ctx, art, ctx->viewport, &detail, 16 * scale)) {
-    loom_fill(ctx, art, NULL, CARD, 16 * scale);
+    loom_fill(ctx, art, NULL, UI_CARD, 16 * scale);
     if (artwork_loading(detail.poster_id, detail.poster_tag, JF_IMAGE_PRIMARY,
                         POSTER_W, POSTER_H))
-      draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale, &art,
-                   scale);
+      ui_spinner(&kit, ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale,
+                 &art);
   }
   draw_watch_badge(ctx, art, ctx->viewport, &detail, scale);
 
   const float x = art.x + art.w + 60 * scale;
   const float w = width - x - margin;
   loom_label(ctx, (loom_rect){x, margin, w, 72 * scale}, NULL,
-             ellipsize(detail.title, w, 52 * scale), TEXT, 52 * scale);
+             ui_ellipsize(&kit, detail.title, w, 52 * scale), UI_TEXT,
+             52 * scale);
   loom_label(ctx, (loom_rect){x, 150 * scale, w, 34 * scale}, NULL,
-             detail.subtitle, TEXT, 24 * scale);
+             detail.subtitle, UI_TEXT, 24 * scale);
   draw_metadata(ctx, (loom_rect){x, 195 * scale, w, 34 * scale}, NULL,
-                detail.official_rating, detail.rating, 20 * scale, DIM);
-  draw_wrapped(ctx, (loom_rect){x, 255 * scale, w, 180 * scale},
-               detail.overview, 22 * scale);
+                detail.official_rating, detail.rating, 20 * scale, UI_DIM);
+  ui_wrapped(&kit, ctx, (loom_rect){x, 255 * scale, w, 180 * scale},
+             detail.overview, 22 * scale, UI_TEXT);
 
   if (card_is(&detail, "Series")) {
     if (seasons_row.count == 0) {
       loom_label(ctx, (loom_rect){x, 480 * scale, w, 34 * scale}, NULL,
-                 seasons_row.loading ? "Loading seasons..." : "No seasons", DIM,
-                 22 * scale);
+                 seasons_row.loading ? "Loading seasons..." : "No seasons",
+                 UI_DIM, 22 * scale);
       return;
     }
     loom_label(ctx, (loom_rect){x, 470 * scale, w, 34 * scale}, NULL, "Seasons",
-               TEXT, 26 * scale);
+               UI_TEXT, 26 * scale);
     /* A carousel like the home rows, entering on the first season not yet
      * watched. */
     const float step = 226 * scale;
@@ -4346,17 +4130,17 @@ static void draw_details(loom_context *ctx, float width, float scale) {
   }
 
   draw_video_path(ctx, (loom_rect){x, 480 * scale, w, 34 * scale}, scale);
-  if (draw_button(ctx, (loom_rect){x, 570 * scale, 250 * scale, 74 * scale},
-                  "Play", nav_str("details.play"), scale) &
+  if (ui_button(&kit, ctx, (loom_rect){x, 570 * scale, 250 * scale, 74 * scale},
+                "Play", nav_str("details.play")) &
       NAV_ACTIVATED)
     start_playback(detail.id, detail.title, detail.series_id,
                    detail.playback_position_ticks);
-  if (draw_button(
-          ctx,
+  if (ui_button(
+          &kit, ctx,
           (loom_rect){x + 280 * scale, 570 * scale, 250 * scale, 74 * scale},
           detail.played ? JF_ICON_CHECKED "  Played"
                         : JF_ICON_UNCHECKED "  Played",
-          nav_str("details.played"), scale) &
+          nav_str("details.played")) &
       NAV_ACTIVATED) {
     jf_task *task = request(JF_JOB_MARK_PLAYED, 0);
     if (task != NULL) {
@@ -4407,27 +4191,28 @@ static void draw_season(loom_context *ctx, float width, float height,
   if (slot != NULL) {
     float uv[4];
     cover_uv(slot, art, uv);
-    loom_textured(ctx, art, NULL, slot->texture, uv, WHITE, 12 * scale);
+    loom_textured(ctx, art, NULL, slot->texture, uv, UI_WHITE, 12 * scale);
   } else if (!draw_blur(ctx, art, ctx->viewport, poster_card(&season_detail),
                         12 * scale)) {
-    loom_fill(ctx, art, NULL, CARD, 12 * scale);
+    loom_fill(ctx, art, NULL, UI_CARD, 12 * scale);
     if (artwork_loading(season_detail.poster_id, season_detail.poster_tag,
                         JF_IMAGE_PRIMARY, POSTER_W, POSTER_H))
-      draw_spinner(ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale, &art,
-                   scale);
+      ui_spinner(&kit, ctx, art.x + art.w / 2, art.y + art.h / 2, 20 * scale,
+                 &art);
   }
   draw_watch_badge(ctx, art, ctx->viewport, &season_detail, scale);
 
   const float x = art.x + art.w + 60 * scale;
   const float w = width - x - margin;
   loom_label(ctx, (loom_rect){x, margin, w, 72 * scale}, NULL,
-             ellipsize(detail.title, w, 52 * scale), TEXT, 52 * scale);
+             ui_ellipsize(&kit, detail.title, w, 52 * scale), UI_TEXT,
+             52 * scale);
   loom_label(ctx, (loom_rect){x, 152 * scale, w, 48 * scale}, NULL,
-             season_detail.title, TEXT, 32 * scale);
-  draw_wrapped(ctx, (loom_rect){x, 220 * scale, w, 145 * scale},
-               season_detail.overview[0] != '\0' ? season_detail.overview
-                                                 : detail.overview,
-               22 * scale);
+             season_detail.title, UI_TEXT, 32 * scale);
+  ui_wrapped(&kit, ctx, (loom_rect){x, 220 * scale, w, 145 * scale},
+             season_detail.overview[0] != '\0' ? season_detail.overview
+                                               : detail.overview,
+             22 * scale, UI_TEXT);
 
   const loom_rect list_rect = {x, 400 * scale, w, height - 464 * scale};
   const float row_height = 170 * scale;
@@ -4435,7 +4220,7 @@ static void draw_season(loom_context *ctx, float width, float height,
     loom_label(ctx, (loom_rect){x, list_rect.y + 20 * scale, w, 34 * scale},
                &list_rect,
                episodes_row.loading ? "Loading episodes..." : "No episodes",
-               DIM, 23 * scale);
+               UI_DIM, 23 * scale);
     return;
   }
 
@@ -4488,31 +4273,32 @@ static void draw_season(loom_context *ctx, float width, float height,
     if (still != NULL) {
       float uv[4];
       cover_uv(still, thumb, uv);
-      loom_textured(ctx, thumb, &clip, still->texture, uv, WHITE, 7 * scale);
+      loom_textured(ctx, thumb, &clip, still->texture, uv, UI_WHITE, 7 * scale);
     } else if (!draw_blur(ctx, thumb, clip, source, 7 * scale)) {
-      loom_fill(ctx, thumb, &clip, CARD, 7 * scale);
+      loom_fill(ctx, thumb, &clip, UI_CARD, 7 * scale);
       if (artwork_loading(source->id, source->thumbnail_tag, JF_IMAGE_PRIMARY,
                           384, 216))
-        draw_spinner(ctx, thumb.x + thumb.w / 2, thumb.y + thumb.h / 2,
-                     13 * scale, &clip, scale);
+        ui_spinner(&kit, ctx, thumb.x + thumb.w / 2, thumb.y + thumb.h / 2,
+                   13 * scale, &clip);
     }
     draw_watch_badge(ctx, thumb, clip, source, scale);
 
     const float text_x = thumb.x + thumb.w + 28 * scale;
     const float text_w = row.x + row.w - text_x - 24 * scale;
     loom_label(ctx, (loom_rect){text_x, row.y + 34 * scale, text_w, 44 * scale},
-               &clip, ellipsize(source->episode_title, text_w, 28 * scale),
-               TEXT, 28 * scale);
+               &clip,
+               ui_ellipsize(&kit, source->episode_title, text_w, 28 * scale),
+               UI_TEXT, 28 * scale);
     draw_metadata(ctx,
                   (loom_rect){text_x, row.y + 90 * scale, text_w, 32 * scale},
-                  &clip, source->runtime, source->rating, 21 * scale, TEXT);
+                  &clip, source->runtime, source->rating, 21 * scale, UI_TEXT);
     if (source->progress > 1) {
       const loom_rect bar = {thumb.x + 4 * scale, thumb.y + thumb.h - 7 * scale,
                              thumb.w - 8 * scale, 5 * scale};
       loom_fill(ctx,
                 (loom_rect){bar.x, bar.y,
                             bar.w * minf(source->progress, 100) / 100, bar.h},
-                &clip, ACCENT, 2 * scale);
+                &clip, UI_ACCENT, 2 * scale);
     }
   }
   nav_scroll_end(&ui);
@@ -4539,7 +4325,7 @@ static void draw_subtitle_picker(loom_context *ctx, float width, float height,
   loom_label(ctx,
              (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
                          36 * scale},
-             &panel, "Subtitles", DIM, 22 * scale);
+             &panel, "Subtitles", UI_DIM, 22 * scale);
   const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
   /* Scrolled only once the focus reaches the last row in view. */
   const float scroll =
@@ -4568,26 +4354,28 @@ static void draw_subtitle_picker(loom_context *ctx, float width, float height,
     if (rect.y + rect.h <= list.y || rect.y >= list.y + list.h)
       continue;
     if (chosen)
-      loom_fill(ctx, rect, &list, SELECTED, 10 * scale);
+      loom_fill(ctx, rect, &list, UI_SELECTED, 10 * scale);
     const char *name = i == 0   ? "Download subtitles..."
                        : i == 1 ? "Off"
                                 : jf_player_subtitle_name(track);
     /* Every track has its appearance and timing to the right. */
     const float arrow = track >= 0 ? 36 * scale : 0;
     const float text_y = rect.y + (rect.h - 30 * scale) / 2;
-    loom_label(ctx,
-               (loom_rect){rect.x + 16 * scale, text_y,
-                           rect.w - 32 * scale - arrow, 36 * scale},
-               &list, ellipsize(name, rect.w - 32 * scale - arrow, 22 * scale),
-               chosen   ? WHITE
-               : i == 0 ? ACCENT
-                        : TEXT,
-               22 * scale);
+    loom_label(
+        ctx,
+        (loom_rect){rect.x + 16 * scale, text_y, rect.w - 32 * scale - arrow,
+                    36 * scale},
+        &list,
+        ui_ellipsize(&kit, name, rect.w - 32 * scale - arrow, 22 * scale),
+        chosen   ? UI_WHITE
+        : i == 0 ? UI_ACCENT
+                 : UI_TEXT,
+        22 * scale);
     if (track >= 0)
       loom_label(ctx,
                  (loom_rect){rect.x + rect.w - 34 * scale, text_y, 18 * scale,
                              36 * scale},
-                 &list, ">", chosen ? WHITE : DIM, 22 * scale);
+                 &list, ">", chosen ? UI_WHITE : UI_DIM, 22 * scale);
   }
   nav_scroll_end(&ui);
   if (chosen_any && subtitle_picker)
@@ -4603,15 +4391,15 @@ static void draw_value_row(loom_context *ctx, loom_rect rect,
                            float scale) {
   const float text_y = rect.y + (rect.h - 28 * scale) / 2;
   loom_label(ctx, (loom_rect){rect.x + 16 * scale, text_y, rect.w, 32 * scale},
-             clip, label, focused ? WHITE : TEXT, 20 * scale);
-  const char *shown = focused && steps ? fmt("<  %s  >", value)
-                      : submenu        ? fmt("%s   >", value)
+             clip, label, focused ? UI_WHITE : UI_TEXT, 20 * scale);
+  const char *shown = focused && steps ? ui_fmt("<  %s  >", value)
+                      : submenu        ? ui_fmt("%s   >", value)
                                        : value;
   const float value_w = jf_renderer_measure(renderer, shown, 20 * scale);
   loom_label(ctx,
              (loom_rect){rect.x + rect.w - 16 * scale - value_w, text_y,
                          value_w, 32 * scale},
-             clip, shown, focused ? WHITE : value_ink, 20 * scale);
+             clip, shown, focused ? UI_WHITE : value_ink, 20 * scale);
 }
 
 /* A panel's note under its list: yellow for something to do, red for
@@ -4623,8 +4411,8 @@ static void draw_note(loom_context *ctx, loom_rect panel, float y,
   loom_label(
       ctx,
       (loom_rect){panel.x + 28 * scale, y, panel.w - 56 * scale, 32 * scale},
-      &panel, ellipsize(note, panel.w - 56 * scale, 20 * scale),
-      error ? RED : YELLOW, 20 * scale);
+      &panel, ui_ellipsize(&kit, note, panel.w - 56 * scale, 20 * scale),
+      error ? UI_RED : UI_YELLOW, 20 * scale);
 }
 
 static void draw_subtitle_search(loom_context *ctx, float width, float height,
@@ -4640,7 +4428,7 @@ static void draw_subtitle_search(loom_context *ctx, float width, float height,
   loom_label(ctx,
              (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
                          36 * scale},
-             &panel, "Download subtitles", DIM, 22 * scale);
+             &panel, "Download subtitles", UI_DIM, 22 * scale);
   const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
   const float scroll =
       nav_scroll_begin(&ui, nav_str("subtitle-search"), list, LOOM_VERTICAL,
@@ -4660,20 +4448,20 @@ static void draw_subtitle_search(loom_context *ctx, float width, float height,
       continue;
     const bool focused = flags & NAV_FOCUSED;
     if (focused)
-      loom_fill(ctx, rect, &list, SELECTED, 10 * scale);
+      loom_fill(ctx, rect, &list, UI_SELECTED, 10 * scale);
     if (i == SEARCH_ROW_SOURCES) {
       const int on = sources_on();
       const bool none = sources.loaded && on == 0;
       draw_value_row(ctx, rect, &list, "Sources",
                      !sources.loaded ? "..."
                      : none          ? "None on"
-                                     : fmt("%d on", on),
-                     none ? YELLOW : DIM, focused, false, true, scale);
+                                     : ui_fmt("%d on", on),
+                     none ? UI_YELLOW : UI_DIM, focused, false, true, scale);
       continue;
     }
     if (i == SEARCH_ROW_LANGUAGE) {
       draw_value_row(ctx, rect, &list, "Language",
-                     search_languages[sub_style.search_language].name, DIM,
+                     search_languages[sub_style.search_language].name, UI_DIM,
                      focused, true, false, scale);
       continue;
     }
@@ -4682,13 +4470,15 @@ static void draw_subtitle_search(loom_context *ctx, float width, float height,
     loom_label(ctx,
                (loom_rect){rect.x + 16 * scale, rect.y + 6 * scale, text_w,
                            32 * scale},
-               &list, ellipsize(search.results[r].name, text_w, 20 * scale),
-               focused ? WHITE : TEXT, 20 * scale);
+               &list,
+               ui_ellipsize(&kit, search.results[r].name, text_w, 20 * scale),
+               focused ? UI_WHITE : UI_TEXT, 20 * scale);
     loom_label(ctx,
                (loom_rect){rect.x + 16 * scale, rect.y + 34 * scale, text_w,
                            28 * scale},
-               &list, ellipsize(search.results[r].detail, text_w, 16 * scale),
-               DIM, 16 * scale);
+               &list,
+               ui_ellipsize(&kit, search.results[r].detail, text_w, 16 * scale),
+               UI_DIM, 16 * scale);
   }
   nav_scroll_end(&ui);
   static const char *const phases[] = {
@@ -4705,7 +4495,7 @@ static void draw_subtitle_search(loom_context *ctx, float width, float height,
                &panel,
                search.phase != DOWNLOAD_NONE ? phases[search.phase]
                                              : "Searching...",
-               DIM, 20 * scale);
+               UI_DIM, 20 * scale);
   else
     draw_note(ctx, panel, note_y, search.error, !search.error_is_warning,
               scale);
@@ -4729,7 +4519,7 @@ static void draw_subtitle_sources(loom_context *ctx, float width, float height,
   loom_label(ctx,
              (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
                          36 * scale},
-             &panel, "Subtitle sources", DIM, 22 * scale);
+             &panel, "Subtitle sources", UI_DIM, 22 * scale);
   const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
   const float scroll =
       nav_scroll_begin(&ui, nav_str("subtitle-sources"), list, LOOM_VERTICAL,
@@ -4747,36 +4537,36 @@ static void draw_subtitle_sources(loom_context *ctx, float width, float height,
     if (i >= sources.count && restart_pending() && i == restart_row()) {
       /* Restarting stops playback: red, and a second press, as deleting. */
       if (focused)
-        loom_fill(ctx, rect, &list, sources.restart_armed ? armed : SELECTED,
+        loom_fill(ctx, rect, &list, sources.restart_armed ? armed : UI_SELECTED,
                   10 * scale);
       draw_value_row(ctx, rect, &list, "Restart the server to apply",
                      sources.restart_armed ? "Press again: playback stops" : "",
-                     WHITE, focused, false, false, scale);
+                     UI_WHITE, focused, false, false, scale);
       continue;
     }
     if (focused)
-      loom_fill(ctx, rect, &list, SELECTED, 10 * scale);
+      loom_fill(ctx, rect, &list, UI_SELECTED, 10 * scale);
     if (i >= sources.count) {
       draw_value_row(ctx, rect, &list, "Add more sources",
                      sources.adding ? "Working..." : "subbuzz repository",
-                     ACCENT, focused, false, false, scale);
+                     UI_ACCENT, focused, false, false, scale);
       continue;
     }
     const char *status = sources.items[i].status;
     const char *value;
     loom_color ink;
     if (sources.items[i].busy)
-      value = "Working...", memcpy(ink, DIM, sizeof(ink));
+      value = "Working...", memcpy(ink, UI_DIM, sizeof(ink));
     else if (status[0] == '\0')
-      value = "Install", memcpy(ink, ACCENT, sizeof(ink));
+      value = "Install", memcpy(ink, UI_ACCENT, sizeof(ink));
     else if (strcmp(status, "Active") == 0)
-      value = "On", memcpy(ink, ACCENT, sizeof(ink));
+      value = "On", memcpy(ink, UI_ACCENT, sizeof(ink));
     else if (strcmp(status, "Disabled") == 0)
-      value = "Off", memcpy(ink, DIM, sizeof(ink));
+      value = "Off", memcpy(ink, UI_DIM, sizeof(ink));
     else if (strcmp(status, "Restart") == 0)
-      value = "On after restart", memcpy(ink, YELLOW, sizeof(ink));
+      value = "On after restart", memcpy(ink, UI_YELLOW, sizeof(ink));
     else
-      value = "Broken", memcpy(ink, RED, sizeof(ink));
+      value = "Broken", memcpy(ink, UI_RED, sizeof(ink));
     draw_value_row(ctx, rect, &list, sources.items[i].name, value, ink, focused,
                    false, false, scale);
   }
@@ -4785,7 +4575,7 @@ static void draw_subtitle_sources(loom_context *ctx, float width, float height,
   if (sources.loading && sources.count == 0)
     loom_label(ctx,
                (loom_rect){panel.x + 28 * scale, note_y, panel.w, 32 * scale},
-               &panel, "Asking the server...", DIM, 20 * scale);
+               &panel, "Asking the server...", UI_DIM, 20 * scale);
   else if (sources.loaded && sources.count == 0 && sources.note[0] == '\0')
     draw_note(ctx, panel, note_y,
               "The server's plugin repositories offer no subtitle source",
@@ -4804,7 +4594,7 @@ static const char *setting_value(subtitle_setting row) {
   case SETTING_OUTLINE:
     return sub_style.outline ? "On" : "Off";
   case SETTING_OUTLINE_WIDTH:
-    return fmt("%d px", sub_style.outline_width);
+    return ui_fmt("%d px", sub_style.outline_width);
   case SETTING_OUTLINE_COLOR:
     return swatches[sub_style.outline_color].name;
   case SETTING_INLINE:
@@ -4812,13 +4602,13 @@ static const char *setting_value(subtitle_setting row) {
   case SETTING_BOLD:
     return sub_style.bold ? "On" : "Off";
   case SETTING_SIZE:
-    return fmt("%d%%", 100 + sub_style.size_percent);
+    return ui_fmt("%d%%", 100 + sub_style.size_percent);
   case SETTING_MARGIN:
-    return fmt("%d%%", sub_style.margin_percent);
+    return ui_fmt("%d%%", sub_style.margin_percent);
   case SETTING_SIDE:
     return sub_style.top ? "Top" : "Bottom";
   case SETTING_DELAY:
-    return delay != NULL ? fmt("%+.1f s", *delay / 1000.0) : "-";
+    return delay != NULL ? ui_fmt("%+.1f s", *delay / 1000.0) : "-";
   case SETTING_DELETE:
     return delete_armed ? "Press again to delete" : "";
   default:
@@ -4861,7 +4651,7 @@ static void draw_subtitle_settings(loom_context *ctx, float width, float height,
   loom_label(ctx,
              (loom_rect){panel.x + 28 * scale, panel.y + 16 * scale, panel.w,
                          36 * scale},
-             &panel, "Subtitle appearance and timing", DIM, 22 * scale);
+             &panel, "Subtitle appearance and timing", UI_DIM, 22 * scale);
   const loom_rect list = {panel.x, panel.y + head, panel.w, visible * row};
   /* Scrolled only once the focus reaches the last row in view. */
   const float scroll =
@@ -4891,9 +4681,9 @@ static void draw_subtitle_settings(loom_context *ctx, float width, float height,
       const float top = rect.y - 6 * scale;
       const float bottom = last ? mid : rect.y + rect.h + 6 * scale;
       loom_fill(ctx, (loom_rect){x, top, 2 * scale, bottom - top}, &list,
-                BORDER, 0);
+                UI_BORDER, 0);
       loom_fill(ctx, (loom_rect){x, mid - scale, 16 * scale, 2 * scale}, &list,
-                BORDER, 0);
+                UI_BORDER, 0);
     }
     const loom_rect body = {rect.x + indent, rect.y, rect.w - indent, rect.h};
     /* Deleting is red, and its row turns red while it waits for the OK that
@@ -4901,13 +4691,13 @@ static void draw_subtitle_settings(loom_context *ctx, float width, float height,
     static const loom_color armed = {150, 40, 40, 255};
     const bool deleting = i == SETTING_DELETE;
     if (focused)
-      loom_fill(ctx, body, &list, deleting && delete_armed ? armed : SELECTED,
-                10 * scale);
+      loom_fill(ctx, body, &list,
+                deleting && delete_armed ? armed : UI_SELECTED, 10 * scale);
     const float text_y = rect.y + (rect.h - 28 * scale) / 2;
     const loom_color *ink = !enabled                    ? &greyed
-                            : deleting && !delete_armed ? &RED
-                            : focused                   ? &WHITE
-                                                        : &TEXT;
+                            : deleting && !delete_armed ? &UI_RED
+                            : focused                   ? &UI_WHITE
+                                                        : &UI_TEXT;
     loom_label(ctx,
                (loom_rect){body.x + 16 * scale, text_y, body.w, 32 * scale},
                &list, labels[i], *ink, 20 * scale);
@@ -4916,14 +4706,14 @@ static void draw_subtitle_settings(loom_context *ctx, float width, float height,
       continue;
     /* Arrows on the focused row say left and right change it. */
     const bool action = i == SETTING_SUGGEST || i == SETTING_DELETE;
-    const char *text = focused && !action ? fmt("<  %s  >", value) : value;
+    const char *text = focused && !action ? ui_fmt("<  %s  >", value) : value;
     const float value_w = jf_renderer_measure(renderer, text, 20 * scale);
     float value_x = rect.x + rect.w - 16 * scale - value_w;
     loom_label(ctx, (loom_rect){value_x, text_y, value_w, 32 * scale}, &list,
                text,
                !enabled  ? greyed
-               : focused ? WHITE
-                         : DIM,
+               : focused ? UI_WHITE
+                         : UI_DIM,
                20 * scale);
     if (i == SETTING_COLOR || i == SETTING_OUTLINE_COLOR) {
       const int index =
@@ -4932,7 +4722,7 @@ static void draw_subtitle_settings(loom_context *ctx, float width, float height,
       const loom_rect chip = {value_x - side - 10 * scale, mid - side / 2, side,
                               side};
       loom_fill(ctx, chip, &list, swatches[index].color, 5 * scale);
-      loom_stroke(ctx, chip, &list, BORDER, 1.5f * scale, 5 * scale);
+      loom_stroke(ctx, chip, &list, UI_BORDER, 1.5f * scale, 5 * scale);
     }
   }
   nav_scroll_end(&ui);
@@ -4941,21 +4731,21 @@ static void draw_subtitle_settings(loom_context *ctx, float width, float height,
 
 static const char *clock_text(int ms) {
   const int seconds = ms > 0 ? ms / 1000 : 0;
-  return seconds >= 3600 ? fmt("%d:%02d:%02d", seconds / 3600,
-                               seconds / 60 % 60, seconds % 60)
-                         : fmt("%d:%02d", seconds / 60, seconds % 60);
+  return seconds >= 3600 ? ui_fmt("%d:%02d:%02d", seconds / 3600,
+                                  seconds / 60 % 60, seconds % 60)
+                         : ui_fmt("%d:%02d", seconds / 60, seconds % 60);
 }
 
 /* Glides the focus glow to (x, y), or puts it there when it was not showing. */
 static void move_glow(float x, float y) {
   if (!glow_placed) {
-    animated_float_snap(&glow_x, x);
-    animated_float_snap(&glow_y, y);
+    ui_anim_snap(&glow_x, x);
+    ui_anim_snap(&glow_y, y);
     glow_placed = true;
     return;
   }
-  animated_float_set(&glow_x, x, NAVIGATION_ANIMATION_NS);
-  animated_float_set(&glow_y, y, NAVIGATION_ANIMATION_NS);
+  ui_anim_set(&glow_x, x, UI_NAVIGATION_NS, animations_enabled);
+  ui_anim_set(&glow_y, y, UI_NAVIGATION_NS, animations_enabled);
 }
 
 static const char *playback_hint(size_t index) {
@@ -4964,21 +4754,21 @@ static const char *playback_hint(size_t index) {
     return playback_paused ? "Play" : "Pause";
   case ACTION_SUBTITLES: {
     const int track = jf_player_subtitle_current();
-    return fmt("Subtitles: %s",
-               track >= 0 ? jf_player_subtitle_name(track) : "Off");
+    return ui_fmt("Subtitles: %s",
+                  track >= 0 ? jf_player_subtitle_name(track) : "Off");
   }
   case ACTION_AUDIO: {
     const int count = jf_player_audio_count();
     if (count == 0)
       return "Audio: none";
-    return fmt("Audio: %s  (%d of %d)",
-               jf_player_audio_name(jf_player_audio_current()),
-               jf_player_audio_current() + 1, count);
+    return ui_fmt("Audio: %s  (%d of %d)",
+                  jf_player_audio_name(jf_player_audio_current()),
+                  jf_player_audio_current() + 1, count);
   }
   case ACTION_PREVIOUS:
-    return fmt("Previous episode: %s", previous_episode.episode_title);
+    return ui_fmt("Previous episode: %s", previous_episode.episode_title);
   case ACTION_NEXT:
-    return fmt("Next episode: %s", next_episode.episode_title);
+    return ui_fmt("Next episode: %s", next_episode.episode_title);
   default:
     return playback_buttons[index].hint;
   }
@@ -5006,9 +4796,9 @@ static void draw_playback(loom_context *ctx, float width, float height,
     draw_subtitle_picker(ctx, width, height, scale);
     return;
   }
-  const bool wanted = playback_chrome_wanted(now_ns());
-  animated_float_set(&chrome_motion, wanted ? 1 : 0,
-                     2 * NAVIGATION_ANIMATION_NS);
+  const bool wanted = playback_chrome_wanted(ui_now_ns());
+  ui_anim_set(&chrome_motion, wanted ? 1 : 0, 2 * UI_NAVIGATION_NS,
+              animations_enabled);
   const float shown = chrome_motion.value;
   if (shown <= 0.001f) {
     glow_placed = false;
@@ -5049,19 +4839,19 @@ static void draw_playback(loom_context *ctx, float width, float height,
   loom_label(ctx,
              (loom_rect){width - margin - hint_w, bar_y - 74 * scale,
                          hint_w + 4, 30 * scale},
-             NULL, hint, state == JF_FAILED ? RED : DIM, hint_size);
+             NULL, hint, state == JF_FAILED ? UI_RED : UI_DIM, hint_size);
   loom_label(ctx,
              (loom_rect){margin, bar_y - 84 * scale,
                          width - margin * 2 - hint_w - 40 * scale, 44 * scale},
              NULL,
-             ellipsize(playback_title, width - margin * 2 - hint_w - 40 * scale,
-                       34 * scale),
-             TEXT, 34 * scale);
+             ui_ellipsize(&kit, playback_title,
+                          width - margin * 2 - hint_w - 40 * scale, 34 * scale),
+             UI_TEXT, 34 * scale);
 
   /* The seek bar, between the elapsed time and the length. */
   const int duration = jf_player_duration();
   /* A release that never arrived ends a scrub all the same. */
-  if (scrubbing && now_ns() - scrub_moved_at > 600000000ull)
+  if (scrubbing && ui_now_ns() - scrub_moved_at > 600000000ull)
     end_scrub();
   const int position = scrubbing ? scrub_ms : jf_player_position();
   const float time_size = 22 * scale, time_w = 74 * scale;
@@ -5070,11 +4860,11 @@ static void draw_playback(loom_context *ctx, float width, float height,
              (loom_rect){margin + time_w -
                              jf_renderer_measure(renderer, elapsed, time_size),
                          bar_y - 14 * scale, time_w, 30 * scale},
-             NULL, elapsed, TEXT, time_size);
+             NULL, elapsed, UI_TEXT, time_size);
   loom_label(ctx,
              (loom_rect){width - margin - time_w, bar_y - 14 * scale, time_w,
                          30 * scale},
-             NULL, duration > 0 ? clock_text(duration) : "--:--", DIM,
+             NULL, duration > 0 ? clock_text(duration) : "--:--", UI_DIM,
              time_size);
   const float bar_h = (bar_focused ? 8 : 5) * scale;
   const loom_rect bar = {margin + time_w + 28 * scale, bar_y - bar_h / 2,
@@ -5121,8 +4911,8 @@ static void draw_playback(loom_context *ctx, float width, float height,
              NULL, JF_ICON_GLOW_TEXT, glow, glow_size);
 
   loom_fill(ctx, bar, NULL, track, bar_h / 2);
-  loom_fill(ctx, (loom_rect){bar.x, bar.y, bar.w * seen, bar.h}, NULL, ACCENT,
-            bar_h / 2);
+  loom_fill(ctx, (loom_rect){bar.x, bar.y, bar.w * seen, bar.h}, NULL,
+            UI_ACCENT, bar_h / 2);
   const int *chapters = NULL;
   const int chapter_count = duration > 0 ? jf_player_chapters(&chapters) : 0;
   for (int i = 0; i < chapter_count; i++) {
@@ -5132,12 +4922,12 @@ static void draw_playback(loom_context *ctx, float width, float height,
     loom_fill(
         ctx,
         (loom_rect){x - 1.5f * scale, bar_y - 9 * scale, 3 * scale, 18 * scale},
-        NULL, position < chapters[i] ? mark : ACCENT, scale);
+        NULL, position < chapters[i] ? mark : UI_ACCENT, scale);
   }
   if (bar_focused) {
     const float knob = 22 * scale;
     loom_fill(ctx, (loom_rect){head_x - knob / 2, bar_y - knob / 2, knob, knob},
-              NULL, WHITE, knob / 2);
+              NULL, UI_WHITE, knob / 2);
   }
 
   for (size_t index = 0; index < PLAYBACK_BUTTON_COUNT; index++) {
@@ -5158,7 +4948,7 @@ static void draw_playback(loom_context *ctx, float width, float height,
     loom_label(ctx, at, NULL,
                pause && playback_paused ? JF_ICON_PLAY
                                         : playback_buttons[index].icon,
-               lit ? WHITE : TEXT, icon);
+               lit ? UI_WHITE : UI_TEXT, icon);
     const char *number = playback_buttons[index].number;
     if (number[0] != '\0') {
       const float size = 15 * scale;
@@ -5167,7 +4957,7 @@ static void draw_playback(loom_context *ctx, float width, float height,
                  (loom_rect){centres[index] - w / 2,
                              at.y + icon * 0.555f - size * 0.72f, w + 2,
                              size * 1.4f},
-                 NULL, number, lit ? WHITE : TEXT, size);
+                 NULL, number, lit ? UI_WHITE : UI_TEXT, size);
     }
     const char *tag = playback_buttons[index].tag;
     if (tag[0] != '\0') {
@@ -5176,7 +4966,7 @@ static void draw_playback(loom_context *ctx, float width, float height,
       loom_label(
           ctx,
           (loom_rect){centres[index] - w / 2, at.y + icon, w + 2, size * 1.4f},
-          NULL, tag, lit ? WHITE : DIM, size);
+          NULL, tag, lit ? UI_WHITE : UI_DIM, size);
     }
   }
 
@@ -5412,7 +5202,7 @@ static void draw_subtitles(loom_context *ctx) {
    * only a picture wholly in the bottom third is taken for dialogue. */
   const float chrome_top = (float)gl_height * (1 - 200.0f / 1080);
   const bool lift = !subtitle_picker && !subtitle_settings && !search.open &&
-                    !sources.open && playback_chrome_wanted(now_ns());
+                    !sources.open && playback_chrome_wanted(ui_now_ns());
   jf_subs_keep_above(lift ? (int)chrome_top : INT_MAX);
   if (!subtitles_active() && subtitle_texture != 0) {
     jf_renderer_destroy_texture(renderer, subtitle_texture);
@@ -5445,7 +5235,7 @@ static void draw_subtitles(loom_context *ctx) {
   if (lift && jf_picsubs_ready() && rect.y > (float)gl_height * 2 / 3 &&
       rect.y + rect.h > chrome_top)
     rect.y -= (rect.y + rect.h - chrome_top) * chrome_motion.value;
-  loom_premultiplied(ctx, rect, NULL, subtitle_texture, whole, WHITE);
+  loom_premultiplied(ctx, rect, NULL, subtitle_texture, whole, UI_WHITE);
 }
 
 static void draw_licenses(loom_context *ctx, float width, float height,
@@ -5457,12 +5247,12 @@ static void draw_licenses(loom_context *ctx, float width, float height,
       minf(height - 240 * scale, chrome + JF_LICENSE_COUNT * row_height);
   const loom_rect panel = {360 * scale, (height - panel_height) / 2,
                            width - 720 * scale, panel_height};
-  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
-  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_fill(ctx, panel, NULL, UI_PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, UI_BORDER, 2 * scale, 18 * scale);
   loom_label(ctx,
              (loom_rect){panel.x + 48 * scale, panel.y + 36 * scale,
                          panel.w - 96 * scale, 44 * scale},
-             &panel, "Open source licenses", TEXT, 32 * scale);
+             &panel, "Open source licenses", UI_TEXT, 32 * scale);
 
   const loom_rect list_rect = {panel.x + 40 * scale, panel.y + 104 * scale,
                                panel.w - 80 * scale, panel.h - 144 * scale};
@@ -5486,16 +5276,17 @@ static void draw_licenses(loom_context *ctx, float width, float height,
     const bool focused = flags & NAV_FOCUSED;
     if (flags & NAV_ACTIVATED)
       chosen = index;
-    loom_fill(ctx, row, &clip, flags & NAV_HOVERED ? HOT : CARD, 12 * scale);
-    loom_stroke(ctx, row, &clip, focused ? ACCENT : BORDER,
+    loom_fill(ctx, row, &clip, flags & NAV_HOVERED ? UI_HOT : UI_CARD,
+              12 * scale);
+    loom_stroke(ctx, row, &clip, focused ? UI_ACCENT : UI_BORDER,
                 focused ? 4 * scale : 2 * scale, 12 * scale);
-    loom_label(
-        ctx,
-        (loom_rect){row.x + 24 * scale, row.y + (row.h - 30 * scale) / 2,
-                    row.w - 48 * scale, 38 * scale},
-        &clip,
-        fmt("%s - %s", jf_licenses[index].library, jf_licenses[index].license),
-        TEXT, 25 * scale);
+    loom_label(ctx,
+               (loom_rect){row.x + 24 * scale, row.y + (row.h - 30 * scale) / 2,
+                           row.w - 48 * scale, 38 * scale},
+               &clip,
+               ui_fmt("%s - %s", jf_licenses[index].library,
+                      jf_licenses[index].license),
+               UI_TEXT, 25 * scale);
   }
   nav_scroll_end(&ui);
   if (chosen < JF_LICENSE_COUNT)
@@ -5524,15 +5315,15 @@ static void draw_license(loom_context *ctx, float width, float height,
   const loom_rect panel = {(width - panel_width) / 2,
                            (height - panel_height) / 2, panel_width,
                            panel_height};
-  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
-  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_fill(ctx, panel, NULL, UI_PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, UI_BORDER, 2 * scale, 18 * scale);
   loom_label(ctx,
              (loom_rect){panel.x + padding, panel.y + 30 * scale,
                          panel.w - 2 * padding, 40 * scale},
              &panel,
-             fmt("%s - %s", jf_licenses[license_open].library,
-                 jf_licenses[license_open].license),
-             TEXT, 28 * scale);
+             ui_fmt("%s - %s", jf_licenses[license_open].library,
+                    jf_licenses[license_open].license),
+             UI_TEXT, 28 * scale);
 
   const loom_rect view = {panel.x + padding, panel.y + heading,
                           panel.w - 2 * padding, panel.h - heading - padding};
@@ -5551,7 +5342,7 @@ static void draw_license(loom_context *ctx, float width, float height,
   for (size_t index = list.first; index < list.last; index++) {
     const loom_rect row = loom_virtual_list_item(&list, index);
     loom_label(ctx, (loom_rect){row.x, row.y, row.w, row.h}, &view,
-               license_lines[index], DIM, size);
+               license_lines[index], UI_DIM, size);
   }
   nav_scroll_end(&ui);
   ctx->mask = outer;
@@ -5560,32 +5351,32 @@ static void draw_license(loom_context *ctx, float width, float height,
 static void draw_settings(loom_context *ctx, float width, float scale) {
   const loom_rect panel = {560 * scale, 230 * scale, width - 1120 * scale,
                            484 * scale};
-  loom_fill(ctx, panel, NULL, PANEL, 18 * scale);
-  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 18 * scale);
+  loom_fill(ctx, panel, NULL, UI_PANEL, 18 * scale);
+  loom_stroke(ctx, panel, NULL, UI_BORDER, 2 * scale, 18 * scale);
   loom_label(ctx,
              (loom_rect){panel.x + 48 * scale, panel.y + 42 * scale,
                          panel.w - 96 * scale, 44 * scale},
-             &panel, "Settings", TEXT, 32 * scale);
-  if (draw_button(ctx,
-                  (loom_rect){panel.x + 48 * scale, panel.y + 116 * scale,
-                              panel.w - 96 * scale, 72 * scale},
-                  animations_enabled ? "Animations: On" : "Animations: Off",
-                  nav_str("settings.animations"), scale) &
+             &panel, "Settings", UI_TEXT, 32 * scale);
+  if (ui_button(&kit, ctx,
+                (loom_rect){panel.x + 48 * scale, panel.y + 116 * scale,
+                            panel.w - 96 * scale, 72 * scale},
+                animations_enabled ? "Animations: On" : "Animations: Off",
+                nav_str("settings.animations")) &
       NAV_ACTIVATED)
     toggle_animations();
-  if (draw_button(ctx,
-                  (loom_rect){panel.x + 48 * scale, panel.y + 210 * scale,
-                              panel.w - 96 * scale, 72 * scale},
-                  "Sign out", nav_str("settings.sign_out"), scale) &
+  if (ui_button(&kit, ctx,
+                (loom_rect){panel.x + 48 * scale, panel.y + 210 * scale,
+                            panel.w - 96 * scale, 72 * scale},
+                "Sign out", nav_str("settings.sign_out")) &
       NAV_ACTIVATED)
     sign_out();
-  if (draw_button(ctx,
-                  (loom_rect){panel.x + 48 * scale, panel.y + 304 * scale,
-                              panel.w - 96 * scale, 72 * scale},
-                  "Open source licenses", nav_str("settings.licenses"), scale) &
+  if (ui_button(&kit, ctx,
+                (loom_rect){panel.x + 48 * scale, panel.y + 304 * scale,
+                            panel.w - 96 * scale, 72 * scale},
+                "Open source licenses", nav_str("settings.licenses")) &
       NAV_ACTIVATED) {
+    push();
     screen = SCREEN_LICENSES;
-    nav_focus(&ui, nav_child(nav_str("licenses"), nav_int(0)));
   }
 }
 
@@ -5593,12 +5384,12 @@ static void draw_sidebar(loom_context *ctx, float height, float scale) {
   const float panel_width = 354 * scale;
   const loom_rect panel = {-panel_width * (1.0f - sidebar_slide.value), 0,
                            panel_width, height};
-  loom_fill(ctx, panel, NULL, PANEL, 0);
-  loom_stroke(ctx, panel, NULL, BORDER, 2 * scale, 0);
+  loom_fill(ctx, panel, NULL, UI_PANEL, 0);
+  loom_stroke(ctx, panel, NULL, UI_BORDER, 2 * scale, 0);
   loom_label(ctx,
              (loom_rect){panel.x + 26 * scale, 28 * scale, panel.w - 52 * scale,
                          34 * scale},
-             &panel, "Categories", DIM, 20 * scale);
+             &panel, "Categories", UI_DIM, 20 * scale);
   const loom_rect list_rect = {panel.x + 18 * scale, 78 * scale,
                                panel.w - 36 * scale, panel.h - 96 * scale};
   const size_t count = categories_row.count + 1; /* the final row is Settings */
@@ -5629,16 +5420,16 @@ static void draw_sidebar(loom_context *ctx, float height, float scale) {
       chosen = index;
     if (index < list.first || index >= list.last)
       continue;
-    loom_fill(ctx, row, &button_clip, flags & NAV_HOVERED ? HOT : CARD,
+    loom_fill(ctx, row, &button_clip, flags & NAV_HOVERED ? UI_HOT : UI_CARD,
               10 * scale);
-    loom_stroke(ctx, row, &button_clip, BORDER, 1 * scale, 10 * scale);
+    loom_stroke(ctx, row, &button_clip, UI_BORDER, 1 * scale, 10 * scale);
     loom_label(ctx,
                (loom_rect){row.x + 22 * scale, row.y + 16 * scale,
                            row.w - 44 * scale, 32 * scale},
                &button_clip,
                index < categories_row.count ? categories_row.cards[index].title
                                             : "Settings",
-               TEXT, 22 * scale);
+               UI_TEXT, 22 * scale);
   }
   nav_scroll_end(&ui);
   nav_set_inert(&ui, inert);
@@ -5647,15 +5438,15 @@ static void draw_sidebar(loom_context *ctx, float height, float scale) {
 }
 
 static bool advance_animations(uint64_t now) {
-  animated_float_update(&sidebar_slide, now);
-  animated_float_update(&chrome_motion, now);
-  animated_float_update(&glow_x, now);
-  animated_float_update(&glow_y, now);
-  if (animated_float_running(&chrome_motion) ||
-      animated_float_running(&glow_x) || animated_float_running(&glow_y))
+  ui_anim_update(&sidebar_slide, now);
+  ui_anim_update(&chrome_motion, now);
+  ui_anim_update(&glow_x, now);
+  ui_anim_update(&glow_y, now);
+  if (ui_anim_running(&chrome_motion) || ui_anim_running(&glow_x) ||
+      ui_anim_running(&glow_y))
     return true;
 
-  if (sidebar_closing && !animated_float_running(&sidebar_slide) &&
+  if (sidebar_closing && !ui_anim_running(&sidebar_slide) &&
       sidebar_slide.value == 0) {
     sidebar_open = false;
     sidebar_closing = false;
@@ -5663,28 +5454,29 @@ static bool advance_animations(uint64_t now) {
      * declares; otherwise the next key press finds nothing to move from. */
     return true;
   }
-  return animated_float_running(&sidebar_slide);
+  return ui_anim_running(&sidebar_slide);
 }
 
 static void build_ui(loom_context *ctx) {
   const float width = (float)gl_width;
   const float height = (float)gl_height;
   const float scale = minf(width / 1920.0f, height / 1080.0f);
-  scratch_used = 0;
+  kit.scale = scale;
+  ui_frame_reset();
   poster_requests = 0;
   frame_index++;
-  advance_animations(now_ns());
+  advance_animations(ui_now_ns());
 
   loom_begin(ctx, width, height);
   ui.animate = animations_enabled;
-  ui.duration = NAVIGATION_ANIMATION_NS;
-  nav_begin(&ui, ctx, now_ns());
+  ui.duration = UI_NAVIGATION_NS;
+  nav_begin(&ui, ctx, ui_now_ns());
   /* What the sidebar covers cannot take the focus from under it. */
   nav_set_inert(&ui, sidebar_open);
   /* The video plane sits behind this EGL surface. During playback every
    * untouched pixel must remain transparent, otherwise the UI obscures it. */
   if (screen != SCREEN_PLAYBACK)
-    loom_fill(ctx, (loom_rect){0, 0, width, height}, NULL, BG, 0);
+    loom_fill(ctx, (loom_rect){0, 0, width, height}, NULL, UI_BG, 0);
   if (screen == SCREEN_DETAILS || screen == SCREEN_SEASON) {
     const loom_rect background = {0, 0, width, height};
     const poster_slot *slot = artwork(detail.backdrop_id, detail.backdrop_tag,
@@ -5696,10 +5488,10 @@ static void build_ui(loom_context *ctx) {
       loom_color tint = {255, 255, 255, 255};
       if (backdrop_texture != slot->texture) {
         backdrop_texture = slot->texture;
-        backdrop_fade_started_at = now_ns();
+        backdrop_fade_started_at = ui_now_ns();
       }
       if (backdrop_fade_started_at != 0) {
-        const uint64_t elapsed = now_ns() - backdrop_fade_started_at;
+        const uint64_t elapsed = ui_now_ns() - backdrop_fade_started_at;
         tint[3] = (uint8_t)min_size(255, elapsed * 255 / 250000000ull);
         if (tint[3] != 255)
           jf_window_frame_requested = true;
@@ -5747,9 +5539,9 @@ static void build_ui(loom_context *ctx) {
   }
   if (sidebar_open)
     draw_sidebar(ctx, height, scale);
-  if (nav_end(&ui, ACCENT, 4 * scale))
+  if (nav_end(&ui, UI_ACCENT, 4 * scale))
     jf_window_frame_requested = true;
-  if (advance_animations(now_ns()))
+  if (advance_animations(ui_now_ns()))
     jf_window_frame_requested = true;
 }
 
@@ -5803,40 +5595,6 @@ static int wait_milliseconds(uint64_t now, bool have_deadline,
   return (int)min_size((size_t)ms, INT32_MAX);
 }
 
-/* This application's own backbuffer as a PPM: the only way to check on-device
- * rendering without the VNC grab. */
-static void capture_frame(const char *path) {
-  const size_t width = gl_width;
-  const size_t height = gl_height;
-  uint8_t *rgba = malloc(width * height * 4);
-  uint8_t *row = malloc(width * 3);
-  FILE *file = NULL;
-  if (rgba == NULL || row == NULL)
-    goto done;
-  glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA, GL_UNSIGNED_BYTE,
-               rgba);
-  file = fopen(path, "wb");
-  if (file == NULL)
-    goto done;
-  fprintf(file, "P6\n%zu %zu\n255\n", width, height);
-  for (size_t y = 0; y < height; y++) {
-    const uint8_t *source = rgba + (height - 1 - y) * width * 4;
-    for (size_t x = 0; x < width; x++) {
-      row[x * 3 + 0] = source[x * 4 + 0];
-      row[x * 3 + 1] = source[x * 4 + 1];
-      row[x * 3 + 2] = source[x * 4 + 2];
-    }
-    fwrite(row, 1, width * 3, file);
-  }
-  fprintf(stderr, "captured OpenGL framebuffer to %s (%zux%zu)\n", path, width,
-          height);
-done:
-  if (file != NULL)
-    fclose(file);
-  free(rgba);
-  free(row);
-}
-
 /* Launched from the TV's app list there is no terminal, so an installed app's
  * output goes nowhere and a failure is invisible. The fallback is to send
  * stdout and stderr to a file next to everything else this app writes - SDL and
@@ -5847,77 +5605,27 @@ static void log_to_file(void) {
 #ifdef JF_APP_TEST
   return;
 #endif
-  if (isatty(2))
-    return;
   char path[576];
   /* conf/ rather than the app directory itself: the package can only make the
    * subdirectories world-writable, and the app runs as a jail uid that owns
    * none of them. /tmp is the fallback when even that fails. */
   snprintf(path, sizeof(path), "%s/conf/jellyfin.log", jf_store_root());
-  int file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (file < 0)
-    file = open("/tmp/jellyfin.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (file < 0)
-    return;
-  dup2(file, 1);
-  dup2(file, 2);
-  close(file);
-  setvbuf(stdout, NULL, _IOLBF, 0);
-  setvbuf(stderr, NULL, _IOLBF, 0);
+  ui_log_to_file(path, "/tmp/jellyfin.log");
 }
 
-/* A remote, replayed. There is no way to click through this app without a TV or
- * a person, so UI_SCRIPT=drrob presses those buttons a few frames apart and
- * UI_CAPTURE saves the screen it ends on. Letters are the four arrows, `o` for
- * OK and `b` for Back; `.` waits one more beat, which is what a screen that is
- * still fetching needs. */
-static const char *script = "";
-static size_t script_at;
-static unsigned script_wait;
+/* A remote, replayed (see ui_script), with `s` for the subtitle button and
+ * `[` `]` for the wheel. UI_CAPTURE saves the screen it ends on. */
+static ui_script script;
 
-/* Frames between scripted presses. Long enough that a request started by one
- * press has landed before the next, on a LAN. */
-#define SCRIPT_BEAT 45
-
+/* True once the script has nothing left to press. */
 static bool step_script(void) {
-  if (script[script_at] == '\0')
-    return jf_fetcher_pending(&fetcher) == 0;
-  /* Never press a button while a request is outstanding: whether discovery has
-   * answered decides what the focused control even is. */
-  if (jf_fetcher_pending(&fetcher) != 0)
-    return false;
-  if (script_wait != 0) {
-    script_wait--;
-    return false;
-  }
-  const char command = script[script_at++];
-  script_wait = SCRIPT_BEAT;
-  uint32_t key = 0;
-  switch (command) {
-  case 'u':
-    key = 103;
-    break;
-  case 'd':
-    key = 108;
-    break;
-  case 'l':
-    key = 105;
-    break;
-  case 'r':
-    key = 106;
-    break;
-  case 'o':
-    key = 28;
-    break;
-  case 'b':
-    key = jf_window_on_webos ? 412 : 158;
-    break;
-  case 's':
-    key = KEY_SUBTITLE;
-    break;
-  default:
-    break;
-  }
+  /* Whether discovery has answered decides what the focused control is. */
+  const int command =
+      ui_script_next(&script, jf_fetcher_pending(&fetcher) != 0);
+  if (command <= 0)
+    return command < 0;
+  const uint32_t key =
+      command == 's' ? KEY_SUBTITLE : ui_script_key((char)command);
   if (key != 0)
     on_key(key, true, false);
   if (command == '[' || command == ']') {
@@ -5929,7 +5637,8 @@ static bool step_script(void) {
     on_event(&wheel);
   }
   fprintf(stderr, "script: '%c' -> screen=%d nav=%08x servers=%zu depth=%zu\n",
-          command, (int)screen, (unsigned)ui.focus, discovered_count, depth);
+          command, (int)screen, (unsigned)ui.focus, discovered_count,
+          ui_stack_depth(&stack));
   return false;
 }
 
@@ -5982,6 +5691,7 @@ static bool app_init(int argc, char **argv) {
   glClearColor(9.0f / 255.0f, 13.0f / 255.0f, 22.0f / 255.0f, 1);
 
   renderer = jf_renderer_create(NULL, 0, 0);
+  kit.renderer = renderer;
   if (renderer == NULL) {
     fprintf(stderr, "the UI renderer could not start\n");
     return false;
@@ -6002,7 +5712,7 @@ static bool app_init(int argc, char **argv) {
   /* A stored token skips straight to the home rows; JELLYFIN_ADDRESS makes a
    * fresh install land on the sign-in screen without typing a URL on a TV. */
   if (restored) {
-    depth = 0;
+    ui_stack_clear(&stack);
     screen = SCREEN_HOME;
     set_status("Signed in as %s", session.user_name);
     load_home();
@@ -6025,7 +5735,7 @@ static bool app_init(int argc, char **argv) {
     if (secret != NULL)
       set_text(password, sizeof(password), secret);
     if (session.url[0] != '\0') {
-      screen = SCREEN_AUTH;
+      return_to_auth();
     } else {
       restart_discovery();
     }
@@ -6033,9 +5743,9 @@ static bool app_init(int argc, char **argv) {
 
   capture_path = getenv("UI_CAPTURE");
   const char *requested_script = getenv("UI_SCRIPT");
-  script = requested_script != NULL ? requested_script : "";
+  script.keys = requested_script != NULL ? requested_script : "";
   /* Without a script, hold long enough for discovery's three timeouts. */
-  capture_after = (capture_path != NULL && script[0] == '\0') ? 240 : 0;
+  capture_after = (capture_path != NULL && script.keys[0] == '\0') ? 240 : 0;
   last_state = jf_player_state_get();
   /* JF_PLAY=<item id>[@ms], or a "play" launch parameter of the same form
    * (`ares-launch -p '{"play":"..."}'`), starts that item once signed in:
@@ -6075,7 +5785,7 @@ static bool app_step(int *wait_ms) {
     if (screen == SCREEN_PLAYBACK)
       jf_window_frame_requested = true;
   }
-  const uint64_t now = now_ns();
+  const uint64_t now = ui_now_ns();
   const bool visible = screen == SCREEN_PLAYBACK && playback_chrome_wanted(now);
   if (visible != controls_visible) {
     controls_visible = visible;
@@ -6090,14 +5800,15 @@ static bool app_step(int *wait_ms) {
   if (subtitle_texture != 0 && !subtitles_active())
     jf_window_frame_requested = true;
   /* A finished script still has to reach its capture. */
-  const bool scripted_frame = script[script_at] != '\0' || capture_after > 0 ||
-                              (script[0] != '\0' && capture_path != NULL);
+  const bool scripted_frame = script.keys[script.at] != '\0' ||
+                              capture_after > 0 ||
+                              (script.keys[0] != '\0' && capture_path != NULL);
   if (!jf_window_drawable ||
       (!jf_window_frame_requested && !jf_player_needs_frame() &&
        !scripted_frame && !capture_requested)) {
     uint64_t deadline = 0;
     const bool have = next_deadline(now, controls_visible, &deadline);
-    *wait_ms = wait_milliseconds(now_ns(), have, deadline);
+    *wait_ms = wait_milliseconds(ui_now_ns(), have, deadline);
     return false;
   }
 
@@ -6145,8 +5856,8 @@ static bool app_step(int *wait_ms) {
       if (phase_frame[i] > phase_peak[i])
         phase_peak[i] = phase_frame[i];
     static uint64_t window_started;
-    if (now_ns() - window_started >= 1000000000ull) {
-      window_started = now_ns();
+    if (ui_now_ns() - window_started >= 1000000000ull) {
+      window_started = ui_now_ns();
       memcpy(phase_shown, phase_peak, sizeof(phase_peak));
       memset(phase_peak, 0, sizeof(phase_peak));
       runs_shown = runs_peak;
@@ -6175,13 +5886,13 @@ static bool app_step(int *wait_ms) {
     probe_timer_end(&timer);
   }
 
-  if (script[0] != '\0' && step_script() && capture_path != NULL &&
+  if (script.keys[0] != '\0' && step_script() && capture_path != NULL &&
       capture_after == 0)
-    capture_after = SCRIPT_BEAT;
+    capture_after = UI_SCRIPT_BEAT;
   if (capture_after > 0 && --capture_after == 0)
     capture_requested = true;
   if (capture_requested) {
-    capture_frame(capture_path != NULL ? capture_path : "jellyfin-capture.ppm");
+    ui_capture(capture_path != NULL ? capture_path : "jellyfin-capture.ppm");
     capture_requested = false;
     if (capture_path != NULL)
       jf_window_running = false;

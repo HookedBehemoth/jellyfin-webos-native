@@ -68,6 +68,9 @@ typedef struct {
 
 typedef struct {
   nav_id focus;
+  /* Between nav_begin and nav_end; and a focus asked for in that time, which
+   * is for the screen the frame's activation went to, not one in this frame. */
+  bool building, focus_for_next;
   /* The item a new screen starts on, when it declares one. */
   bool want_default;
   nav_id default_id;
@@ -131,7 +134,9 @@ void nav_wheel(nav *ui, float delta);
  * what Up and Down do over text with nothing in it to focus. */
 void nav_step(nav *ui, int steps);
 /* Put the focus somewhere directly, e.g. back where a screen was left. Zero
- * lets the screen choose: its default, or the first thing on screen. */
+ * lets the screen choose: its default, or the first thing on screen. Also
+ * during a frame, from an activation that changes screens: the next frame is
+ * the one that declares it. */
 void nav_focus(nav *ui, nav_id id);
 
 /* The frame. */

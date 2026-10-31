@@ -11,7 +11,8 @@ void jf_image_report_version(void) {
           version % 100);
 }
 
-bool jf_image_decode(const uint8_t *data, size_t size, jf_image *out) {
+static bool decode(const uint8_t *data, size_t size, png_uint_32 format,
+                   jf_image *out) {
   png_image png;
   memset(&png, 0, sizeof(png));
   png.version = PNG_IMAGE_VERSION;
@@ -19,8 +20,8 @@ bool jf_image_decode(const uint8_t *data, size_t size, jf_image *out) {
     return false;
   /* From here libpng holds an allocation inside `png`, released either by
    * png_image_finish_read or explicitly. */
-  png.format = PNG_FORMAT_RGB;
-  const size_t bytes = (size_t)png.width * png.height * 3;
+  png.format = format;
+  const size_t bytes = PNG_IMAGE_SIZE(png);
   if (bytes == 0) {
     png_image_free(&png);
     return false;
@@ -31,7 +32,8 @@ bool jf_image_decode(const uint8_t *data, size_t size, jf_image *out) {
     return false;
   }
   /* row_stride 0 means "tightly packed", which is what the texture upload
-   * wants; no colormap and no background, since the format has no alpha. */
+   * wants; no colormap, and no background: RGB composites onto black, and
+   * RGBA keeps the alpha for the draw to blend. */
   if (!png_image_finish_read(&png, NULL, rgb, 0, NULL)) {
     free(rgb);
     png_image_free(&png);
@@ -41,6 +43,14 @@ bool jf_image_decode(const uint8_t *data, size_t size, jf_image *out) {
   out->height = png.height;
   out->rgb = rgb;
   return true;
+}
+
+bool jf_image_decode(const uint8_t *data, size_t size, jf_image *out) {
+  return decode(data, size, PNG_FORMAT_RGB, out);
+}
+
+bool jf_image_decode_rgba(const uint8_t *data, size_t size, jf_image *out) {
+  return decode(data, size, PNG_FORMAT_RGBA, out);
 }
 
 void jf_image_free(jf_image *image) {
