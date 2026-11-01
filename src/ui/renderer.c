@@ -555,8 +555,18 @@ void jf_renderer_draw(jf_renderer *r, const loom_command *commands,
       const bool square = c->rectangle.radius <= 0;
       want(r, square ? KIND_FILL : KIND_ROUND, 0, u,
            !(square && c->rectangle.color[3] == 255) || faded(c));
-      const float shape[4] = {c->rectangle.radius, 0, 0, 0};
-      push(r, c->rect, c->clip, &c->mask, no_uv, c->rectangle.color, shape);
+      /* The vertex shader shears every instance by the third, after clipping
+       * it: clipped first, a parallelogram cut by the left of its clip would
+       * lose the strip the shear moves back into view. So it may run that far
+       * past the left, which the viewport still cuts. */
+      const float shape[4] = {c->rectangle.radius, 0, c->rectangle.slant, 0};
+      loom_rect clip = c->clip;
+      if (c->rectangle.slant > 0) {
+        const float reach = c->rect.h * c->rectangle.slant;
+        clip.x -= reach;
+        clip.w += reach;
+      }
+      push(r, c->rect, clip, &c->mask, no_uv, c->rectangle.color, shape);
       break;
     }
     case LOOM_BORDER: {

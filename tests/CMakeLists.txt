@@ -39,9 +39,10 @@ if (TARGET jf-app AND NOT TARGET_WEBOS)
 endif ()
 
 # The launcher against the TV in the process (src/tv/transport_mock.c), on SDL's
-# offscreen driver: the ribbon, the settings and the navigation stack.
+# offscreen driver: the bar, editing it and the navigation stack.
 if (TARGET home-app AND NOT TARGET_WEBOS)
     add_executable(home-tests home_tests.c)
     target_link_libraries(home-tests PRIVATE home-app)
+    target_compile_definitions(home-tests PRIVATE JF_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     add_test(NAME home-tests COMMAND home-tests)
 endif ()

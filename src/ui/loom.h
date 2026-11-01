@@ -68,6 +68,9 @@ typedef struct {
     struct {
       loom_color color;
       float radius;
+      /* Horizontal shift per pixel above the bottom: a parallelogram. Only
+       * square corners. */
+      float slant;
     } rectangle;
     struct {
       loom_color color;
@@ -115,6 +118,11 @@ void loom_begin(loom_context *ctx, float width, float height);
 /* `clip` of NULL means the viewport. */
 void loom_fill(loom_context *ctx, loom_rect rect, const loom_rect *clip,
                const loom_color color, float radius);
+/* `rect` sheared about its bottom edge, which stays where it is: the top is
+ * `slant` times the height further right. */
+void loom_parallelogram(loom_context *ctx, loom_rect rect,
+                        const loom_rect *clip, const loom_color color,
+                        float slant);
 void loom_stroke(loom_context *ctx, loom_rect rect, const loom_rect *clip,
                  const loom_color color, float width, float radius);
 void loom_label(loom_context *ctx, loom_rect rect, const loom_rect *clip,

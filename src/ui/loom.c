@@ -67,6 +67,18 @@ void loom_fill(loom_context *ctx, loom_rect rect, const loom_rect *clip,
   c->rectangle.radius = radius;
 }
 
+void loom_parallelogram(loom_context *ctx, loom_rect rect,
+                        const loom_rect *clip, const loom_color color,
+                        float slant) {
+  loom_command *c = append(ctx, rect, clip);
+  if (c == NULL)
+    return;
+  c->kind = LOOM_RECTANGLE;
+  memcpy(c->rectangle.color, color, sizeof(loom_color));
+  c->rectangle.radius = 0;
+  c->rectangle.slant = slant;
+}
+
 void loom_stroke(loom_context *ctx, loom_rect rect, const loom_rect *clip,
                  const loom_color color, float width, float radius) {
   loom_command *c = append(ctx, rect, clip);

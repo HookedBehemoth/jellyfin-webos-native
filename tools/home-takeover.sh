@@ -6,6 +6,13 @@
 #   ssh root@tv sh -s restore < tools/home-takeover.sh
 #   ssh root@tv sh -s status  < tools/home-takeover.sh
 #
+# The launcher carries this script and runs it itself: opened from LG's menu,
+# through Homebrew Channel's root service, as `take open`; and at every start
+# when it is asked to, through Homebrew Channel's boot hooks, as `boot`. Off
+# again, from anywhere:
+#
+#   ssh root@tv sh -s disable-boot < tools/home-takeover.sh
+#
 # The launcher must be installed first (cmake --build build --target
 # home-install). Nothing on the root filesystem changes: a copy of it, under
 # LG's Home's id, is bind-mounted over /usr/palm/applications/
@@ -31,18 +38,40 @@ OURS=dev.hookedbehemoth.home
 INSTALLED=/media/developer/apps/usr/palm/applications/$OURS
 STAGE=/tmp/home-takeover
 BLOCK_SCHEMA=/etc/palm/schemas/sam/applicationManager.blockSystemApp.schema
-# Not an app: blocking it blocks nothing, and makes sam rescan.
+# Not an app: blocking it blocks nothing, and makes sam rescan. A new one
+# every time, so that the list always changes.
 NUDGE_ID=dev.hookedbehemoth.home.rescan
+# Run at boot by Homebrew Channel while it is there (home-boot-hook).
+BOOT_HOOK=/var/lib/webosbrew/init.d/60-home-takeover
 
 say() { echo "home-takeover: $*" >&2; }
 
 # luna-send answers nothing with stdin at its end over SSH; held open, it does.
 luna() { sleep 3 | luna-send -n 1 -w 3000 "luna://$1" "$2" 2>/dev/null; }
 
+# Said on the screen too: run from the launcher, there is no terminal.
+fail() {
+  say "$*"
+  sleep 3 | luna-send -n 1 -w 3000 -a "$LG_HOME" \
+    luna://com.webos.notification/createToast \
+    "{\"sourceId\":\"$LG_HOME\",\"message\":\"$*\"}" >/dev/null 2>&1
+}
+
 same_file() { [ "$(stat -L -c %d:%i "$1" 2>/dev/null)" = "$(stat -L -c %d:%i "$2" 2>/dev/null)" ]; }
 
 mounted() { [ -d "$STAGE" ] && same_file "$APP_DIR" "$STAGE"; }
 exe_mounted() { [ -f "$STAGE/home" ] && same_file "$LG_EXE" "$STAGE/home"; }
+
+# Every mount over `path`, by what the kernel lists rather than by the stage
+# it came from: one left by a run that went wrong outlives its stage, and
+# stacks under the next.
+unmount_all() {
+  for _ in 1 2 3 4 5 6 7 8; do
+    grep -q " $1 " /proc/mounts || return 0
+    umount "$1" 2>/dev/null || umount -l "$1"
+  done
+  ! grep -q " $1 " /proc/mounts
+}
 
 # Processes running LG's executable path, and whether each is the launcher
 # under it or LG's own: the path is the same, the file is not.
@@ -128,13 +157,16 @@ nudge() {
   current=$(luna com.webos.service.config/getConfigs \
     '{"configNames":["profile.blockedAppList"]}' |
     tr -d '\n' | sed -n 's/.*"profile.blockedAppList": *\(\[[^]]*\]\).*/\1/p')
-  if [ -z "$current" ]; then
+  # Without an id an earlier run left in it, when one stopped half way.
+  current=$(echo "$current" | sed "s/\"$NUDGE_ID[^\"]*\" *,\{0,1\} *//g; s/, *\]/]/")
+  if [ -z "$current" ] || [ "$current" = "[]" ]; then
     current=$(cat "$COUNTRY_LISTS"/*.json 2>/dev/null | head -n 1 |
       sed -n 's/.*"blocked_applist": *\(\[[^]]*\]\).*/\1/p')
     [ -n "$current" ] || current='[]'
   fi
-  with=$(echo "$current" | sed "s/^\[ *\]$/[\"$NUDGE_ID\"]/;t
-    s/^\[\(..*\)\]$/[\1,\"$NUDGE_ID\"]/")
+  nudge_id="$NUDGE_ID.$(date +%s)"
+  with=$(echo "$current" | sed "s/^\[ *\]$/[\"$nudge_id\"]/;t
+    s/^\[\(..*\)\]$/[\1,\"$nudge_id\"]/")
   luna com.webos.service.config/setConfigs \
     "{\"configs\":{\"profile.blockedAppList\":$with}}" >/dev/null || return 1
   sleep 1.5
@@ -166,11 +198,12 @@ stop_ours() {
 
 stage() {
   [ -x "$INSTALLED/home" ] || {
-    say "install the launcher first: no $INSTALLED/home"
+    fail "Install the launcher first: there is no $INSTALLED/home"
     return 1
   }
   # The files once; the manifest every time, through a mount if there is one.
   if ! mounted && ! exe_mounted; then
+    unmount_all "$LG_EXE" && unmount_all "$APP_DIR" || return 1
     rm -rf "$STAGE" && mkdir -p "$STAGE" && cp -a "$INSTALLED/." "$STAGE/" ||
       return 1
   fi
@@ -196,65 +229,96 @@ stage() {
 EOF
 }
 
+# With `open`, the launcher is opened once it is in place; without, only if
+# LG's Home was in front, which stopping it leaves empty.
 take() {
+  open=${1:-}
   if mounted && exe_mounted; then
     say "already in place"
-  else
-    stage || exit 1
-    mounted || mount --bind "$STAGE" "$APP_DIR"
-    exe_mounted || mount --bind "$STAGE/home" "$LG_EXE"
-    mounted && exe_mounted || {
-      say "the mounts did not take; putting LG's back"
-      restore
-      exit 1
-    }
+    [ "$open" = open ] && open_home
+    return 0
   fi
+  stage || exit 1
+  mounted || mount --bind "$STAGE" "$APP_DIR"
+  exe_mounted || mount --bind "$STAGE/home" "$LG_EXE"
+  mounted && exe_mounted || {
+    fail "The launcher could not take LG's Home's place: the mounts did not take"
+    restore
+    exit 1
+  }
   if ! reread sam_has_ours; then
-    say "sam did not take the launcher as Home; putting LG's back"
+    fail "The launcher could not take LG's Home's place: the TV did not take it as Home"
     restore
     exit 1
   fi
+  luna com.webos.applicationManager/getForegroundAppInfo '{}' |
+    grep -q "\"appId\": *\"$LG_HOME\"" && open=open
   stop_lg_home
   # A launcher an earlier take left running, started from another path: sam
   # starts it again from the manifest it has now. Not before the reread, or
   # it starts again from the old one.
   stop_ours $(home_pids ours)
-  say "in place until the next reboot; press Home"
+  say "in place until the next reboot"
+  [ "$open" = open ] && open_home
+  return 0
+}
+
+open_home() {
+  luna com.webos.applicationManager/launch "{\"id\":\"$LG_HOME\"}" >/dev/null
+}
+
+# At boot, sam is not up yet when Homebrew Channel runs its hooks: waited
+# for, up to two minutes, before taking its place.
+boot() {
+  for _ in $(seq 60); do
+    sam_info | grep -q '"returnValue": *true' && break
+    sleep 2
+  done
+  take
+}
+
+disable_boot() {
+  rm -f "$BOOT_HOOK"
+  say "not at the next start"
 }
 
 restore() {
   # Found while the file can still be told apart, stopped last.
   ours=$(home_pids ours)
-  if exe_mounted; then
-    umount "$LG_EXE" 2>/dev/null || umount -l "$LG_EXE"
-  fi
-  if mounted; then
-    umount "$APP_DIR" 2>/dev/null || umount -l "$APP_DIR"
-  fi
+  unmount_all "$LG_EXE" || say "$LG_EXE is still mounted over"
+  unmount_all "$APP_DIR" || say "$APP_DIR is still mounted over"
   reread sam_has_lgs ||
     say "sam has not reread LG's Home; a reboot puts it back"
   luna com.webos.service.preloadmanager/setPreloadPolicy \
     "{\"application\":{\"id\":\"$LG_HOME\",\"isEnabled\":true}}" >/dev/null
-  # Last, once sam has LG's manifest: where ours was in front, the TV opens
-  # LG's Home in its place.
+  # Last, once sam has LG's manifest. A Home opened while this ran - the Home
+  # key pressed while it waited - started with LG's executable but the
+  # launcher's folder still mounted, and draws nothing: stopped with the
+  # launcher, and LG's Home opened afresh.
   stop_ours $ours
+  for pid in $(home_pids lgs); do kill "$pid" 2>/dev/null; done
   rm -rf "$STAGE"
+  sleep 1
+  luna com.webos.applicationManager/launch "{\"id\":\"$LG_HOME\"}" >/dev/null
   say "LG's Home is back"
 }
 
 status() {
   if mounted; then echo "mounted over $APP_DIR"; else echo "not mounted"; fi
   if exe_mounted; then echo "mounted over $LG_EXE"; fi
+  if [ -e "$BOOT_HOOK" ]; then echo "taking LG's Home's place at every start"; fi
   echo "launcher: $(home_pids ours)  LG's Home: $(home_pids lgs)"
   sam_info
 }
 
 case "${1:-}" in
-take) take ;;
+take) take "${2:-}" ;;
+boot) boot ;;
 restore) restore ;;
+disable-boot) disable_boot ;;
 status) status ;;
 *)
-  echo "usage: home-takeover.sh take|restore|status" >&2
+  echo "usage: home-takeover.sh take [open]|boot|restore|disable-boot|status" >&2
   exit 2
   ;;
 esac

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Homebrew Channel runs every file in /var/lib/webosbrew/init.d at boot; the
+# launcher links this there when asked to take LG's Home's place at every
+# start, and removes the link when asked not to. It returns at once, leaving
+# home-takeover.sh to wait for sam in the background.
+#
+# To stop it without the launcher: rm /var/lib/webosbrew/init.d/60-home-takeover
+dir=$(dirname "$(readlink -f "$0")")
+setsid sh "$dir/home-takeover.sh" boot </dev/null >/tmp/home-takeover.log 2>&1 &

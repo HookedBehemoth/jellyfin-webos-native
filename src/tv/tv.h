@@ -1,7 +1,6 @@
 /*
  * What the launcher asks of the TV: the apps and inputs to show, opening one,
- * LG's own screens that open over the launcher, and the few settings it
- * changes itself.
+ * and removing an app.
  *
  * Every request goes out over the Luna bus and comes back later, on whatever
  * thread the bus answers on. Answers are queued and applied to `tv` by
@@ -10,7 +9,7 @@
  * (transport.h): the payloads are parsed here either way, so the host tests
  * run the same parsing against the mock's canned answers.
  *
- * Payload shapes are as glasshouse documents them for webOS 5 to 11; see
+ * Payload shapes are as glasshouse and LG's own Home use them; see
  * docs/home.md for which were checked on which TV.
  */
 #pragma once
@@ -21,13 +20,17 @@
 
 #define TV_APPS 96
 #define TV_INPUTS 8
-#define TV_CHOICES 24
 
 typedef struct {
   char id[128];
   char title[96];
   /* An absolute path to a PNG, or "" for none. */
   char icon[384];
+  /* The colour the app asks its tile to be, 0xRRGGBB, when it names one. */
+  uint32_t color;
+  bool has_color;
+  /* Can be uninstalled; LG's own apps cannot. */
+  bool removable;
 } tv_app;
 
 typedef struct {
@@ -38,38 +41,9 @@ typedef struct {
   /* What is plugged in, by its HDMI-CEC name, or "". */
   char device[64];
   bool connected;
+  /* The last frame the TV kept of it, an absolute path, or "". */
+  char preview[384];
 } tv_input;
-
-/* LG's screens that open over whatever is in front, the launcher included. */
-typedef enum {
-  TV_OVERLAY_INPUTS,
-  TV_OVERLAY_QUICK_SETTINGS,
-  TV_OVERLAY_SETTINGS,
-  TV_OVERLAY_NOTIFICATIONS,
-  TV_OVERLAY_SEARCH,
-  TV_OVERLAY_COUNT
-} tv_overlay;
-
-typedef enum {
-  TV_PICTURE_MODE,
-  TV_SOUND_OUTPUT,
-  TV_ENERGY_SAVING,
-  TV_SETTING_COUNT
-} tv_setting_id;
-
-typedef struct {
-  const char *category, *key, *title;
-  char value[48];
-  bool known;
-  /* The values it takes now, as the TV describes them. A setting the TV says
-   * is not visible here is left out of the screen; one not active is shown
-   * but cannot change. */
-  char choices[TV_CHOICES][48];
-  size_t choice_count;
-  bool visible, active;
-  /* A write on its way: the value shown is the one asked for. */
-  bool writing;
-} tv_setting;
 
 typedef struct {
   tv_app apps[TV_APPS];
@@ -78,9 +52,11 @@ typedef struct {
   tv_input inputs[TV_INPUTS];
   size_t input_count;
   bool inputs_loaded;
-  tv_setting settings[TV_SETTING_COUNT];
-  /* Which app each overlay is on this TV, or "" where it has none. */
-  char overlay_app[TV_OVERLAY_COUNT][64];
+  /* The app in front, beneath the launcher, as tv_refresh last found it:
+   * an input is its app. "" for none. `foreground_fresh` is set with every
+   * answer, for the launcher to clear. */
+  char foreground[128];
+  bool foreground_fresh;
   /* The last thing that went wrong, for a status line; "" for nothing. */
   char error[160];
 } tv_state;
@@ -99,11 +75,10 @@ size_t tv_pending(void);
 void tv_refresh(void);
 bool tv_launch(const char *app_id);
 bool tv_open_input(const tv_input *input);
-bool tv_open_overlay(tv_overlay overlay);
-const char *tv_overlay_title(tv_overlay overlay);
-/* Shown at once, written behind it; a refusal puts the old value back. */
-void tv_setting_set(tv_setting_id setting, const char *value);
-/* The panel off and the sound on, for music. */
-bool tv_screen_off(void);
-/* LG's own name for a setting's value, "expert1" as "Expert (Dark room)". */
-const char *tv_value_title(const char *value);
+/* Uninstalls it; the apps are asked again once the TV has. */
+bool tv_remove_app(const char *app_id);
+/* Restarts the TV, as its own power menu does. */
+bool tv_restart(void);
+/* Opens the input or app the TV was last showing (general.lastInputApp), as
+ * LG's Home does when the TV comes on. */
+bool tv_open_last_input(void);

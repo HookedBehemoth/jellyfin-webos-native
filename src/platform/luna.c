@@ -16,7 +16,8 @@ bool jf_luna_register_lifecycle(void (*quit)(void), void (*relaunch)(void)) {
 void jf_luna_deinit(void) {}
 void jf_luna_query_hdr(void) {}
 int jf_luna_hdr(void) { return -1; }
-bool jf_luna_relaunch_home_key(void) { return false; }
+jf_relaunch_reason jf_luna_relaunch_reason(void) { return JF_RELAUNCH_OTHER; }
+void jf_luna_set_pause_handler(void (*on_pause)(void)) { (void)on_pause; }
 
 bool jf_luna_call(const char *uri, const char *payload, jf_luna_reply_fn reply,
                   void *user) {
@@ -120,7 +121,10 @@ static pthread_t loop_thread;
 static bool loop_running;
 static void (*on_quit)(void);
 static void (*on_relaunch)(void);
-static atomic_bool relaunch_home_key;
+static void (*on_pause)(void);
+static atomic_int relaunch_reason;
+
+void jf_luna_set_pause_handler(void (*handler)(void)) { on_pause = handler; }
 
 static bool on_message(LSHandle *handle, LSMessage *message, void *user) {
   (void)handle;
@@ -136,16 +140,17 @@ static bool on_message(LSHandle *handle, LSMessage *message, void *user) {
   fprintf(stderr, "luna lifecycle: %s\n", event);
   if (strcmp(event, "close") == 0 && on_quit != NULL)
     on_quit();
+  if (strcmp(event, "pause") == 0 && on_pause != NULL)
+    on_pause();
   /* A minimised app is still running, so opening it from the launcher is a
    * relaunch rather than a start: nothing else will raise the window. */
   if (strcmp(event, "relaunch") == 0 && on_relaunch != NULL) {
-    /* The Home key, as against SAM opening Home because nothing else is
-     * left in front. */
-    char reason[32];
-    atomic_store(
-        &relaunch_home_key,
-        jf_luna_json_string(payload, "reason", reason, sizeof(reason)) &&
-            strcmp(reason, "hotKey") == 0);
+    char reason[32] = "";
+    jf_luna_json_string(payload, "reason", reason, sizeof(reason));
+    atomic_store(&relaunch_reason,
+                 strcmp(reason, "hotKey") == 0 ? JF_RELAUNCH_HOME_KEY
+                 : strcmp(reason, "boot") == 0 ? JF_RELAUNCH_BOOT
+                                               : JF_RELAUNCH_OTHER);
     on_relaunch();
   }
   return true;
@@ -179,7 +184,9 @@ void jf_luna_query_hdr(void) {
 
 int jf_luna_hdr(void) { return atomic_load(&hdr); }
 
-bool jf_luna_relaunch_home_key(void) { return atomic_load(&relaunch_home_key); }
+jf_relaunch_reason jf_luna_relaunch_reason(void) {
+  return (jf_relaunch_reason)atomic_load(&relaunch_reason);
+}
 
 static void *run_loop(void *unused) {
   (void)unused;

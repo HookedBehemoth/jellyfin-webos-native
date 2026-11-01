@@ -87,6 +87,8 @@ static struct {
   void (*egl_window_destroy)(void *);
   const struct wl_interface *display, *registry, *compositor, *surface, *seat,
       *keyboard, *pointer, *output, *shell, *shell_surface;
+  /* Not on every TV: without it the pointer is the compositor's to hide. */
+  const struct wl_interface *input_manager;
 } wl;
 
 static bool load_symbol(void *library, const char *name, void *out) {
@@ -139,6 +141,7 @@ static bool load(void) {
   ok &= load_symbol(webos, "wl_webos_shell_interface", &wl.shell);
   ok &=
       load_symbol(webos, "wl_webos_shell_surface_interface", &wl.shell_surface);
+  wl.input_manager = dlsym(webos, "wl_webos_input_manager_interface");
   return ok;
 }
 
@@ -174,7 +177,7 @@ static wl_proxy *send_request(wl_proxy *p, const struct wl_interface *i,
 /* ------------------------------------------------------------ the window */
 
 static void *display;
-static wl_proxy *registry, *compositor, *shell, *output;
+static wl_proxy *registry, *compositor, *shell, *output, *input_manager;
 static wl_proxy *surface, *shell_surface;
 static void *egl_window;
 static EGLDisplay egl_display = EGL_NO_DISPLAY;
@@ -309,10 +312,38 @@ static void on_key_leave(void *d, wl_proxy *k, uint32_t serial, wl_proxy *s) {
   if (jf_window_log_events)
     fprintf(stderr, "wayland: focus out\n");
 }
+/* The magic remote's pointer, as the compositor last said. Hidden here on
+ * every key, as LG's SDL does; moving the remote brings it back. */
+static bool cursor_shown;
+
+static void hide_cursor(void) {
+  if (!cursor_shown || input_manager == NULL)
+    return;
+  send_request(input_manager, wl.input_manager, "set_cursor_visibility", NULL,
+               0, 0, 0, 0, 0);
+  cursor_shown = false;
+  emit(&(jf_event){.kind = JF_EVENT_POINTER_LEAVE});
+}
+
+static void on_cursor_visibility(void *d, wl_proxy *m, uint32_t visibility,
+                                 wl_proxy *webos_seat) {
+  (void)d, (void)m, (void)webos_seat;
+  if (jf_window_log_events)
+    fprintf(stderr, "wayland: pointer %s\n", visibility ? "shown" : "hidden");
+  cursor_shown = visibility != 0;
+  if (!cursor_shown)
+    emit(&(jf_event){.kind = JF_EVENT_POINTER_LEAVE});
+}
+static void ignore_event(void) {}
+/* Filled by name from the interface's own event table, the rest ignored. */
+static listener_fn input_manager_listener[8];
+
 static void on_key(void *d, wl_proxy *k, uint32_t serial, uint32_t time,
                    uint32_t code, uint32_t state) {
   (void)d, (void)k, (void)serial, (void)time;
   const bool pressed = state == 1;
+  if (pressed)
+    hide_cursor();
   if (pressed) {
     repeat_key = code;
     repeat_at = now_ms() + (uint64_t)repeat_delay;
@@ -355,6 +386,7 @@ static void on_pointer_leave(void *d, wl_proxy *p, uint32_t serial,
 static void on_motion(void *d, wl_proxy *p, uint32_t time, int32_t x,
                       int32_t y) {
   (void)d, (void)p, (void)time;
+  cursor_shown = true;
   pointer_at(JF_EVENT_POINTER_MOTION, x, y);
 }
 static void on_button(void *d, wl_proxy *p, uint32_t serial, uint32_t time,
@@ -435,6 +467,12 @@ static void on_global(void *data, wl_proxy *r, uint32_t name,
     want = wl.output, at = version < 2 ? version : 2;
   else if (strcmp(interface, "wl_seat") == 0 && seat_count < SEATS)
     want = wl.seat, at = version < 4 ? version : 4;
+  else if (strcmp(interface, "wl_webos_input_manager") == 0 &&
+           wl.input_manager != NULL && input_manager == NULL &&
+           (size_t)wl.input_manager->event_count <=
+               sizeof(input_manager_listener) /
+                   sizeof(input_manager_listener[0]))
+    want = wl.input_manager;
   if (want == NULL)
     return;
   /* wl_registry.bind is "usun": the name, then the interface's name and
@@ -450,6 +488,15 @@ static void on_global(void *data, wl_proxy *r, uint32_t name,
   } else if (want == wl.output) {
     output = bound;
     wl.add_listener(bound, output_listener, NULL);
+  } else if (want == wl.input_manager) {
+    input_manager = bound;
+    for (int i = 0; i < want->event_count; i++) {
+      const bool visibility =
+          strcmp(want->events[i].name, "cursor_visibility") == 0;
+      input_manager_listener[i] = visibility ? (listener_fn)on_cursor_visibility
+                                             : (listener_fn)ignore_event;
+    }
+    wl.add_listener(bound, input_manager_listener, NULL);
   } else {
     seats[seat_count].seat = bound;
     wl.add_listener(bound, seat_listener, (void *)(uintptr_t)seat_count);
@@ -704,18 +751,21 @@ static void carry_out(void) {
   while (read(wake_pipe[0], drain, sizeof(drain)) > 0)
     continue;
   if (atomic_exchange(&raise_asked, false)) {
-    /* Mapped afresh every time, hidden here or not: the compositor hides an
-     * overlay itself when an app comes up over it - an input chosen in LG's
-     * input picker - and tells it nothing (SAM only sends a pause), and a
-     * window it hid that way comes back only as one hidden here does. */
     if (jf_window_log_events)
       fprintf(stderr, "wayland: raise\n");
-    if (!hidden)
-      unmap_surface();
-    if (!map_surface())
-      fprintf(stderr, "wayland: the window could not be mapped again\n");
-    hidden = false;
-    set_state(STATE_FULLSCREEN);
+    /* Mapped afresh unless it is up and has the remote: the compositor hides
+     * an overlay itself when an app comes up over it - an input chosen in
+     * LG's input picker - and tells it nothing (SAM only sends a pause), and
+     * a window it hid that way comes back only as one hidden here does. Up
+     * and focused, it is in front already, and a remap would only flicker. */
+    if (!jf_window_focused()) {
+      if (!hidden)
+        unmap_surface();
+      if (!map_surface())
+        fprintf(stderr, "wayland: the window could not be mapped again\n");
+      hidden = false;
+      set_state(STATE_FULLSCREEN);
+    }
     jf_window_drawable = true;
     jf_window_frame_requested = true;
   }

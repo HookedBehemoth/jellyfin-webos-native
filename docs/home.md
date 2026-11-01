@@ -1,10 +1,10 @@
 # Home: replacing LG's launcher
 
-`home` is a Home screen in place of LG's: one horizontal ribbon along the
-bottom of the screen, laid over whatever is playing, with the apps, the HDMI
-inputs, LG's own screens that open over everything (the input picker,
-notifications, ...), and a small panel for picture mode, sound output and
-energy saving. It is not a port of
+`home` is a Home screen in place of LG's: a bar of app tiles along the
+bottom of the screen, as LG's Home drew it before webOS 6, laid over whatever
+is playing, with the HDMI inputs under it. It does not handle the Settings
+key or settings at all: that key opens LG's quick settings, another app. It is
+not a port of
 [glasshouse](https://github.com/rorygallagher2024/glasshouse)'s Home; that
 project's research is where most of what follows comes from, and it is cited
 where it was measured on a TV other than ours. Nothing in this file has been
@@ -19,6 +19,36 @@ ssh root@10.10.8.63 sh -s restore < tools/home-takeover.sh   # and back
 Taking over is **non-permanent by construction**: the copy and the bind mount
 live in `/tmp`, so a reboot gives LG's Home its place back whatever state
 anything is left in. `restore` does the same without the reboot.
+
+### On the TV, without ssh
+
+The ipk carries `home-takeover.sh` and `home-boot-hook`.
+
+- **Opening "Home" from LG's menu** takes the place for this start. Opened
+  under its own id, the launcher is a developer app without root, so it asks
+  Homebrew Channel's root service
+  (`luna://org.webosbrew.hbchannel.service/exec`, open to any caller) to run
+  `home-takeover.sh take open` in the background, and quits. The script opens
+  the new Home once it is in place, and says on screen (a toast) when it
+  could not. Without Homebrew Channel, a toast says that is what is missing.
+- **The gear tile** at the end of the bar (options): *At every start* links
+  `home-boot-hook` as `/var/lib/webosbrew/init.d/60-home-takeover`. Homebrew
+  Channel runs everything there at boot; the hook returns at once and leaves
+  the script to wait for sam (up to two minutes) and take the place. In LG's
+  Home's place the launcher runs as root, so it makes and removes the link
+  itself. *Restart the TV* restarts it
+  (`com.webos.service.sleep/shutdown/machineReboot`), leaving the link as it
+  is: with *At every start* off, that gives LG's Home its place back for
+  certain. Undoing the takeover in place (`restore`) is
+  left to a shell.
+- **Recovery** with *At every start* on: remove the link from a shell
+  (`home-takeover.sh disable-boot`, or `rm` it) and reboot or `restore`. With
+  it off, a reboot is always enough. Homebrew Channel's own failsafe also
+  skips every boot hook on the start after one that a reboot cut short.
+
+Glasshouse does the same with a setting its server reads at every start and
+a boot hook of its own (`50-tvweb`), applied without asking; here nothing
+runs at boot until the option is turned on.
 
 ## How the takeover works
 
@@ -56,6 +86,10 @@ out of the last app (sam's `last_input_handler`), waking from standby
    - Where configd held no `profile.blockedAppList`, the nudge leaves it holding
      the country's list (`blockedAppList/<country>.json`), so sam blocks what
      it did before.
+   - The id is a new one every time (`dev.hookedbehemoth.home.rescan.<time>`),
+     and any left in the list is taken out when it is written back. A run that
+     stopped half way once left the list holding just the id; adding the same
+     id again changed nothing sam counts, and no takeover took after that.
 4. Only then stop LG's running Home (its process, or on webOS 10/11 the
    `flutter-client -i com.webos.app.home` runner). Changing the manifest's type
    under a running instance leaves sam unable to close or replace it.
@@ -63,8 +97,13 @@ out of the last app (sam's `last_input_handler`), waking from standby
    `preloadmanager/setPreloadPolicy` with `isEnabled: false` stops that, and
    `restore` turns it back on.
 
-`restore` unmounts, rereads, and stops our process last; where ours was in
-front, sam opens LG's Home in its place.
+`restore` unmounts, rereads, stops our process, and opens LG's Home. It
+unmounts whatever `/proc/mounts` lists over the two paths, not only what
+matches the stage: a mount a failed run left behind outlives its stage, and
+LG's Home started over the empty folder it leaves draws nothing (a black
+screen). For the same reason a Home that started while `restore` ran - the
+Home key pressed while it waited for sam, after the executable was LG's again
+but before the folder was - is stopped, and LG's Home opened afresh.
 
 ## What it took on webOS 9.2.2
 
@@ -162,18 +201,98 @@ layer's GLib thread), parsed in `src/tv/tv.c`:
 |---|---|---|
 | apps | `com.webos.applicationManager/listLaunchPoints` | `launchPoints[]`: `id`, `title`, `largeIcon`/`icon` (absolute PNG paths); skips `lptype: bookmark`, `visible: false`, the HDMI apps and Home itself |
 | inputs | `com.webos.service.eim/getAllInputStatus` | `devices[]` with `id` `HDMI_n`: `label`, `appId`, `hdmiPlugIn` (some TVs report `connected: true` for every port), the `SIMPLINK` entry of `subList` for the CEC device name |
+| tiles | the same launch points | `iconColor` (`#rrggbb`, the tile's colour, as LG's Home paints it; often `""`), `removable` (false for LG's own apps) |
+| previews | `com.webos.service.recent/listRecents` | `recentsAppList[]`: `appId`, `cardSnapShotFilePath`, the last frame the compositor kept of an app, which LG's Home shows on an input's card |
+| front | `com.webos.applicationManager/getForegroundAppInfo` | `appId`: the app beneath the launcher, which as an overlay is not the foreground app itself (checked on webOS 9.2.2); the launcher starts on its tile, or its input's card |
 | open | `com.webos.applicationManager/launch` | `{id}`; an input is its app, `com.webos.app.hdmiN` |
-| overlays | `com.webos.applicationManager/getAppInfo` per candidate | the first id the TV has: input picker `com.webos.app.quickinputpicker` (webOS 11) or `com.webos.app.inputcommon` (webOS 9); quick settings `com.webos.app.quicksettings`; Settings `com.palm.app.settings`; notifications `com.webos.app.notificationcenter`; search `com.webos.app.voice` |
-| settings | `com.webos.service.settings/getSystemSettings`, `getSystemSettingDesc`, `setSystemSettings` | `settings.<key>`; a choice's values in `values.arrayExt` (each with `visible`), or `values.array` on older firmware; `ui.visible`/`ui.active` hide or grey the key. Answers "does not exist" on older TVs, which have it as `com.webos.settingsservice`; the launcher switches over on that answer |
-| screen off | `com.webos.service.tvpower/power/turnOffScreen` | |
+| remove | `com.webos.appInstallService/remove` | `{id, subscribe: false}`, as LG's Home sends it; the launch points are asked again after the answer |
 
-Picture settings without a `dimension` read and write the picture on screen;
-with the launcher over an app, that is the app's (`input: default`).
+`com.webos.service.recent` is the compositor itself (`libWebOSCoreCompositor`
+registers it), found in LG's Home QML (`Interfaces/HomeRecentInterfaces`). On
+webOS 9.2.2 it answers, but only apps that supply an `imageForRecents` have a
+path: the HDMI inputs' are empty there, so their cards show a glyph. How the
+compositor captures one for an input was not chased further.
 
-LG's screens all opened over glasshouse's replacement on a G3 (webOS 9.2):
-the input picker, notifications, search, the account panel, alerts and toasts.
-The quick settings tile is offered only where `getAppInfo` finds the app, as
-it may not be launchable at all; the Settings key opens it regardless.
+The order of the apps and which are hidden are the launcher's own
+(`src/home/layout.c`), one line per app (`show <id>` / `hide <id>`) in
+`layout.txt` beside the installed app,
+`/media/developer/apps/usr/palm/applications/dev.hookedbehemoth.home/`, so
+LG's Home keeps its own order (`moveLaunchPoint`) when it has its place back.
+A reinstall starts it afresh. `HOME_LAYOUT` names another file.
+
+## Coming on
+
+At power-on, from standby or a restart, bootManager opens Home (reason
+`boot`, `parameters: {boot: true}`), and a second later sam's
+`last_input_handler` opens it again (reason `undefined`, mode `last_input`).
+LG's Home opens the last input then (`general.lastInputApp` in
+`com.webos.settingsservice`, `com.webos.app.livetv` on ours) and stays out of
+sight. The launcher does the same for both, within 15 s of the first; showing
+itself there left nothing in front: a black screen once it was put away. The
+same applies when it is started rather than relaunched by the TV coming on.
+
+## The bar
+
+- No background: the tiles, parallelograms side by side, stand over the
+  picture. The focused one grows up along its slanted sides, its colour still
+  reaching the bottom edge; the one losing the focus sinks back, both eased.
+  Tiles carry no names. A tile without an icon shows its first letter in
+  black or white, whichever contrasts more with the tile (WCAG relative
+  luminance). The bar starts at the screen's side,
+  where the first tile's bottom left corner is.
+- With the inputs up, they sit on a solid background reaching up to the top
+  of the apps.
+- Coming up, the launcher starts on what is in front beneath it, unless a key
+  is pressed before the TV says what that is.
+- Up from the apps puts the launcher out of the way, as Back does.
+- The tiles are 7.5% of the screen wide and 18.5% high, leaning 17%. A
+  slanted fill is clipped before the vertex shader shears it, so the renderer
+  lets it run past the left of its clip by the shear's reach; otherwise a tile
+  half off the left edge loses the triangle the shear brings back into view.
+- The Magic Remote's pointer: `wl_webos_input_manager` (requests
+  `set_cursor_visibility(u)` and `get_webos_seat(no)`, checked on webOS 9.2.2)
+  reports its visibility as soon as it is bound and whenever it changes. The
+  compositor brings the pointer up whenever the launcher is shown, as it does
+  for LG's Home, and the launcher leaves it: every key hides it, as LG's SDL
+  does, and moving the remote brings it back.
+- Resting the pointer in the outer 120 px at either side of the bar scrolls
+  it that way, steadily, faster the nearer the edge: up to 1400 px a second.
+- Opening, nothing eases: the first frames, through the focus going to what is
+  in front, are drawn at their end state, until a key or the pointer moves.
+- Closing an app (Exit, or `ares-launch --close`), SAM relaunches Home twice
+  (reason `undefined`, nothing in front). The launcher comes up over black,
+  showing nothing but the menu, until it is put away: over black, or over
+  `/media/developer/home-background.png` when there is one (a PNG, cropped to
+  fill the screen; `HOME_BACKGROUND` names another). Being an overlay is no
+  bar to that: the frame is the launcher's to draw, and it covers what is
+  beneath wherever it is opaque. A raise while it is up
+  and focused does not remap it, which flickered.
+- The compositor may also bring the last input up when an app closes:
+  `StarfishFullscreenController.qml`'s closing policy, under its read-only
+  setting `fullscreen.launchLastInputAppAfterClosing` (true), launches the app
+  the `general.lastInputApp` setting names when the closing window asks for it.
+  Coming up full screen, any app closes every overlay
+  (`StarfishViewStateController.qml`), and SAM sends the launcher a `pause`.
+  A pause within 3 s of such a relaunch, before any key, brings the launcher
+  back over it, once. An overlay can be kept up with
+  `com.webos.surfacemanager/setPinOverlayView {appId, overlayId}`, but that is
+  in the `surfaces.control` group, which LG Home's role does not have:
+  "Denied method call" on webOS 9.2.2. Neither Exit nor `--close` brought an
+  input up in testing; when the remote's Back closes an app it may.
+- An app opened over another minimises the one beneath (SDL: `FOCUS_LOST`, then
+  `MINIMIZED`); the overlay launcher only takes its focus. SAM sends a native
+  app no `pause` for either. Jellyfin pauses playback when its window is
+  minimised, so it plays on under the menu but stops for another app.
+- Down raises the bar and focuses the inputs, over a background that is solid
+  below the apps and fades out to their top; Up goes back to the app the
+  focus left, and Down again to the input it left.
+- The pencil after the apps opens the edit mode, on the app beside it. Select
+  picks an app up, with
+  arrows either side of it; Left and Right carry it; select puts it down. Up
+  reaches the X over it, which asks whether to hide or uninstall it; an app
+  that is not `removable` can only be hidden. The hidden apps follow the shown
+  ones, greyed out; selecting one shows it again and picks it up. Back saves
+  and leaves the edit mode, as does the Home key.
 
 ## What to check first
 
@@ -188,20 +307,20 @@ On the TV, in this order; each one decides the next:
 2. **The window type**: whether the app beneath keeps playing behind the
    ribbon, or goes black and stops. See above for the fork.
 3. **The Home key while the launcher is up**: SAM should send `relaunch`,
-   which brings the ribbon back to its start and asks for the lists again.
+   which brings the bar back to its first screen and asks for the lists again.
 4. **sam's rescan** on this firmware: `tools/home-takeover.sh status` shows
    whether `getAppInfo` names our vendor.
 
 ## Testing without the TV
 
 Off the TV, `src/tv/transport_mock.c` stands in for the bus: a TV in the
-process that answers in the same payloads, keeps what is written to it, and
-can refuse a call or answer only under the older settings name. The desktop
+process that answers in the same payloads, forgets an app removed from it,
+and can refuse a call. The desktop
 build runs against it, and so do the launcher's tests:
 
 ```sh
 ./build-host/src/home                         # the mock TV, in a window
-SDL_VIDEODRIVER=offscreen UI_SCRIPT=rrrrrrro UI_CAPTURE=/tmp/home.ppm ./build-host/src/home
+SDL_VIDEODRIVER=offscreen UI_SCRIPT=rrro UI_CAPTURE=/tmp/home.ppm ./build-host/src/home
 ctest --preset host -R home                   # tests/home_tests.c
 ```
 

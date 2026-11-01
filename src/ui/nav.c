@@ -264,6 +264,17 @@ void nav_scroll_end(nav *ui) {
   nav_pop(ui);
 }
 
+void nav_scroll_by(nav *ui, nav_id id, float delta) {
+  nav_state *state = state_for(ui, id);
+  /* However small: a caller scrolling a little every frame adds up. */
+  const float target = fmaxf(state->target + delta, 0);
+  if (target == state->target)
+    return;
+  state->from = state->value = state->target = target;
+  state->started_at = 0;
+  ui->acted = true;
+}
+
 void nav_forget(nav *ui, nav_id id) {
   for (size_t i = 0; i < NAV_STATES; i++)
     if (ui->states[i].id == id)

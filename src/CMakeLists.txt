@@ -221,7 +221,7 @@ if (LIBPNG_FOUND AND JSONC_FOUND)
     endif ()
 
     # Everything the launcher is but its main(), for tests/home_tests.c.
-    add_library(home-app STATIC jf/image.c)
+    add_library(home-app STATIC jf/image.c home/layout.c)
     target_include_directories(home-app SYSTEM PUBLIC ${LIBPNG_INCLUDE_DIRS})
     target_link_directories(home-app PUBLIC ${LIBPNG_LIBRARY_DIRS})
     target_link_libraries(home-app PUBLIC jf-tv jf-ui ${LIBPNG_LIBRARIES} m pthread)
@@ -234,8 +234,13 @@ if (LIBPNG_FOUND AND JSONC_FOUND)
     else ()
         target_link_libraries(home-app PUBLIC jf-window-sdl)
     endif ()
+    # Opened from LG's menu, it runs home-takeover.sh to take LG's Home's
+    # place; home-boot-hook is what it links into Homebrew Channel's boot
+    # hooks when asked to do that at every start.
     webos_add_ipk(TARGET home APPID dev.hookedbehemoth.home TITLE "Home" VERSION 0.0.1
-            COLOR "#090d16" ICON "${CMAKE_SOURCE_DIR}/assets/icon.png" WEBOS_VERSIONS ">=5")
+            COLOR "#090d16" ICON "${CMAKE_SOURCE_DIR}/assets/icon.png" WEBOS_VERSIONS ">=5"
+            FILES "${CMAKE_SOURCE_DIR}/tools/home-takeover.sh"
+            "${CMAKE_SOURCE_DIR}/tools/home-boot-hook")
 else ()
     message(STATUS "No libpng/json-c here - skipping home")
 endif ()

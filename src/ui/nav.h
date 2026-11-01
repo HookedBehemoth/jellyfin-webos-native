@@ -153,6 +153,10 @@ void nav_pop(nav *ui);
 float nav_scroll_begin(nav *ui, nav_id id, loom_rect view, loom_axis axis,
                        float extent, float margin, float step);
 void nav_scroll_end(nav *ui);
+/* Scrolls a top-level region by `delta` from where it is heading, there at
+ * once rather than animated, for a caller that scrolls a little every frame:
+ * the next frame keeps it within the content. */
+void nav_scroll_by(nav *ui, nav_id id, float delta);
 /* Forgets a top-level scroll region's offset, so the next time it is shown it
  * starts at the top: a list opened afresh rather than returned to. */
 void nav_forget(nav *ui, nav_id id);

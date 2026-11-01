@@ -29,9 +29,21 @@ bool jf_luna_register_lifecycle(void (*on_quit)(void),
                                 void (*on_relaunch)(void));
 void jf_luna_deinit(void);
 
-/* Whether the last relaunch was the Home key, as against SAM opening Home
- * because nothing else is left in front. Read in on_relaunch. */
-bool jf_luna_relaunch_home_key(void);
+/* Called, from the bus's thread, when SAM says the app was paused: the
+ * compositor put something over it. Set before jf_luna_register_lifecycle. */
+void jf_luna_set_pause_handler(void (*on_pause)(void));
+
+/* Why the last relaunch came. Read in on_relaunch. */
+typedef enum {
+  /* SAM opening Home because nothing else is left in front. */
+  JF_RELAUNCH_OTHER,
+  /* The Home key. */
+  JF_RELAUNCH_HOME_KEY,
+  /* The TV coming on, from standby or a restart: LG's Home brings the last
+   * input back then, rather than showing itself. */
+  JF_RELAUNCH_BOOT,
+} jf_relaunch_reason;
+jf_relaunch_reason jf_luna_relaunch_reason(void);
 
 /* Asks for tv.model.supportHDR; jf_luna_hdr is 1 or 0 once it answers, and -1
  * before then or off the TV. After jf_luna_register_lifecycle, whose loop

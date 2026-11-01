@@ -30,7 +30,7 @@ set(WEBOS_PACKAGE_MODULE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 function(webos_add_ipk)
     cmake_parse_arguments(IPK "" "TARGET;APPID;TITLE;VERSION;ICON;COLOR;WEBOS_VERSIONS"
-            "BUNDLE_LIBS;MEDIA;WRITABLE_DIRS" ${ARGN})
+            "BUNDLE_LIBS;MEDIA;WRITABLE_DIRS;FILES" ${ARGN})
 
     if (NOT IPK_TARGET OR NOT IPK_APPID OR NOT IPK_TITLE)
         message(FATAL_ERROR "webos_add_ipk: TARGET, APPID and TITLE are required")
@@ -89,6 +89,12 @@ function(webos_add_ipk)
             list(APPEND _stage_cmds COMMAND "${CMAKE_COMMAND}" -E copy "${_media}" "${_stage}/")
         endforeach ()
     endif ()
+
+    # Anything else the app carries, next to it under its own name, its mode
+    # kept: a script stays executable.
+    foreach (_file IN LISTS IPK_FILES)
+        list(APPEND _stage_cmds COMMAND "${CMAKE_COMMAND}" -E copy "${_file}" "${_stage}/")
+    endforeach ()
 
     foreach (_dir IN LISTS IPK_WRITABLE_DIRS)
         list(APPEND _stage_cmds

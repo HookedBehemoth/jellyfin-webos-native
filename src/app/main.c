@@ -5761,6 +5761,8 @@ static bool app_init(int argc, char **argv) {
 /* One pass of the event loop after the window's events: results, then a frame
  * if anything asked for one. False when there was nothing to draw, with how
  * long to sleep before the next deadline (-1 for none). */
+static bool playback_was_drawable = true;
+
 static bool app_step(int *wait_ms) {
   pump();
   if (autoplay != NULL && screen == SCREEN_HOME) {
@@ -5785,6 +5787,13 @@ static bool app_step(int *wait_ms) {
     if (screen == SCREEN_PLAYBACK)
       jf_window_frame_requested = true;
   }
+  /* Another app opened over this one minimises it, and nothing else stops
+   * the player: it is paused, to be resumed by hand. An overlay - the Home
+   * menu, LG's settings - does not minimise it, and playback goes on behind. */
+  if (playback_was_drawable && !jf_window_drawable &&
+      screen == SCREEN_PLAYBACK && !playback_paused)
+    toggle_playback();
+  playback_was_drawable = jf_window_drawable;
   const uint64_t now = ui_now_ns();
   const bool visible = screen == SCREEN_PLAYBACK && playback_chrome_wanted(now);
   if (visible != controls_visible) {

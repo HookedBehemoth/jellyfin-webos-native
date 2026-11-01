@@ -398,6 +398,18 @@ static void test_playback(void) {
   CHECK(ui.focus == seek_bar_id());
   press(DOWN);
 
+  /* Another app opened over it minimises the window: playback pauses, and is
+   * still paused when the window comes back. */
+  CHECK(!playback_paused);
+  jf_window_minimize();
+  test_ui_settle();
+  CHECK(playback_paused);
+  jf_window_post_raise();
+  test_ui_settle();
+  CHECK(jf_window_drawable && playback_paused);
+  toggle_playback();
+  test_ui_settle();
+
   press(KEY_SUBTITLE);
   CHECK(subtitle_picker);
   CHECK(focus_in_view());
