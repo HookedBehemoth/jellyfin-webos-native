@@ -16,13 +16,17 @@ tv_state tv;
 typedef enum {
   ASK_APPS = 1,
   ASK_INPUTS,
-  ASK_RECENTS,
   ASK_FOREGROUND,
   ASK_LAUNCH,
   ASK_REMOVE,
-  ASK_RESTART,
-  ASK_LAST_INPUT,
+  ASK_HOME,
+  ASK_ICON,
 } ask;
+
+#define HOME_CHOOSER_APP "org.webosbrew.homechooser"
+#define HOME_CHOOSER "luna://org.webosbrew.homechooser.service/"
+/* The launcher API this was written for. */
+#define HOME_CHOOSER_API 1
 
 static uint32_t tag(ask kind, uint32_t index) {
   return (uint32_t)kind << 16 | (index & 0xffff);
@@ -37,6 +41,7 @@ typedef struct answer {
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static answer *queue_head, **queue_tail = &queue_head;
 static void (*wake_fn)(void);
+static tv_icon_fn *icon_fn;
 static size_t in_flight;
 
 void tv_deliver(uint32_t tag, const char *payload) {
@@ -65,7 +70,10 @@ static bool send_json(const char *uri, json_object *payload, uint32_t t) {
 
 size_t tv_pending(void) { return in_flight; }
 
-void tv_init(void (*wake)(void)) { wake_fn = wake; }
+void tv_init(void (*wake)(void), tv_icon_fn *on_icon) {
+  wake_fn = wake;
+  icon_fn = on_icon;
+}
 
 void tv_deinit(void) {
   pthread_mutex_lock(&queue_lock);
@@ -82,36 +90,45 @@ void tv_deinit(void) {
 
 /* ---------------------------------------------------------- the requests */
 
+/* Whether Home Chooser tells of changes to the apps by itself, as far as its
+ * last answer said, and whether the subscription's first answer is yet to come:
+ * only that one counts as a request in flight. */
+static bool apps_live, apps_awaited;
+
+static void ask_apps(void) {
+  if (apps_live || apps_awaited)
+    return;
+  json_object *ask = json_object_new_object();
+  json_object_object_add(ask, "subscribe", json_object_new_boolean(true));
+  const char *text =
+      json_object_to_json_string_ext(ask, JSON_C_TO_STRING_PLAIN);
+  if (tv_transport_subscribe(HOME_CHOOSER "listApps", text, tag(ASK_APPS, 0))) {
+    in_flight++;
+    apps_awaited = true;
+  }
+  json_object_put(ask);
+}
+
 void tv_refresh(void) {
-  send_json("luna://com.webos.applicationManager/listLaunchPoints",
-            json_object_new_object(), tag(ASK_APPS, 0));
+  ask_apps();
   send_json("luna://com.webos.service.eim/getAllInputStatus",
             json_object_new_object(), tag(ASK_INPUTS, 0));
-  /* The compositor's list of what was in front lately, with the last frame
-   * it kept of each: LG's Home shows an input's from there. */
-  send_json("luna://com.webos.service.recent/listRecents",
-            json_object_new_object(), tag(ASK_RECENTS, 0));
   /* The launcher, an overlay, is not the foreground app: the one under it
    * is. */
-  send_json("luna://com.webos.applicationManager/getForegroundAppInfo",
-            json_object_new_object(), tag(ASK_FOREGROUND, 0));
+  send_json(HOME_CHOOSER "getForegroundApp", json_object_new_object(),
+            tag(ASK_FOREGROUND, 0));
 }
 
-bool tv_open_last_input(void) {
-  json_object *ask = json_object_new_object();
-  json_object *keys = json_object_new_array();
-  json_object_array_add(keys, json_object_new_string("lastInputApp"));
-  json_object_object_add(ask, "category", json_object_new_string("general"));
-  json_object_object_add(ask, "keys", keys);
-  return send_json("luna://com.webos.settingsservice/getSystemSettings", ask,
-                   tag(ASK_LAST_INPUT, 0));
+void tv_check_home(void) {
+  send_json(HOME_CHOOSER "getInfo", json_object_new_object(), tag(ASK_HOME, 0));
 }
 
-bool tv_restart(void) {
+void tv_ask_icon(const char *app_id, bool large, uint32_t slot) {
   json_object *ask = json_object_new_object();
-  json_object_object_add(ask, "reason", json_object_new_string("remoteKey"));
-  return send_json("luna://com.webos.service.sleep/shutdown/machineReboot", ask,
-                   tag(ASK_RESTART, 0));
+  json_object_object_add(ask, "id", json_object_new_string(app_id));
+  json_object_object_add(ask, "size",
+                         json_object_new_string(large ? "largeIcon" : "icon"));
+  send_json(HOME_CHOOSER "getAppIcon", ask, tag(ASK_ICON, slot));
 }
 
 static bool launch(const char *app_id, json_object *params) {
@@ -129,12 +146,16 @@ bool tv_open_input(const tv_input *input) {
   return launch(input->app_id, NULL);
 }
 
+bool tv_ask_to_be_home(const char *app_id) {
+  json_object *params = json_object_new_object();
+  json_object_object_add(params, "request", json_object_new_string(app_id));
+  return launch(HOME_CHOOSER_APP, params);
+}
+
 bool tv_remove_app(const char *app_id) {
   json_object *ask = json_object_new_object();
   json_object_object_add(ask, "id", json_object_new_string(app_id));
-  json_object_object_add(ask, "subscribe", json_object_new_boolean(false));
-  return send_json("luna://com.webos.appInstallService/remove", ask,
-                   tag(ASK_REMOVE, 0));
+  return send_json(HOME_CHOOSER "uninstallApp", ask, tag(ASK_REMOVE, 0));
 }
 
 /* ------------------------------------------------------------ the answers */
@@ -192,78 +213,37 @@ static bool shown_as_app(const char *id) {
 }
 
 static void apps_answered(json_object *reply) {
-  json_object *points = member(reply, "launchPoints");
-  if (!succeeded(reply) || !json_object_is_type(points, json_type_array)) {
+  json_object *listed = member(reply, "apps");
+  apps_live = succeeded(reply) && flag_of(reply, "subscribed", false);
+  if (!succeeded(reply) || !json_object_is_type(listed, json_type_array)) {
     failed("The apps could not be listed", reply);
     return;
   }
   tv.app_count = 0;
-  const size_t count = json_object_array_length(points);
+  const size_t count = json_object_array_length(listed);
   for (size_t i = 0; i < count && tv.app_count < TV_APPS; i++) {
-    json_object *point = json_object_array_get_idx(points, i);
-    const char *id = string_of(point, "id");
-    const char *type = string_of(point, "lptype");
-    /* Saved web pages and input tiles are bookmarks of something else. */
-    if (id == NULL || !flag_of(point, "visible", true) ||
-        (type != NULL && strcmp(type, "bookmark") == 0) || !shown_as_app(id))
+    json_object *listing = json_object_array_get_idx(listed, i);
+    const char *id = string_of(listing, "id");
+    if (id == NULL || !flag_of(listing, "visible", true) || !shown_as_app(id))
       continue;
     tv_app *app = &tv.apps[tv.app_count++];
     copy(app->id, sizeof(app->id), id);
-    const char *title = string_of(point, "title");
+    const char *title = string_of(listing, "title");
     copy(app->title, sizeof(app->title), title != NULL ? title : id);
-    const char *icon = string_of(point, "largeIcon");
-    if (icon == NULL || icon[0] != '/')
-      icon = string_of(point, "icon");
-    copy(app->icon, sizeof(app->icon),
-         icon != NULL && icon[0] == '/' ? icon : "");
+    copy(app->folder, sizeof(app->folder), string_of(listing, "folderPath"));
+    copy(app->icon, sizeof(app->icon), string_of(listing, "icon"));
+    copy(app->large_icon, sizeof(app->large_icon),
+         string_of(listing, "largeIcon"));
+    copy(app->version, sizeof(app->version), string_of(listing, "version"));
     /* LG's Home paints the tile in it. */
-    const char *color = string_of(point, "iconColor");
+    const char *color = string_of(listing, "iconColor");
     unsigned rgb = 0;
     app->has_color =
         color != NULL && sscanf(color, "#%6x", &rgb) == 1 && strlen(color) == 7;
     app->color = app->has_color ? rgb : 0;
-    app->removable = flag_of(point, "removable", false);
+    app->removable = flag_of(listing, "removable", false);
   }
   tv.apps_loaded = true;
-}
-
-/* The last frame of each app the compositor kept, by app id, as it last
- * answered: an input's is shown on its card. */
-#define PREVIEWS 32
-static struct {
-  char app_id[64];
-  char path[384];
-} previews[PREVIEWS];
-static size_t preview_count;
-
-static void assign_previews(void) {
-  for (size_t i = 0; i < tv.input_count; i++) {
-    tv_input *input = &tv.inputs[i];
-    input->preview[0] = '\0';
-    for (size_t p = 0; p < preview_count; p++)
-      if (strcmp(previews[p].app_id, input->app_id) == 0)
-        copy(input->preview, sizeof(input->preview), previews[p].path);
-  }
-}
-
-static void recents_answered(json_object *reply) {
-  json_object *list = member(reply, "recentsAppList");
-  /* Not every TV has the service; the cards do without. */
-  if (!succeeded(reply) || !json_object_is_type(list, json_type_array))
-    return;
-  preview_count = 0;
-  for (size_t i = 0;
-       i < json_object_array_length(list) && preview_count < PREVIEWS; i++) {
-    json_object *recent = json_object_array_get_idx(list, i);
-    const char *app = string_of(recent, "appId");
-    const char *path = string_of(recent, "cardSnapShotFilePath");
-    if (app == NULL || path == NULL || path[0] != '/')
-      continue;
-    copy(previews[preview_count].app_id, sizeof(previews[0].app_id), app);
-    copy(previews[preview_count].path, sizeof(previews[0].path), path);
-    preview_count++;
-  }
-  assign_previews();
 }
 
 static void inputs_answered(json_object *reply) {
@@ -312,8 +292,70 @@ static void inputs_answered(json_object *reply) {
       }
     }
   }
-  assign_previews();
   tv.inputs_loaded = true;
+}
+
+/* What getInfo says, in the order the launcher API's guide has it. */
+static void home_answered(json_object *reply) {
+  json_object *version = member(reply, "apiVersion");
+  const char *why = string_of(reply, "errorText");
+  /* The bus, not Home Chooser: it is there, but not set up, as after being
+   * installed again. */
+  if (!succeeded(reply) && why != NULL && strstr(why, "Denied") != NULL)
+    snprintf(tv.error, sizeof(tv.error),
+             "Open Home Chooser once to finish setting it up");
+  else if (!succeeded(reply))
+    failed("Home Chooser is needed, and did not answer", reply);
+  else if (version == NULL || json_object_get_int(version) != HOME_CHOOSER_API)
+    snprintf(tv.error, sizeof(tv.error),
+             "This version of Home Chooser is not the one this Home knows");
+  else if (!flag_of(reply, "root", false))
+    snprintf(tv.error, sizeof(tv.error),
+             "Open Home Chooser once to finish setting it up");
+  else if (!flag_of(reply, "permitted", false))
+    snprintf(tv.error, sizeof(tv.error),
+             "Install this Home again, with Home Chooser already set up");
+  else
+    tv.not_chosen = !flag_of(reply, "isSelectedHome", false);
+}
+
+static int base64_digit(char c) {
+  if (c >= 'A' && c <= 'Z')
+    return c - 'A';
+  if (c >= 'a' && c <= 'z')
+    return c - 'a' + 26;
+  if (c >= '0' && c <= '9')
+    return c - '0' + 52;
+  return c == '+' ? 62 : c == '/' ? 63 : -1;
+}
+
+/* Up to the padding, or the first thing that is not base64. Its length in
+ * `size`; NULL when out of memory. */
+static uint8_t *base64_decode(const char *text, size_t *size) {
+  uint8_t *out = malloc(strlen(text) / 4 * 3 + 3);
+  if (out == NULL)
+    return NULL;
+  size_t at = 0;
+  uint32_t bits = 0;
+  int count = 0;
+  for (; base64_digit(*text) >= 0; text++) {
+    bits = bits << 6 | (uint32_t)base64_digit(*text);
+    if ((count += 6) >= 8) {
+      count -= 8;
+      out[at++] = (uint8_t)(bits >> count);
+    }
+  }
+  *size = at;
+  return out;
+}
+
+static void icon_answered(uint32_t slot, json_object *reply) {
+  const char *data = succeeded(reply) ? string_of(reply, "data") : NULL;
+  size_t size = 0;
+  uint8_t *bytes = data != NULL ? base64_decode(data, &size) : NULL;
+  if (icon_fn != NULL)
+    icon_fn(slot, bytes, size);
+  free(bytes);
 }
 
 static void apply(const answer *a) {
@@ -325,9 +367,6 @@ static void apply(const answer *a) {
     break;
   case ASK_INPUTS:
     inputs_answered(reply);
-    break;
-  case ASK_RECENTS:
-    recents_answered(reply);
     break;
   case ASK_FOREGROUND:
     copy(tv.foreground, sizeof(tv.foreground),
@@ -341,25 +380,14 @@ static void apply(const answer *a) {
   case ASK_REMOVE:
     if (!succeeded(reply))
       failed("The app could not be removed", reply);
-    /* Gone, or not: the list says which. */
-    send_json("luna://com.webos.applicationManager/listLaunchPoints",
-              json_object_new_object(), tag(ASK_APPS, 0));
+    /* Gone once the owner agrees: said by itself, or else seen next time. */
+    ask_apps();
     break;
-  case ASK_LAST_INPUT: {
-    json_object *settings = NULL;
-    const char *app = NULL;
-    if (succeeded(reply) &&
-        json_object_object_get_ex(reply, "settings", &settings))
-      app = string_of(settings, "lastInputApp");
-    if (app != NULL && app[0] != '\0')
-      launch(app, NULL);
-    else
-      failed("The TV did not say what it last showed", reply);
+  case ASK_HOME:
+    home_answered(reply);
     break;
-  }
-  case ASK_RESTART:
-    if (!succeeded(reply))
-      failed("The TV would not restart", reply);
+  case ASK_ICON:
+    icon_answered(a->tag & 0xffff, reply);
     break;
   }
   json_object_put(reply);
@@ -375,7 +403,11 @@ bool tv_pump(void) {
   while (list != NULL) {
     answer *a = list;
     list = a->next;
-    if (in_flight > 0)
+    /* A subscription's later answers were never asked for. */
+    const bool later = a->tag >> 16 == ASK_APPS && !apps_awaited;
+    if (a->tag >> 16 == ASK_APPS)
+      apps_awaited = false;
+    if (in_flight > 0 && !later)
       in_flight--;
     apply(a);
     free(a->payload);

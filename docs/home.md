@@ -1,138 +1,44 @@
 # Home: replacing LG's launcher
 
-`home` is a Home screen in place of LG's: a bar of app tiles along the
-bottom of the screen, as LG's Home drew it before webOS 6, laid over whatever
-is playing, with the HDMI inputs under it. It does not handle the Settings
-key or settings at all: that key opens LG's quick settings, another app. It is
-not a port of
-[glasshouse](https://github.com/rorygallagher2024/glasshouse)'s Home; that
-project's research is where most of what follows comes from, and it is cited
-where it was measured on a TV other than ours. Nothing in this file has been
-checked on `10.10.8.63` yet; see [What to check first](#what-to-check-first).
+`home` is a Home screen in place of LG's: a bar of app tiles along the bottom
+of the screen, as LG's Home drew it before webOS 6, laid over whatever is
+playing, with the HDMI inputs under it. It does not handle the Settings key or
+settings at all: that key opens LG's quick settings, another app.
+
+It is an ordinary developer app. What makes it Home is
+[Home Chooser](https://github.com/webosbrew/home-chooser), a homebrew app that
+makes the Home key open the launcher the owner picks, keeps that across
+restarts, and puts LG's Home back if the launcher or Home Chooser is removed.
 
 ```sh
 cmake --build build --target home-install
-ssh root@10.10.8.63 sh -s take    < tools/home-takeover.sh   # LG's Home -> ours
-ssh root@10.10.8.63 sh -s restore < tools/home-takeover.sh   # and back
 ```
 
-Taking over is **non-permanent by construction**: the copy and the bind mount
-live in `/tmp`, so a reboot gives LG's Home its place back whatever state
-anything is left in. `restore` does the same without the reboot.
+Home Chooser has to be installed and opened once **before** the launcher: the
+TV refuses to install an app naming a permission nobody declares yet (`Not
+allowed permission is used`). Then open Home in LG's menu. If another app is
+Home, it opens Home Chooser asking the owner to choose it, and gets out of the
+way. To go back, open Home Chooser and choose LG Home; removing Home Chooser or
+the launcher does the same by itself.
 
-### On the TV, without ssh
+## What Home Chooser does for it
 
-The ipk carries `home-takeover.sh` and `home-boot-hook`.
+On webOS 6 to 9:
 
-- **Opening "Home" from LG's menu** takes the place for this start. Opened
-  under its own id, the launcher is a developer app without root, so it asks
-  Homebrew Channel's root service
-  (`luna://org.webosbrew.hbchannel.service/exec`, open to any caller) to run
-  `home-takeover.sh take open` in the background, and quits. The script opens
-  the new Home once it is in place, and says on screen (a toast) when it
-  could not. Without Homebrew Channel, a toast says that is what is missing.
-- **The gear tile** at the end of the bar (options): *At every start* links
-  `home-boot-hook` as `/var/lib/webosbrew/init.d/60-home-takeover`. Homebrew
-  Channel runs everything there at boot; the hook returns at once and leaves
-  the script to wait for sam (up to two minutes) and take the place. In LG's
-  Home's place the launcher runs as root, so it makes and removes the link
-  itself. *Restart the TV* restarts it
-  (`com.webos.service.sleep/shutdown/machineReboot`), leaving the link as it
-  is: with *At every start* off, that gives LG's Home its place back for
-  certain. Undoing the takeover in place (`restore`) is
-  left to a shell.
-- **Recovery** with *At every start* on: remove the link from a shell
-  (`home-takeover.sh disable-boot`, or `rm` it) and reboot or `restore`. With
-  it off, a reboot is always enough. Homebrew Channel's own failsafe also
-  skips every boot hook on the start after one that a reboot cut short.
+- The Home key: a copy of the TV's key filter launching the launcher instead,
+  selected through configd until the next restart.
+- SAM opening `com.webos.app.home` for any other reason: a gate, mounted over
+  `/usr/bin/com.webos.app.home`, decides. With `defaultWindowType: overlay`:
+  nothing in front opens the last input, and something in front opens the
+  launcher. The launcher gets only its id then, not why.
+- A watcher redoes all of it at every start, as a boot hook of Home Chooser's.
 
-Glasshouse does the same with a setting its server reads at every start and
-a boot hook of its own (`50-tvweb`), applied without asking; here nothing
-runs at boot until the option is turned on.
+So the launcher has no part in the TV coming on or an app closing. Closing an
+app goes back to the last input, not to the menu.
 
-## How the takeover works
-
-LG's Home is `com.webos.app.home`, and it is what the TV opens for everything
-that means Home: the Home key (surface-manager, `launchType: homeKey`), Back
-out of the last app (sam's `last_input_handler`), waking from standby
-(bootManager). Nothing calls it as a Luna service. So the replacement takes its
-**id** rather than any setting:
-
-1. Copy the installed `dev.hookedbehemoth.home` to `/tmp/home-takeover`, with an
-   `appinfo.json` naming `com.webos.app.home`, `main` as an absolute
-   `file://` path as LG's own manifest has it, `appCategory: ["home"]` (without
-   it webOS 10's Home key opens nothing) and `defaultWindowType: "overlay"` (not read for a native app, see below).
-2. `mount --bind` it over `/usr/palm/applications/com.webos.app.home`. The
-   mount propagates into the voice service's jails, which see that directory
-   too.
-3. Make sam read that manifest again. sam reads `appinfo.json` only when it
-   scans, and has no call for it, so:
-   - webOS 10 and 11: `applicationManager/blockSystemApp` then
-     `releaseBlockSystemApp` on the id rereads that one app (webOS 11 wants
-     `forceBlockSystemApp: false`, named only in its schema);
-   - webOS 7 to 9: configd's `profile.blockedAppList` set to itself plus an id
-     no app has, then back, makes sam rescan everything without restarting.
-     configd keeps that value across reboots as a user value: it is LG's own
-     list, but a later change of LG's list would not be seen.
-   - webOS 5 and 6 have neither; only restarting sam works there, which closes
-     every app, and the script does not do it.
-   - **webOS 9.2.2 (our TV) has `blockSystemApp` but not
-     `releaseBlockSystemApp`** ("Unknown method"), and its schema has no
-     `forceBlockSystemApp`. A block there lasts until sam restarts: Home then
-     opens nothing (`getAppInfo`: "Invalid appId specified OR Unsupported
-     Application Type") and only a reboot undoes it; nothing is written to
-     disk. The script therefore nudges first, and blocks only where a release
-     for an unblocked id answers true.
-   - Where configd held no `profile.blockedAppList`, the nudge leaves it holding
-     the country's list (`blockedAppList/<country>.json`), so sam blocks what
-     it did before.
-   - The id is a new one every time (`dev.hookedbehemoth.home.rescan.<time>`),
-     and any left in the list is taken out when it is written back. A run that
-     stopped half way once left the list holding just the id; adding the same
-     id again changed nothing sam counts, and no takeover took after that.
-4. Only then stop LG's running Home (its process, or on webOS 10/11 the
-   `flutter-client -i com.webos.app.home` runner). Changing the manifest's type
-   under a running instance leaves sam unable to close or replace it.
-5. webOS 11's preload manager starts LG's Home again in the background;
-   `preloadmanager/setPreloadPolicy` with `isEnabled: false` stops that, and
-   `restore` turns it back on.
-
-`restore` unmounts, rereads, stops our process, and opens LG's Home. It
-unmounts whatever `/proc/mounts` lists over the two paths, not only what
-matches the stage: a mount a failed run left behind outlives its stage, and
-LG's Home started over the empty folder it leaves draws nothing (a black
-screen). For the same reason a Home that started while `restore` ran - the
-Home key pressed while it waited for sam, after the executable was LG's again
-but before the folder was - is stopped, and LG's Home opened afresh.
-
-## What it took on webOS 9.2.2
-
-Checked on `10.10.8.63` (Rockhopper 9.2.2) on 31 October 2026; with all of it
-the launcher registers with sam, every call below is answered, and the ribbon
-draws the TV's apps with their icons.
-
-- **The executable, not only the manifest.** ls-hubd gives the name
-  `com.webos.app.home`, with LG's Home's `privileged` role and outbound access
-  to every service, only to `/usr/bin/com.webos.app.home`
-  (`/usr/share/ls2/roles/{pub,prv}/com.webos.app.home.json`). Run from
-  anywhere else the bus refuses it, sam never hears from it and keeps its
-  launch spinner up (`spinnerOnLaunch`) for good. The takeover mounts the
-  binary over that file too, and the manifest's `main` names it.
-- **No `APPID` for a system app.** SAM starts it with the id only in the
-  launch payload (`argv[1]`, `"appId"`). Without it the launcher named itself
-  by its development id, to the bus and to the compositor alike.
-- **Not through libhelpers.** libhelpers works the app's name out from where
-  its executable is and, from `/usr/bin`, fails every call before reaching the
-  bus, with an empty `HGetError`. The launcher registers the name itself with
-  luna-service2 (`jf_luna_set_name`); jellyfin keeps libhelpers.
-- **Stop the old instance after the reread.** sam's last-input handler starts
-  Home again at once, from whatever manifest it holds at that moment.
-- **The launcher runs as root**, unjailed (`privilegedJail: false`).
-- `/tmp/criu_enable` is set, and sam made a (still empty) checkpoint directory
-  for the launcher: Home is one of the apps it snapshots. Whether a restore
-  from such a snapshot keeps the bus connection is not known.
-- The bind mounts propagate into every jailed app's view of `/usr/bin` and
-  `/usr/palm/applications`; unmounting takes them all down.
+Home Chooser refuses a key filter whose shape it does not know, and leaves
+LG's Home on the key. Its list of checked firmware has 9.2.1 and 9.2.4, not
+our 9.2.2.
 
 ## Drawing over the app beneath
 
@@ -176,7 +82,8 @@ calls the TV's own SDL 2.0.14 looks up. With `_WEBOS_WINDOW_TYPE_OVERLAY` set
 on the shell surface before the first frame, surface-manager logs the window
 as `_WEBOS_WINDOW_TYPE_OVERLAY`, it survives being launched by SAM, the app in
 front stays the foreground app (`getForegroundAppInfo`), and a capture shows it
-through and around the ribbon (checked over YouTube on 31 October 2026). It
+through and around the ribbon (checked over YouTube on 31 October 2026, then
+still running as LG's Home). It
 has no on-screen keyboard and no exported video window yet, so jellyfin keeps
 `window.c`; off the TV the launcher uses `window.c` too, for its tests.
 
@@ -194,54 +101,64 @@ playing throughout (checked over YouTube's preview, 31 October 2026).
 
 ## What it asks the TV
 
-All one-shot Luna calls, through `jf_luna_call` (libhelpers, on the platform
-layer's GLib thread), parsed in `src/tv/tv.c`:
+A developer app has the bus groups `public` and `ares.webos.cli`
+(`client-permissions.d`, `devmode_certificate.json`), and what those allow was
+read from `/usr/share/luna-service2/api-permissions.d` on webOS 9.2.2. `luna-send
+-a <app>` does not show it: as root it answers an id that does not exist too.
+What they do not allow goes through Home Chooser's root service, whose methods
+need `requiredPermissions` naming `org.webosbrew.homechooser.applications`.
+
+All one-shot Luna calls, through `jf_luna_call`, parsed in `src/tv/tv.c`:
 
 | for | call | answer used |
 |---|---|---|
-| apps | `com.webos.applicationManager/listLaunchPoints` | `launchPoints[]`: `id`, `title`, `largeIcon`/`icon` (absolute PNG paths); skips `lptype: bookmark`, `visible: false`, the HDMI apps and Home itself |
-| inputs | `com.webos.service.eim/getAllInputStatus` | `devices[]` with `id` `HDMI_n`: `label`, `appId`, `hdmiPlugIn` (some TVs report `connected: true` for every port), the `SIMPLINK` entry of `subList` for the CEC device name |
-| tiles | the same launch points | `iconColor` (`#rrggbb`, the tile's colour, as LG's Home paints it; often `""`), `removable` (false for LG's own apps) |
-| previews | `com.webos.service.recent/listRecents` | `recentsAppList[]`: `appId`, `cardSnapShotFilePath`, the last frame the compositor kept of an app, which LG's Home shows on an input's card |
-| front | `com.webos.applicationManager/getForegroundAppInfo` | `appId`: the app beneath the launcher, which as an overlay is not the foreground app itself (checked on webOS 9.2.2); the launcher starts on its tile, or its input's card |
-| open | `com.webos.applicationManager/launch` | `{id}`; an input is its app, `com.webos.app.hdmiN` |
-| remove | `com.webos.appInstallService/remove` | `{id, subscribe: false}`, as LG's Home sends it; the launch points are asked again after the answer |
+| apps | Home Chooser `listApps {subscribe: true}` (`listApps` itself is private), asked once while it keeps telling of changes, and at every opening where it does not | `apps[]`: `id`, `title`, `folderPath`, `icon`, `largeIcon`, `version`, `iconColor`, `removable`, `visible`; skips `visible: false`, the HDMI apps and Home itself |
+| icons | The app's folder where the jail can read it; else Home Chooser `getAppIcon {id, size}`, kept in `data/icons/<id>-<version>` | `data`, base64. On webOS 9.2.2 the jail sees `/media/developer/apps` but not `/usr/palm`, `/media/system/apps` or `/mnt/otncabi`: 12 of 21 visible apps. The large icon, then the small one |
+| inputs | `com.webos.service.eim/getAllInputStatus` (public) | `devices[]` with `id` `HDMI_n`: `label`, `appId`, `hdmiPlugIn` (some TVs report `connected: true` for every port), the `SIMPLINK` entry of `subList` for the CEC device name |
+| front | Home Chooser `getForegroundApp` (`getForegroundAppInfo` is private) | `appId`: the app beneath the launcher, which as an overlay is not the foreground app itself; the launcher starts on its tile, or its input's card |
+| open | `com.webos.applicationManager/launch` (public) | `{id}`; an input is its app, `com.webos.app.hdmiN` |
+| remove | Home Chooser `uninstallApp {id}` | `pending`: it asks the owner itself, after the launcher's own question. If they agree the app leaves the subscribed list |
+| Home Chooser | Home Chooser `getInfo` | `apiVersion`, `root`, `permitted`, `isSelectedHome`, in that order; each but the last is a line on screen |
 
-`com.webos.service.recent` is the compositor itself (`libWebOSCoreCompositor`
-registers it), found in LG's Home QML (`Interfaces/HomeRecentInterfaces`). On
-webOS 9.2.2 it answers, but only apps that supply an `imageForRecents` have a
-path: the HDMI inputs' are empty there, so their cards show a glyph. How the
-compositor captures one for an input was not chased further.
+`iconColor` and `subscribe` in `listApps`, and native callers at all, are not in
+Home Chooser's API yet; without the first tiles are grey, and without the second
+the list is asked for at every opening. `eim/getAllInputStatus` answers
+`subscribe: true` without `subscribed`, so the inputs are asked for at every
+opening too, as is what is in front. `com.webos.service.recent/listRecents`, the frames LG's Home shows on
+an input's card, is private and Home Chooser does not offer it, so the cards
+show a glyph. On webOS 9.2.2 its paths for the inputs were empty anyway.
 
 The order of the apps and which are hidden are the launcher's own
 (`src/home/layout.c`), one line per app (`show <id>` / `hide <id>`) in
-`layout.txt` beside the installed app,
-`/media/developer/apps/usr/palm/applications/dev.hookedbehemoth.home/`, so
-LG's Home keeps its own order (`moveLaunchPoint`) when it has its place back.
-A reinstall starts it afresh. `HOME_LAYOUT` names another file.
+`data/layout.txt` in the app's folder, its working directory, which a reinstall
+leaves in place (seen on webOS 9.2.2). `HOME_LAYOUT` names another file. With no layout yet the apps are
+in `listApps`'s order, by id.
 
-## Coming on
+## How long it lives
 
-At power-on, from standby or a restart, bootManager opens Home (reason
-`boot`, `parameters: {boot: true}`), and a second later sam's
-`last_input_handler` opens it again (reason `undefined`, mode `last_input`).
-LG's Home opens the last input then (`general.lastInputApp` in
-`com.webos.settingsservice`, `com.webos.app.livetv` on ours) and stays out of
-sight. The launcher does the same for both, within 15 s of the first; showing
-itself there left nothing in front: a black screen once it was put away. The
-same applies when it is started rather than relaunched by the TV coming on.
+Started by the first Home press, it stays running: Home brings it back, and
+hiding it unmaps the window, keeping the GL context, textures and icons. Nothing
+freezes it; it sleeps until an event comes. It held about 32 MB on webOS 9.2.2.
+
+It is not kept alive by anything either. A `_WEBOS_WINDOW_TYPE_RESTRICTED` window
+such as LiveTV's `com.webos.app.channelsetting` closes it (`close`, reason
+`windowPolicy`), and once it died hidden with no cause in any log. The next Home
+press starts it afresh. `/tmp/home.log` is this run's; the last run's is
+`/tmp/home.log.1`.
 
 ## The bar
 
-- No background: the tiles, parallelograms side by side, stand over the
-  picture. The focused one grows up along its slanted sides, its colour still
+- The tiles, parallelograms side by side, stand over the picture. The focused one grows up along its slanted sides, its colour still
   reaching the bottom edge; the one losing the focus sinks back, both eased.
   Tiles carry no names. A tile without an icon shows its first letter in
   black or white, whichever contrasts more with the tile (WCAG relative
   luminance). The bar starts at the screen's side,
   where the first tile's bottom left corner is.
-- With the inputs up, they sit on a solid background reaching up to the top
-  of the apps.
+- Behind the bar, always, is one fade, from nothing at the top of the apps to
+  solid at their foot, and solid below that, where the inputs come up. It moves
+  with the bar and nothing about it depends on how far that has risen. A fade is only true on a quad that
+  ends with it: `ui.slang` clamps it at the corners before interpolating, so on
+  a longer quad it runs past the width asked for.
 - Coming up, the launcher starts on what is in front beneath it, unless a key
   is pressed before the TV says what that is.
 - Up from the apps puts the launcher out of the way, as Back does.
@@ -253,42 +170,25 @@ same applies when it is started rather than relaunched by the TV coming on.
   `set_cursor_visibility(u)` and `get_webos_seat(no)`, checked on webOS 9.2.2)
   reports its visibility as soon as it is bound and whenever it changes. The
   compositor brings the pointer up whenever the launcher is shown, as it does
-  for LG's Home, and the launcher leaves it: every key hides it, as LG's SDL
-  does, and moving the remote brings it back.
+  for LG's Home, and the launcher leaves it: the arrow keys hide it, and moving
+  the remote brings it back.
 - Resting the pointer in the outer 120 px at either side of the bar scrolls
   it that way, steadily, faster the nearer the edge: up to 1400 px a second.
 - Opening, nothing eases: the first frames, through the focus going to what is
   in front, are drawn at their end state, until a key or the pointer moves.
-- Closing an app (Exit, or `ares-launch --close`), SAM relaunches Home twice
-  (reason `undefined`, nothing in front). The launcher comes up over black,
-  showing nothing but the menu, until it is put away: over black, or over
-  `/media/developer/home-background.png` when there is one (a PNG, cropped to
-  fill the screen; `HOME_BACKGROUND` names another). Being an overlay is no
-  bar to that: the frame is the launcher's to draw, and it covers what is
-  beneath wherever it is opaque. A raise while it is up
-  and focused does not remap it, which flickered.
-- The compositor may also bring the last input up when an app closes:
-  `StarfishFullscreenController.qml`'s closing policy, under its read-only
-  setting `fullscreen.launchLastInputAppAfterClosing` (true), launches the app
-  the `general.lastInputApp` setting names when the closing window asks for it.
-  Coming up full screen, any app closes every overlay
-  (`StarfishViewStateController.qml`), and SAM sends the launcher a `pause`.
-  A pause within 3 s of such a relaunch, before any key, brings the launcher
-  back over it, once. An overlay can be kept up with
-  `com.webos.surfacemanager/setPinOverlayView {appId, overlayId}`, but that is
-  in the `surfaces.control` group, which LG Home's role does not have:
-  "Denied method call" on webOS 9.2.2. Neither Exit nor `--close` brought an
-  input up in testing; when the remote's Back closes an app it may.
 - An app opened over another minimises the one beneath (SDL: `FOCUS_LOST`, then
   `MINIMIZED`); the overlay launcher only takes its focus. SAM sends a native
   app no `pause` for either. Jellyfin pauses playback when its window is
   minimised, so it plays on under the menu but stops for another app.
-- Down raises the bar and focuses the inputs, over a background that is solid
-  below the apps and fades out to their top; Up goes back to the app the
+- Down raises the bar and focuses the inputs; Up goes back to the app the
   focus left, and Down again to the input it left.
 - The pencil after the apps opens the edit mode, on the app beside it. Select
   picks an app up, with
-  arrows either side of it; Left and Right carry it; select puts it down. Up
+  arrows either side of it; Left and Right carry it; select puts it down. The
+  pointer does the same: a click picks an app up, it follows the pointer with
+  the focus staying on it, at either side scrolling the bar, and a click anywhere
+  puts it down; or it is dragged, and letting go puts it down. A pick-up that
+  moves it to no other place is not a drag, as the remote shakes when clicked. Up
   reaches the X over it, which asks whether to hide or uninstall it; an app
   that is not `removable` can only be hidden. The hidden apps follow the shown
   ones, greyed out; selecting one shows it again and picks it up. Back saves
@@ -298,18 +198,20 @@ same applies when it is started rather than relaunched by the TV coming on.
 
 On the TV, in this order; each one decides the next:
 
-1. **Permissions.** Whether the calls above answer when the launcher runs as
-   `com.webos.app.home` from `/usr/palm/applications`. ls-hubd decides what a
-   native client may call, and a developer app gets only public methods. The
-   launcher logs every call and answer to `/tmp/home.log`.
-   If they are refused, the fallback is a root helper that runs `luna-send`
-   for it, as glasshouse's server does.
-2. **The window type**: whether the app beneath keeps playing behind the
-   ribbon, or goes black and stops. See above for the fork.
-3. **The Home key while the launcher is up**: SAM should send `relaunch`,
-   which brings the bar back to its first screen and asks for the lists again.
-4. **sam's rescan** on this firmware: `tools/home-takeover.sh status` shows
-   whether `getAppInfo` names our vendor.
+1. **Whether Home Chooser takes the launcher as a caller.** It requires
+   an application id, which a native app's connection does not carry on webOS
+   9.2.2: it answered `forbidden`, and `LSRegisterApplicationService` is refused
+   (`Invalid permissions`), as the role goes by the executable and names no app.
+   Home Chooser needs to take the bus name for those. `getInfo`'s answer is on
+   the bar's line and in `/tmp/home.log`.
+2. **Whether the key filter is accepted** on 9.2.2: Home Chooser's status shows
+   `patch=possible`.
+3. **The window type under the developer id**: that the app beneath keeps
+   playing, as it did as LG's Home.
+4. **The Home key's reason**: `relaunch` with `hotKey` is what toggles the bar.
+5. **The TV coming on**: Home is opened twice, and if the input is in front by
+   the second, the gate opens the launcher over it.
+6. **Whether a hidden developer app stays alive**, which LG's Home was kept for.
 
 ## Testing without the TV
 

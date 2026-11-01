@@ -9,5 +9,5 @@
   "iconColor": "@IPK_COLOR@",
   "bgColor": "@IPK_COLOR@",
   "nativeLifeCycleInterfaceVersion": 2,
-  "noSplashOnLaunch": true
+  "noSplashOnLaunch": true@IPK_APPINFO_EXTRA@
 }

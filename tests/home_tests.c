@@ -78,7 +78,6 @@ static nav_id input_card(const char *id) {
   return nav_child(nav_str("inputs"), nav_str(id));
 }
 #define PENCIL nav_child(nav_str("ribbon"), nav_str("edit"))
-#define OPTIONS nav_child(nav_str("ribbon"), nav_str("options"))
 
 static void focus(nav_id id) {
   nav_focus(&ui, id);
@@ -96,22 +95,43 @@ static const char *shown_order(void) {
   return out;
 }
 
+/* The item nav last saw for `id`, or NULL. */
+static const nav_item_record *declared(nav_id id) {
+  for (size_t i = 0; i < ui.count[ui.current]; i++)
+    if (ui.items[ui.current][i].id == id)
+      return &ui.items[ui.current][i];
+  return NULL;
+}
+
 /* ------------------------------------------------------------------ tests */
 
-/* What the TV lists, less what is not an app to open: the bookmark, the
- * hidden app, the input app, and Home - LG's, and this one. */
+/* What Home Chooser lists, less what is not an app to open: the hidden app, the
+ * input app, and Home - LG's, and this one. */
 static void test_catalogue(void) {
   settle();
   CHECK(screen == SCREEN_HOME);
   CHECK(tv.app_count == TV_MOCK_APPS);
   CHECK(strcmp(tv.apps[0].id, "netflix") == 0);
-  CHECK(tv.apps[0].icon[0] == '/');
+  /* Each icon: from the app's folder where that can be read, and otherwise
+   * through Home Chooser, large, then small; for neither, its letter. */
+  CHECK(icon_for(&tv.apps[0]) != NULL);
+  CHECK(strstr(tv_mock_last("getAppIcon"), "netflix") == NULL);
+  CHECK(icon_for(&tv.apps[1]) != NULL);
+  CHECK(icon_for(&tv.apps[2]) == NULL);
+  CHECK(tv_mock_calls("getAppIcon") == 3);
+  /* What Home Chooser gave is kept, and asked for no more. */
+  for (size_t i = 0; i < icon_count; i++)
+    free(icons[i].data);
+  icon_count = 0;
+  find_icons();
+  settle();
+  CHECK(icon_for(&tv.apps[1]) != NULL);
+  CHECK(tv_mock_calls("getAppIcon") == 4);
   /* The tile colour each asks for, and which can be uninstalled. */
   CHECK(tv.apps[0].has_color && tv.apps[0].color == 0xe50914);
   CHECK(tv.apps[0].removable);
-  /* A relative icon is no icon; LG's browser names no colour and stays. */
-  CHECK(strcmp(tv.apps[2].id, "com.webos.app.browser") == 0 &&
-        tv.apps[2].icon[0] == '\0');
+  /* LG's browser names no colour and stays. */
+  CHECK(strcmp(tv.apps[2].id, "com.webos.app.browser") == 0);
   CHECK(!tv.apps[2].has_color && !tv.apps[2].removable);
   CHECK(tv.input_count == 4);
   CHECK(strcmp(tv.inputs[0].device, "PlayStation 5") == 0);
@@ -119,10 +139,6 @@ static void test_catalogue(void) {
   CHECK(strcmp(tv.inputs[2].label, "HDMI 3") == 0);
   CHECK(strcmp(tv.inputs[2].app_id, "com.webos.app.hdmi3") == 0);
   CHECK(!tv.inputs[3].connected);
-  /* The console's last frame, from the compositor's recents; none for the
-   * rest. */
-  CHECK(tv.inputs[0].preview[0] == '/');
-  CHECK(tv.inputs[1].preview[0] == '\0');
   /* No saved layout: the TV's order. */
   CHECK(strcmp(shown_order(),
                "netflix,youtube.leanback.v4,com.webos.app.browser") == 0);
@@ -134,9 +150,14 @@ static void test_catalogue(void) {
  * launcher back. */
 static void home_again(void) {
   CHECK(!jf_window_drawable);
+  const unsigned lists = tv_mock_calls("listApps");
+  const unsigned fronts = tv_mock_calls("getForegroundApp");
   relaunch(RELAUNCH_HOME_KEY);
   settle();
   CHECK(jf_window_drawable);
+  /* Once for each press, and the apps are not asked for at all. */
+  CHECK(tv_mock_calls("getForegroundApp") == fronts + 1);
+  CHECK(tv_mock_calls("listApps") == lists);
 }
 
 static void test_open(void) {
@@ -146,15 +167,11 @@ static void test_open(void) {
   home_again();
   /* Back with the bar where it was. */
   CHECK(screen == SCREEN_HOME && ui.focus == tile("netflix"));
-  /* The pencil after the apps, then the options, and the end of the bar
-   * stays there. */
+  /* The pencil after the apps, and the end of the bar stays there. */
   presses(RIGHT, 3);
   CHECK(ui.focus == PENCIL);
   press(RIGHT);
-  CHECK(ui.focus == OPTIONS);
-  press(RIGHT);
-  CHECK(ui.focus == OPTIONS);
-  press(LEFT);
+  CHECK(ui.focus == PENCIL);
   /* Up from the apps puts the launcher out of the way. */
   press(UP);
   CHECK(!jf_window_drawable);
@@ -202,6 +219,102 @@ static void test_inputs(void) {
   animations_enabled = false;
 }
 
+/* The background of the inputs as last drawn: the one fill that fades in from
+ * its top. NULL for none. */
+static const loom_command *inputs_background(void) {
+  for (size_t i = 0; i < ctx.count; i++)
+    if (ctx.commands[i].kind == LOOM_RECTANGLE &&
+        ctx.commands[i].mask.width[LOOM_FADE_TOP] > 0)
+      return &ctx.commands[i];
+  return NULL;
+}
+
+/* From nothing at the top of the apps to solid at their foot, as drawn: the one
+ * fade, its quad ending with it. */
+static void check_inputs_background(void) {
+  const loom_command *shade = inputs_background();
+  CHECK(shade != NULL);
+  if (shade == NULL)
+    return;
+  const float bottom = (float)gl_height - rise.value * INPUTS_RISE * kit.scale;
+  const float tile = TILE_H * kit.scale;
+  CHECK(shade->rectangle.color[3] == 255);
+  CHECK(fabsf(shade->rect.y - (bottom - tile)) < 1);
+  CHECK(fabsf(shade->mask.edge[LOOM_FADE_TOP] - (bottom - tile)) < 1);
+  CHECK(fabsf(shade->mask.width[LOOM_FADE_TOP] - tile) < 1);
+  CHECK(fabsf(shade->rect.y + shade->rect.h - bottom) < 1);
+}
+
+/* The blue of a pixel of the frame as drawn. */
+static int frame_blue(const char *path, int x, int y) {
+  FILE *file = fopen(path, "rb");
+  int width = 0, height = 0, blue = -1;
+  if (file != NULL && fscanf(file, "P6 %d %d 255", &width, &height) == 2) {
+    fgetc(file);
+    fseek(file, (long)(y * width + x) * 3 + 2, SEEK_CUR);
+    blue = fgetc(file);
+  }
+  if (file != NULL)
+    fclose(file);
+  return blue;
+}
+
+/* One frame, read back, with the background's blue checked past the last tile:
+ * the frame's clear is black, and the background is 14. Solid from the apps'
+ * foot down, half way half way up them, and nothing above. */
+static void check_background_in_frame(void) {
+  char path[64];
+  snprintf(path, sizeof(path), "/tmp/home-tests-%d.ppm", (int)getpid());
+  jf_window_poll();
+  glViewport(0, 0, (GLsizei)gl_width, (GLsizei)gl_height);
+  glClearColor(0, 0, 0, 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  build_ui(&ctx);
+  jf_renderer_draw(renderer, ctx.commands, ctx.count, (float)gl_width,
+                   (float)gl_height);
+  ui_capture(path);
+  jf_window_swap();
+  check_inputs_background();
+  const int x = (int)gl_width - 8;
+  const float bottom = (float)gl_height - rise.value * INPUTS_RISE * kit.scale;
+  const float tile = TILE_H * kit.scale;
+  /* The row the foot falls in is only part covered. */
+  if ((int)bottom + 1 < (int)gl_height)
+    CHECK(frame_blue(path, x, (int)bottom + 1) == 14);
+  if ((int)bottom + 2 < (int)gl_height)
+    CHECK(frame_blue(path, x, (int)gl_height - 1) == 14);
+  const int half = frame_blue(path, x, (int)(bottom - tile / 2));
+  CHECK(half >= 5 && half <= 9);
+  CHECK(frame_blue(path, x, (int)(bottom - tile) + 1) <= 1);
+  CHECK(frame_blue(path, x, (int)(bottom - tile) - 4) == 0);
+  unlink(path);
+}
+
+static void check_background_while(uint32_t key, float until) {
+  animations_enabled = true;
+  on_key(key, true, false);
+  bool mid_way = false;
+  for (int i = 0; i < 400 && (i < 2 || rise.value != until); i++) {
+    check_background_in_frame();
+    mid_way = mid_way || (rise.value > 0.05f && rise.value < 0.95f);
+    usleep(1000);
+  }
+  CHECK(mid_way && rise.value == until);
+  animations_enabled = false;
+}
+
+/* Up and down with the inputs and at rest, in the pixels of every frame:
+ * nothing about the background depends on how far the bar has risen. */
+static void test_inputs_background(void) {
+  focus(tile("youtube.leanback.v4"));
+  CHECK(rise.value == 0);
+  check_background_in_frame();
+  check_background_while(DOWN, 1);
+  check_background_while(UP, 0);
+  check_background_in_frame();
+  settle();
+}
+
 /* Reordering: select picks the app up, Left and Right carry it, select puts
  * it down. */
 static void test_move(void) {
@@ -232,6 +345,86 @@ static void test_move(void) {
   /* Left and Right move the focus again. */
   press(RIGHT);
   CHECK(ui.focus == tile("com.webos.app.browser"));
+}
+
+static void point(jf_event_kind kind, float x, float y) {
+  jf_event pointer = {.kind = kind};
+  pointer.pointer.x = (jf_fixed)x << 8;
+  pointer.pointer.y = (jf_fixed)y << 8;
+  on_event(&pointer);
+  settle();
+}
+
+static void point_at(nav_id id) {
+  const nav_item_record *item = declared(id);
+  CHECK(item != NULL);
+  if (item != NULL)
+    point(JF_EVENT_POINTER_MOTION, item->rect.x + item->rect.w / 2,
+          item->rect.y + item->rect.h / 2);
+}
+
+static void button(bool pressed) {
+  jf_event click = {.kind = JF_EVENT_POINTER_BUTTON};
+  click.button.button = 0x110;
+  click.button.pressed = pressed;
+  on_event(&click);
+  settle();
+}
+
+/* The pointer does what the keys do: a click picks an app up, it goes with the
+ * pointer, the focus staying on it, and another click puts it down. Or it is
+ * dragged, and letting go puts it down. */
+static void test_move_with_pointer(void) {
+  CHECK(screen == SCREEN_EDIT);
+  point_at(tile("netflix"));
+  CHECK(ui.focus == tile("netflix"));
+  button(true);
+  button(false);
+  CHECK(moving);
+  point_at(tile("com.webos.app.browser"));
+  CHECK(strcmp(shown_order(),
+               "youtube.leanback.v4,com.webos.app.browser,netflix") == 0);
+  CHECK(ui.focus == tile("netflix"));
+  /* Across the bar, and put down well above it. */
+  point_at(tile("youtube.leanback.v4"));
+  CHECK(strcmp(shown_order(),
+               "netflix,youtube.leanback.v4,com.webos.app.browser") == 0);
+  point(JF_EVENT_POINTER_MOTION, declared(tile("netflix"))->rect.x + 8, 10);
+  CHECK(moving);
+  button(true);
+  CHECK(!moving);
+  button(false);
+  CHECK(!moving);
+  /* Hovering only moves the focus again. */
+  point_at(tile("com.webos.app.browser"));
+  CHECK(ui.focus == tile("com.webos.app.browser"));
+  CHECK(strcmp(shown_order(),
+               "netflix,youtube.leanback.v4,com.webos.app.browser") == 0);
+  /* Dragged. */
+  button(true);
+  CHECK(moving);
+  point_at(tile("netflix"));
+  CHECK(strcmp(shown_order(),
+               "com.webos.app.browser,netflix,youtube.leanback.v4") == 0);
+  button(false);
+  CHECK(!moving);
+  /* Back as it was, by the keys, which hand over from the pointer. */
+  point_at(tile("com.webos.app.browser"));
+  press(OK);
+  CHECK(moving && !pointer_carrying);
+  presses(RIGHT, 2);
+  press(OK);
+  CHECK(!moving);
+  CHECK(strcmp(shown_order(),
+               "netflix,youtube.leanback.v4,com.webos.app.browser") == 0);
+  nav_pointer_leave(&ui);
+  /* The order the keys' journey goes on from. */
+  focus(tile("netflix"));
+  press(OK);
+  press(RIGHT);
+  press(OK);
+  CHECK(strcmp(shown_order(),
+               "youtube.leanback.v4,netflix,com.webos.app.browser") == 0);
 }
 
 /* The X over an app: hide it, or uninstall it where the TV lets. */
@@ -266,13 +459,16 @@ static void test_hide(void) {
         ui.focus == remove_badge("com.webos.app.browser"));
 
   /* YouTube can go altogether. */
+  const unsigned list_calls = tv_mock_calls("listApps");
   focus(remove_badge("youtube.leanback.v4"));
   press(OK);
   press(RIGHT);
   CHECK(ui.focus == nav_str("confirm.remove"));
   press(OK);
-  CHECK(tv_mock_calls("remove") == 1);
-  CHECK(strstr(tv_mock_last("remove"), "youtube.leanback.v4") != NULL);
+  CHECK(tv_mock_calls("uninstallApp") == 1);
+  /* Said by Home Chooser, not asked for. */
+  CHECK(tv_mock_calls("listApps") == list_calls);
+  CHECK(strstr(tv_mock_last("uninstallApp"), "youtube.leanback.v4") != NULL);
   CHECK(screen == SCREEN_EDIT);
   CHECK(tv.app_count == TV_MOCK_APPS - 1);
   CHECK(layout_find(&layout, "youtube.leanback.v4") < 0);
@@ -340,14 +536,6 @@ static void test_home_key(void) {
   settle();
   CHECK(jf_window_drawable);
   CHECK(screen == SCREEN_HOME && ui.focus == PENCIL);
-}
-
-/* The item nav last saw for `id`, or NULL. */
-static const nav_item_record *declared(nav_id id) {
-  for (size_t i = 0; i < ui.count[ui.current]; i++)
-    if (ui.items[ui.current][i].id == id)
-      return &ui.items[ui.current][i];
-  return NULL;
 }
 
 /* Coming up, the launcher starts on what is in front beneath it - unless a
@@ -426,41 +614,6 @@ static void test_opens_instantly(void) {
   tv_mock_foreground("");
 }
 
-/* Closing an app, SAM brings Home up, and the input it goes back to comes up
- * over it: the launcher comes back over that, once - but not once a key put
- * it away. */
-static void test_back_over_the_input(void) {
-  press(BACK);
-  relaunch(RELAUNCH_OTHER);
-  settle();
-  CHECK(jf_window_drawable);
-  /* Over nothing: an input the compositor brings up is not to be seen, and
-   * the wallpaper is. */
-  CHECK(covering);
-  CHECK(icon_for(background_path) != NULL);
-  capture("covering");
-  /* The compositor hiding it, as an input coming up does. */
-  jf_window_minimize();
-  on_pause();
-  settle();
-  CHECK(jf_window_drawable);
-  /* Once. */
-  jf_window_minimize();
-  on_pause();
-  settle();
-  CHECK(!jf_window_drawable);
-  relaunch(RELAUNCH_OTHER);
-  settle();
-  press(BACK);
-  CHECK(!covering);
-  on_pause();
-  settle();
-  CHECK(!jf_window_drawable);
-  /* The Home key opens it over what is in front, uncovered. */
-  home_again();
-  CHECK(!covering);
-}
-
 /* A bar longer than the screen scrolls along with the app being carried. */
 static void test_carried_out_of_view(void) {
   char id[16];
@@ -507,54 +660,82 @@ static void test_carried_out_of_view(void) {
   nav_pointer_leave(&ui);
 }
 
-/* The TV coming on: Home is opened for the start and then for the last
- * input, and opens that input rather than showing itself, for both. */
-static void test_waking(void) {
-  press(BACK);
-  CHECK(!jf_window_drawable);
+/* Another app as Home, the owner is asked in Home Chooser and the launcher goes
+ * out of its way; what Home Chooser still needs is said on the line. */
+static void test_home_chooser(void) {
   const unsigned launches = tv_mock_calls("launch");
-  relaunch(RELAUNCH_BOOT);
+  tv_mock_home_chooser(true, true, false);
+  tv_check_home();
   settle();
-  CHECK(!jf_window_drawable);
-  CHECK(tv_mock_calls("launch") == launches + 1 &&
-        strstr(tv_mock_last("launch"), "com.webos.app.hdmi1") != NULL);
-  relaunch(RELAUNCH_OTHER);
-  settle();
-  CHECK(!jf_window_drawable && !covering);
+  CHECK(!jf_window_drawable && !tv.not_chosen);
   CHECK(tv_mock_calls("launch") == launches + 1);
-  /* The Home key opens it as ever, and an app closing after that covers. */
+  CHECK(strstr(tv_mock_last("launch"), "\"org.webosbrew.homechooser\"") !=
+        NULL);
+  CHECK(strstr(tv_mock_last("launch"), "\"request\":\"" APP_ID "\"") != NULL);
+  tv_mock_home_chooser(true, true, true);
   home_again();
-  press(BACK);
-  relaunch(RELAUNCH_OTHER);
+
+  tv_mock_home_chooser(false, true, true);
+  tv_check_home();
   settle();
-  CHECK(jf_window_drawable && covering);
-  press(BACK);
-  home_again();
+  CHECK(strstr(tv.error, "Open Home Chooser") != NULL);
+  press(LEFT);
+  tv_mock_home_chooser(true, false, true);
+  tv_check_home();
+  settle();
+  CHECK(strstr(tv.error, "Install this Home again") != NULL);
+  press(LEFT);
+  tv_mock_refuse("getInfo", 1);
+  tv_check_home();
+  settle();
+  CHECK(strstr(tv.error, "Home Chooser is needed") != NULL);
+  press(LEFT);
+  tv_mock_home_chooser(true, true, true);
+  CHECK(tv_mock_calls("launch") == launches + 1 && jf_window_drawable);
 }
 
-/* The launcher's own options: taking LG's Home's place at every start is a
- * link to the hook it carries, which restarting the TV leaves as it is. */
-static void test_options(void) {
-  focus(OPTIONS);
-  press(OK);
-  CHECK(screen == SCREEN_OPTIONS);
-  capture("options");
-  CHECK(!boot_enabled());
-  press(OK);
-  char target[512] = "";
-  CHECK(readlink(boot_hook_path, target, sizeof(target) - 1) > 0 &&
-        strcmp(target, INSTALLED_DIR "/home-boot-hook") == 0);
-  press(OK);
-  CHECK(!boot_enabled());
-  press(OK);
-  press(RIGHT);
-  press(OK);
-  CHECK(screen == SCREEN_HOME && boot_enabled() && restarting);
-  CHECK(tv_mock_calls("machineReboot") == 1);
-  /* Back, from the first screen as ever. */
-  press(BACK);
+/* Home Chooser going away, as when it is installed again: the list asked for
+ * again next time, and until then the line says why and the inputs still work.
+ * One that cannot subscribe is asked at every press. */
+static void test_apps_refused(void) {
+  tv_mock_lose_subscribers();
+  settle();
+  CHECK(strstr(tv.error, "could not be listed") != NULL);
+  press(LEFT);
+  tv.apps_loaded = false;
+  tv_mock_refuse("listApps", 1);
+  tv_refresh();
+  settle();
+  CHECK(!tv.apps_loaded && strstr(tv.error, "could not be listed") != NULL);
+  CHECK(jf_window_drawable && declared(input_card("HDMI_1")) != NULL);
+  capture("refused");
+  press(DOWN);
+  CHECK(ui.focus == input_card("HDMI_1"));
+  press(UP);
   CHECK(!jf_window_drawable);
-  home_again();
+  tv_mock_subscribable(false);
+  const unsigned lists = tv_mock_calls("listApps");
+  relaunch(RELAUNCH_HOME_KEY);
+  settle();
+  CHECK(jf_window_drawable && tv.apps_loaded);
+  CHECK(tv_mock_calls("listApps") == lists + 1);
+  /* And what went wrong before is no longer said. */
+  CHECK(tv.error[0] == '\0');
+  press(BACK);
+  relaunch(RELAUNCH_HOME_KEY);
+  settle();
+  CHECK(tv_mock_calls("listApps") == lists + 2);
+  tv_mock_subscribable(true);
+  tv_refresh();
+  settle();
+  /* The bus refusing Home Chooser is it not being set up. */
+  tv_mock_refuse("getInfo", 1);
+  tv_mock_refuse_text("Denied method call");
+  tv_check_home();
+  settle();
+  CHECK(strstr(tv.error, "Open Home Chooser") != NULL);
+  tv_mock_refuse_text(NULL);
+  press(LEFT);
 }
 
 /* The file itself: a layout written and read back, and one the TV's apps
@@ -589,22 +770,20 @@ int main(void) {
   snprintf(path, sizeof(path), "/tmp/home-tests-%d.txt", (int)getpid());
   setenv("HOME_LAYOUT", path, 1);
   unlink(path);
-  setenv("HOME_BACKGROUND", JF_SOURCE_DIR "/assets/icon.png", 1);
-  /* The boot hook. */
-  char hook[64];
-  snprintf(hook, sizeof(hook), "/tmp/home-tests-%d-hook", (int)getpid());
-  unlink(hook);
-  setenv("HOME_BOOT_HOOK", hook, 1);
+  char cache[64];
+  snprintf(cache, sizeof(cache), "/tmp/home-tests-%d-icons", (int)getpid());
+  setenv("HOME_ICON_CACHE", cache, 1);
   tv_mock_reset();
-  char *argv[] = {"home-tests", NULL};
-  if (!app_init(1, argv))
+  if (!app_init())
     return 1;
   animations_enabled = false;
 
   test_catalogue();
   test_open();
   test_inputs();
+  test_inputs_background();
   test_move();
+  test_move_with_pointer();
   test_hide();
   test_show_and_save();
   test_relaunch();
@@ -612,14 +791,16 @@ int main(void) {
   test_foreground();
   test_carried_out_of_view();
   test_opens_instantly();
-  test_back_over_the_input();
-  test_waking();
-  test_options();
+  test_home_chooser();
+  test_apps_refused();
   test_layout_file();
 
   app_deinit();
   unlink(path);
-  unlink(hook);
+  char remove_cache[96];
+  snprintf(remove_cache, sizeof(remove_cache), "rm -rf %s", cache);
+  if (system(remove_cache) != 0)
+    failures++;
   if (failures == 0)
     printf("home tests passed\n");
   return failures == 0 ? 0 : 1;

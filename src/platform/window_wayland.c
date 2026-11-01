@@ -312,8 +312,8 @@ static void on_key_leave(void *d, wl_proxy *k, uint32_t serial, wl_proxy *s) {
   if (jf_window_log_events)
     fprintf(stderr, "wayland: focus out\n");
 }
-/* The magic remote's pointer, as the compositor last said. Hidden here on
- * every key, as LG's SDL does; moving the remote brings it back. */
+/* The magic remote's pointer, as the compositor last said. Hidden here when the
+ * arrow keys take over from it; moving the remote brings it back. */
 static bool cursor_shown;
 
 static void hide_cursor(void) {
@@ -342,7 +342,7 @@ static void on_key(void *d, wl_proxy *k, uint32_t serial, uint32_t time,
                    uint32_t code, uint32_t state) {
   (void)d, (void)k, (void)serial, (void)time;
   const bool pressed = state == 1;
-  if (pressed)
+  if (pressed && (code == 103 || code == 105 || code == 106 || code == 108))
     hide_cursor();
   if (pressed) {
     repeat_key = code;

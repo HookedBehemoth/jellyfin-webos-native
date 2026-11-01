@@ -29,19 +29,13 @@ bool jf_luna_register_lifecycle(void (*on_quit)(void),
                                 void (*on_relaunch)(void));
 void jf_luna_deinit(void);
 
-/* Called, from the bus's thread, when SAM says the app was paused: the
- * compositor put something over it. Set before jf_luna_register_lifecycle. */
-void jf_luna_set_pause_handler(void (*on_pause)(void));
-
 /* Why the last relaunch came. Read in on_relaunch. */
 typedef enum {
-  /* SAM opening Home because nothing else is left in front. */
+  /* Anything but the Home key: the launcher opened from a list, or by Home
+   * Chooser's gate. */
   JF_RELAUNCH_OTHER,
   /* The Home key. */
   JF_RELAUNCH_HOME_KEY,
-  /* The TV coming on, from standby or a restart: LG's Home brings the last
-   * input back then, rather than showing itself. */
-  JF_RELAUNCH_BOOT,
 } jf_relaunch_reason;
 jf_relaunch_reason jf_luna_relaunch_reason(void);
 
@@ -51,14 +45,6 @@ jf_relaunch_reason jf_luna_relaunch_reason(void);
 void jf_luna_query_hdr(void);
 int jf_luna_hdr(void);
 
-/* Registers on the bus under `service` itself, for every call that follows,
- * rather than leaving the name to libhelpers. libhelpers works the name out
- * from where the executable is, which only an app in its own directory has:
- * a system app run from /usr/bin - the launcher in LG's Home's place - gets
- * no connection at all from it. The bus allows the name only to the
- * executable its role file names. Before any other call here. */
-void jf_luna_set_name(const char *service);
-
 /* Any one-shot call: `reply` gets the answer's payload, or NULL when the bus
  * gave none. It runs on the GLib thread, like the callbacks above, and the
  * payload is valid for the call only. False when the call could not be sent,
@@ -66,6 +52,10 @@ void jf_luna_set_name(const char *service);
 typedef void (*jf_luna_reply_fn)(const char *payload, void *user);
 bool jf_luna_call(const char *uri, const char *payload, jf_luna_reply_fn reply,
                   void *user);
+/* The same, with `reply` called for every answer for as long as the app runs:
+ * `payload` asks for that itself, with "subscribe": true. */
+bool jf_luna_subscribe(const char *uri, const char *payload,
+                       jf_luna_reply_fn reply, void *user);
 
 /* Print every lifecycle payload. */
 extern bool jf_luna_log;

@@ -11,7 +11,7 @@ marked as unverified.
 | [opengl.md](opengl.md) | OpenGL ES 3.2 capabilities, GPU timing, and the Slang -> GLSL ES pipeline |
 | [fonts.md](fonts.md) | Installed TV fonts and the native UI font selection order |
 | [vulkan.md](vulkan.md) | The Mali ICD, the missing loader, the missing WSI, and how to initialise anyway |
-| [home.md](home.md) | **Home**: the launcher in LG's Home's place, how the takeover works, the Luna calls it makes, what is unverified |
+| [home.md](home.md) | **Home**: the launcher, chosen through Home Chooser, what it asks of it, the Luna calls it makes, what is unverified |
 | [jellyfin.md](jellyfin.md) | **The Jellyfin client**: storage and artwork caching, the libpng-not-libjpeg decision, and playback — Starfish for video, ALSA for audio |
 | [ndl.md](ndl.md) | **NDL: hardware video decode on the video plane** — interface, the four traps, punch-through |
 | [multimedia.md](multimedia.md) | Hardware video decode: NDL_directmedia, GStreamer, device nodes |

@@ -234,13 +234,16 @@ if (LIBPNG_FOUND AND JSONC_FOUND)
     else ()
         target_link_libraries(home-app PUBLIC jf-window-sdl)
     endif ()
-    # Opened from LG's menu, it runs home-takeover.sh to take LG's Home's
-    # place; home-boot-hook is what it links into Homebrew Channel's boot
-    # hooks when asked to do that at every start.
+    # Home Chooser lists it for its category and makes it what the Home key opens; the
+    # permission opens Home Chooser's launcher API to it (docs/home.md).
     webos_add_ipk(TARGET home APPID dev.hookedbehemoth.home TITLE "Home" VERSION 0.0.1
             COLOR "#090d16" ICON "${CMAKE_SOURCE_DIR}/assets/icon.png" WEBOS_VERSIONS ">=5"
-            FILES "${CMAKE_SOURCE_DIR}/tools/home-takeover.sh"
-            "${CMAKE_SOURCE_DIR}/tools/home-boot-hook")
+            WRITABLE_DIRS data
+            APPINFO_EXTRA [=[,
+  "appCategory": ["home"],
+  "defaultWindowType": "overlay",
+  "transparent": true,
+  "requiredPermissions": ["org.webosbrew.homechooser.applications"]]=])
 else ()
     message(STATUS "No libpng/json-c here - skipping home")
 endif ()

@@ -12,5 +12,8 @@
  * none, goes to tv_deliver with `tag`, on any thread, at any later time. False
  * when it could not be sent; then nothing is delivered. */
 bool tv_transport_send(const char *uri, const char *payload, uint32_t tag);
+/* The same, with every later answer going to tv_deliver too: `payload` asks for
+ * them. */
+bool tv_transport_subscribe(const char *uri, const char *payload, uint32_t tag);
 /* Thread-safe; copies `payload`. */
 void tv_deliver(uint32_t tag, const char *payload);

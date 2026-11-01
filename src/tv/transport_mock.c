@@ -25,8 +25,20 @@ static char installed[12][2][64];
 static size_t installed_count;
 static char removed[8][128];
 static size_t removed_count;
+static bool hc_root, hc_permitted, hc_chosen, subscribable;
+static bool has_subscriber;
+static uint32_t subscriber;
+
+static const char *list_apps(bool subscribed);
+
+static void tell_subscriber(void) {
+  if (has_subscriber)
+    tv_deliver(subscriber, list_apps(true));
+}
 
 void tv_mock_reset(void) {
+  hc_root = hc_permitted = hc_chosen = subscribable = true;
+  has_subscriber = false;
   memset(methods, 0, sizeof(methods));
   method_count = 0;
   installed_count = 0;
@@ -61,6 +73,9 @@ void tv_mock_refuse(const char *method, unsigned count) {
     methods[i].refuse = count;
 }
 
+static const char *refusal_text;
+void tv_mock_refuse_text(const char *text) { refusal_text = text; }
+
 void tv_mock_foreground(const char *id) {
   snprintf(foreground, sizeof(foreground), "%s", id);
 }
@@ -71,6 +86,22 @@ void tv_mock_install(const char *id, const char *title) {
   snprintf(installed[installed_count][0], sizeof(installed[0][0]), "%s", id);
   snprintf(installed[installed_count][1], sizeof(installed[0][1]), "%s", title);
   installed_count++;
+  tell_subscriber();
+}
+
+void tv_mock_subscribable(bool can) { subscribable = can; }
+
+void tv_mock_lose_subscribers(void) {
+  if (has_subscriber)
+    tv_deliver(subscriber, "{\"returnValue\":false,\"errorCode\":-1,"
+                           "\"errorText\":\"The service went away\"}");
+  has_subscriber = false;
+}
+
+void tv_mock_home_chooser(bool root, bool permitted, bool chosen) {
+  hc_root = root;
+  hc_permitted = permitted;
+  hc_chosen = chosen;
 }
 
 /* ------------------------------------------------------------ answers */
@@ -82,22 +113,25 @@ static bool is_removed(const char *id) {
   return false;
 }
 
-static const char *launch_points(void) {
+static const char *list_apps(bool subscribed) {
   /* Netflix asks for a red tile and can be removed; the browser is LG's. */
-  static const char *const points[][2] = {
-      {"netflix", "{\"id\":\"netflix\",\"title\":\"Netflix\",\"icon\":\"" ICON
-                  "\",\"largeIcon\":\"" ICON "\",\"lptype\":\"default\","
-                  "\"iconColor\":\"#e50914\",\"removable\":true}"},
+  static const char *const apps[][2] = {
+      {"netflix", "{\"id\":\"netflix\",\"title\":\"Netflix\","
+                  "\"folderPath\":\"" JF_SOURCE_DIR "/assets\","
+                  "\"version\":\"1.0\",\"icon\":\"icon.png\","
+                  "\"largeIcon\":\"icon.png\","
+                  "\"iconColor\":\"#e50914\",\"removable\":true,"
+                  "\"visible\":true}"},
       {"youtube.leanback.v4",
        "{\"id\":\"youtube.leanback.v4\",\"title\":\"YouTube\","
-       "\"icon\":\"" ICON "\",\"iconColor\":\"#ffffff\",\"removable\":true}"},
+       "\"folderPath\":\"/nonexistent\",\"version\":\"2.0\","
+       "\"icon\":\"icon.png\",\"largeIcon\":\"large.png\","
+       "\"iconColor\":\"#ffffff\",\"removable\":true,\"visible\":true}"},
       {"com.webos.app.hdmi1",
        "{\"id\":\"com.webos.app.hdmi1\",\"title\":\"HDMI 1\"}"},
       {"com.webos.app.browser",
        "{\"id\":\"com.webos.app.browser\",\"title\":\"Web Browser\","
-       "\"icon\":\"assets/relative.png\",\"iconColor\":\"\"}"},
-      {"bookmark.page", "{\"id\":\"bookmark.page\",\"title\":\"A saved page\","
-                        "\"lptype\":\"bookmark\"}"},
+       "\"icon\":\"gone.png\",\"iconColor\":\"\",\"visible\":true}"},
       {"com.webos.app.hidden", "{\"id\":\"com.webos.app.hidden\",\"title\":"
                                "\"Hidden\",\"visible\":false}"},
       {"com.webos.app.home",
@@ -107,14 +141,15 @@ static const char *launch_points(void) {
        "\"removable\":true}"},
   };
   static char out[4096];
-  int at =
-      snprintf(out, sizeof(out), "{\"returnValue\":true,\"launchPoints\":[");
+  int at = snprintf(out, sizeof(out),
+                    "{\"returnValue\":true,\"apiVersion\":1,%s\"apps\":[",
+                    subscribed ? "\"subscribed\":true," : "");
   const char *comma = "";
-  for (size_t i = 0; i < sizeof(points) / sizeof(points[0]); i++) {
-    if (is_removed(points[i][0]) || at >= (int)sizeof(out))
+  for (size_t i = 0; i < sizeof(apps) / sizeof(apps[0]); i++) {
+    if (is_removed(apps[i][0]) || at >= (int)sizeof(out))
       continue;
-    at += snprintf(out + at, sizeof(out) - (size_t)at, "%s%s", comma,
-                   points[i][1]);
+    at +=
+        snprintf(out + at, sizeof(out) - (size_t)at, "%s%s", comma, apps[i][1]);
     comma = ",";
   }
   for (size_t i = 0; i < installed_count && at < (int)sizeof(out); i++)
@@ -129,6 +164,37 @@ static const char *launch_points(void) {
   return out;
 }
 
+/* getAppIcon's answer, the repository's icon for every app that has one. */
+static const char *app_icon(const char *id, const char *size) {
+  const bool large = size != NULL && strcmp(size, "largeIcon") == 0;
+  if (strcmp(id, "com.webos.app.browser") == 0 ||
+      (strcmp(id, "youtube.leanback.v4") == 0 && large))
+    return "{\"returnValue\":false,\"apiVersion\":1,\"errorCode\":\"noIcon\","
+           "\"errorText\":\"The app has no readable icon\"}";
+  static const char digits[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  static unsigned char bytes[16384];
+  static char out[32768];
+  FILE *file = fopen(ICON, "rb");
+  const size_t read = file != NULL ? fread(bytes, 1, sizeof(bytes), file) : 0;
+  if (file != NULL)
+    fclose(file);
+  int at = snprintf(out, sizeof(out),
+                    "{\"returnValue\":true,\"apiVersion\":1,"
+                    "\"mimeType\":\"image/png\",\"data\":\"");
+  for (size_t i = 0; i < read; i += 3) {
+    const unsigned word = (unsigned)bytes[i] << 16 |
+                          (i + 1 < read ? (unsigned)bytes[i + 1] << 8 : 0) |
+                          (i + 2 < read ? bytes[i + 2] : 0);
+    out[at++] = digits[word >> 18 & 63];
+    out[at++] = digits[word >> 12 & 63];
+    out[at++] = i + 1 < read ? digits[word >> 6 & 63] : '=';
+    out[at++] = i + 2 < read ? digits[word & 63] : '=';
+  }
+  snprintf(out + at, sizeof(out) - (size_t)at, "\",\"byteLength\":%zu}", read);
+  return out;
+}
+
 static const char *const inputs =
     "{\"returnValue\":true,\"devices\":["
     "{\"id\":\"HDMI_1\",\"label\":\"HDMI 1\",\"appId\":\"com.webos.app.hdmi1\","
@@ -140,18 +206,25 @@ static const char *const inputs =
     "{\"id\":\"HDMI_4\",\"label\":\"HDMI 4\",\"connected\":false},"
     "{\"id\":\"AV_1\",\"label\":\"AV\"}]}";
 
-/* The console's last frame was kept; the other inputs have none. */
-static const char *const recents =
-    "{\"returnValue\":true,\"recentsAppList\":["
-    "{\"appId\":\"com.webos.app.hdmi1\",\"cardSnapShotFilePath\":\"" ICON "\"},"
-    "{\"appId\":\"com.webos.app.hdmi2\",\"cardSnapShotFilePath\":\"\"},"
-    "{\"appId\":\"netflix\"}]}";
-
 static const char *string_in(json_object *object, const char *key) {
   json_object *value;
   return object != NULL && json_object_object_get_ex(object, key, &value)
              ? json_object_get_string(value)
              : NULL;
+}
+
+bool tv_transport_subscribe(const char *uri, const char *payload,
+                            uint32_t tag) {
+  const char *method = strrchr(uri, '/') + 1;
+  const int index = method_index(method, true);
+  if (!subscribable || (index >= 0 && methods[index].refuse > 0))
+    return tv_transport_send(uri, payload, tag);
+  if (index >= 0)
+    methods[index].calls++;
+  has_subscriber = true;
+  subscriber = tag;
+  tell_subscriber();
+  return true;
 }
 
 bool tv_transport_send(const char *uri, const char *payload, uint32_t tag) {
@@ -163,32 +236,44 @@ bool tv_transport_send(const char *uri, const char *payload, uint32_t tag) {
     snprintf(methods[index].last, sizeof(methods[0].last), "%s", payload);
     if (methods[index].refuse > 0) {
       methods[index].refuse--;
-      tv_deliver(tag, "{\"returnValue\":false,\"errorCode\":-1,"
-                      "\"errorText\":\"refused by the mock\"}");
+      char refusal[256];
+      snprintf(refusal, sizeof(refusal),
+               "{\"returnValue\":false,\"errorCode\":-1,\"errorText\":\"%s\"}",
+               refusal_text != NULL ? refusal_text : "refused by the mock");
+      tv_deliver(tag, refusal);
       return true;
     }
   }
   json_object *ask = json_tokener_parse(payload);
   const char *reply = "{\"returnValue\":true}";
-  if (strcmp(method, "listLaunchPoints") == 0) {
-    reply = launch_points();
+  if (strcmp(method, "listApps") == 0) {
+    reply = list_apps(false);
   } else if (strcmp(method, "getAllInputStatus") == 0) {
     reply = inputs;
-  } else if (strcmp(method, "listRecents") == 0) {
-    reply = recents;
-  } else if (strcmp(method, "getForegroundAppInfo") == 0) {
+  } else if (strcmp(method, "getInfo") == 0) {
+    static char answer[256];
+    snprintf(answer, sizeof(answer),
+             "{\"returnValue\":true,\"apiVersion\":1,\"root\":%s,"
+             "\"permitted\":%s,\"isSelectedHome\":%s}",
+             hc_root ? "true" : "false", hc_permitted ? "true" : "false",
+             hc_chosen ? "true" : "false");
+    reply = answer;
+  } else if (strcmp(method, "getAppIcon") == 0) {
+    reply = app_icon(string_in(ask, "id"), string_in(ask, "size"));
+  } else if (strcmp(method, "getForegroundApp") == 0) {
     static char answer[256];
     snprintf(answer, sizeof(answer),
              "{\"returnValue\":true,\"appId\":\"%s\",\"processId\":\"\"}",
              foreground);
     reply = answer;
-  } else if (strcmp(method, "getSystemSettings") == 0) {
-    reply = "{\"returnValue\":true,\"category\":\"general\","
-            "\"settings\":{\"lastInputApp\":\"com.webos.app.hdmi1\"}}";
-  } else if (strcmp(method, "remove") == 0) {
+  } else if (strcmp(method, "uninstallApp") == 0) {
+    /* And the owner agreeing at once, which the real thing never does. */
+    reply = "{\"returnValue\":true,\"apiVersion\":1,\"pending\":true,"
+            "\"confirmation\":\"alert\"}";
     const char *id = string_in(ask, "id");
     if (id != NULL && removed_count < sizeof(removed) / sizeof(removed[0]))
       snprintf(removed[removed_count++], sizeof(removed[0]), "%s", id);
+    tell_subscriber();
   }
   tv_deliver(tag, reply);
   json_object_put(ask);

@@ -3,21 +3,20 @@
  * of the screen, as LG's Home drew it before webOS 6, over the app or input
  * in front, with the inputs under it.
  *
- * It is LG's Home only while tools/home-takeover.sh has it mounted over LG's
- * app; a reboot gives LG's Home its place back, unless it was asked to take
- * the place at every start. Opened from LG's menu under its own id, it runs
- * that script to take the place, and the bar opens as LG's Home.
+ * What makes it Home is Home Chooser, the owner's choice, kept there across
+ * restarts: this is an ordinary developer app that says it can be one, and
+ * opened while another is, it asks the owner through Home Chooser.
  *
  * Everything it knows of the TV comes through src/tv, whose answers arrive
  * between frames; the screens draw whatever has arrived so far. The order of
  * the apps and which are hidden are its own (layout.h).
  */
-#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -38,19 +37,10 @@
 #include "layout.h"
 
 #define APP_ID "dev.hookedbehemoth.home"
-#define LG_HOME_ID "com.webos.app.home"
-/* Where the TV installed it, with the scripts it carries. */
-#define INSTALLED_DIR "/media/developer/apps/usr/palm/applications/" APP_ID
 
 /* SCREEN_EDIT reorders and hides the apps; SCREEN_CONFIRM asks whether one is
- * hidden or uninstalled; SCREEN_OPTIONS is the launcher's own: whether it
- * takes LG's Home's place at every start, and giving it back. */
-typedef enum {
-  SCREEN_HOME,
-  SCREEN_EDIT,
-  SCREEN_CONFIRM,
-  SCREEN_OPTIONS
-} screen_id;
+ * hidden or uninstalled. */
+typedef enum { SCREEN_HOME, SCREEN_EDIT, SCREEN_CONFIRM } screen_id;
 
 static jf_renderer *renderer;
 static nav ui;
@@ -61,9 +51,6 @@ static bool animations_enabled = true;
  * simply there. */
 static bool instant = true;
 static bool animating(void) { return animations_enabled && !instant; }
-/* Over nothing: the app in front closed, and the input the compositor brings
- * up for it is not to be seen. Black behind the menu until it goes. */
-static bool covering;
 
 static screen_id screen = SCREEN_HOME;
 
@@ -72,8 +59,6 @@ static ui_stack stack = {(unsigned char *)stack_entries, sizeof(ui_view), 8, 0};
 
 /* A status line over the bar: what went wrong, until the next key. */
 static char status[160];
-/* Restarting the TV, until it goes; the line says so. */
-static bool restarting;
 
 static float minf(float a, float b) { return a < b ? a : b; }
 static float maxf(float a, float b) { return a > b ? a : b; }
@@ -96,6 +81,10 @@ static void go_back(void) {
 static void save_layout(void);
 /* In SCREEN_EDIT: the focused app goes along with Left and Right. */
 static bool moving;
+/* The pointer has moved since the app was picked up, so it goes where that is.
+ * Held: the button is down, and `dragged` once that has moved the app, in which
+ * case letting go puts it down. */
+static bool pointer_carrying, pointer_held, dragged;
 
 /* Pressing Home with the launcher already up: back to its first screen, as
  * it would open, keeping what was being edited. */
@@ -112,8 +101,6 @@ static void go_home(void) {
 
 static home_layout layout;
 static char layout_path[512];
-/* A PNG shown behind the bar when nothing else is: "" for black. */
-static char background_path[512];
 
 /* The app SCREEN_CONFIRM asks about. */
 static char confirming[128];
@@ -135,21 +122,33 @@ static void save_layout(void) {
 
 /* ----------------------------------------------------------------- icons
  *
- * One texture per app's icon, read from the path its launch point gives. The
- * icons are the TV's own files, so they are decoded on the main thread, a
- * couple a frame, rather than kept anywhere. */
+ * One texture per app's icon. All of them are found as soon as the apps are
+ * known, hidden or not, so that opening shows them: from the copy kept here,
+ * from the app's own folder where the jail lets it be read, and only otherwise
+ * from Home Chooser, which answers one call after another. What Home Chooser
+ * gave is kept, by the app's version. They become textures while drawing, a few
+ * a frame: the window has no surface to draw with while it is hidden. */
 
 #define ICONS 128
-#define ICON_LOADS_PER_FRAME 2
+#define ICON_LOADS_PER_FRAME 4
+#define ICONS_ASKED_AT_ONCE 4
 
 typedef struct {
-  char path[384];
+  char app[128];
   uint32_t texture, width, height;
+  /* The file, arrived and waiting for a frame. */
+  uint8_t *data;
+  size_t size;
+  /* Still to ask Home Chooser for: the large icon, then the small one. */
+  bool ask_large, ask_small;
+  char keep_at[512];
 } icon;
 
 static icon icons[ICONS];
 static size_t icon_count;
-static unsigned icon_loads;
+static unsigned icon_loads, icons_asked;
+/* Where what Home Chooser gave is kept. */
+static char icon_cache[256];
 
 static uint8_t *read_file(const char *path, size_t *out_size) {
   FILE *file = fopen(path, "rb");
@@ -171,36 +170,114 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
   return data;
 }
 
-/* NULL for none, for one that would not load, or for one still to come. */
-static const icon *icon_for(const char *path) {
-  if (path[0] == '\0')
-    return NULL;
+static bool read_app_file(const tv_app *app, const char *name, icon *slot) {
+  if (name[0] == '\0')
+    return false;
+  char path[512];
+  if (name[0] == '/')
+    snprintf(path, sizeof(path), "%s", name);
+  else
+    snprintf(path, sizeof(path), "%s/%s", app->folder, name);
+  slot->data = read_file(path, &slot->size);
+  return slot->data != NULL;
+}
+
+static void keep_icon(const icon *slot, const uint8_t *data, size_t size) {
+  char temporary[520];
+  snprintf(temporary, sizeof(temporary), "%s.new", slot->keep_at);
+  mkdir(icon_cache, 0777);
+  FILE *file = fopen(temporary, "wb");
+  if (file == NULL)
+    return;
+  const bool wrote = fwrite(data, 1, size, file) == size;
+  if (fclose(file) != 0 || !wrote || rename(temporary, slot->keep_at) != 0)
+    unlink(temporary);
+}
+
+static void ask_for_icon(icon *slot) {
+  const bool large = slot->ask_large;
+  if (large)
+    slot->ask_large = false;
+  else
+    slot->ask_small = false;
+  icons_asked++;
+  tv_ask_icon(slot->app, large, (uint32_t)(slot - icons));
+}
+
+static void on_icon(uint32_t slot_index, const uint8_t *data, size_t size) {
+  icon *slot = &icons[slot_index];
+  if (icons_asked > 0)
+    icons_asked--;
+  if (data == NULL) {
+    if (!slot->ask_small)
+      fprintf(stderr, "home: no icon for %s\n", slot->app);
+    return;
+  }
+  slot->ask_large = slot->ask_small = false;
+  slot->data = malloc(size);
+  if (slot->data == NULL)
+    return;
+  memcpy(slot->data, data, size);
+  slot->size = size;
+  keep_icon(slot, data, size);
+}
+
+static icon *icon_slot(const char *app) {
   for (size_t i = 0; i < icon_count; i++)
-    if (strcmp(icons[i].path, path) == 0)
-      return icons[i].texture != 0 ? &icons[i] : NULL;
-  if (icon_count == ICONS)
-    return NULL;
-  if (icon_loads == ICON_LOADS_PER_FRAME) {
-    jf_window_frame_requested = true;
-    return NULL;
+    if (strcmp(icons[i].app, app) == 0)
+      return &icons[i];
+  return NULL;
+}
+
+/* Looks for the icons of apps not seen yet, and asks Home Chooser for as many
+ * of the rest as it should be asked at once; its answers bring this back. */
+static void find_icons(void) {
+  for (size_t i = 0; i < tv.app_count && icon_count < ICONS; i++) {
+    const tv_app *app = &tv.apps[i];
+    if ((app->icon[0] == '\0' && app->large_icon[0] == '\0') ||
+        icon_slot(app->id) != NULL)
+      continue;
+    icon *slot = &icons[icon_count++];
+    memset(slot, 0, sizeof(*slot));
+    snprintf(slot->app, sizeof(slot->app), "%s", app->id);
+    snprintf(slot->keep_at, sizeof(slot->keep_at), "%s/%s-%s", icon_cache,
+             app->id, app->version);
+    slot->data = read_file(slot->keep_at, &slot->size);
+    if (slot->data != NULL || read_app_file(app, app->large_icon, slot) ||
+        read_app_file(app, app->icon, slot))
+      continue;
+    slot->ask_large = app->large_icon[0] != '\0';
+    slot->ask_small = app->icon[0] != '\0';
   }
-  icon_loads++;
-  icon *slot = &icons[icon_count++];
-  memset(slot, 0, sizeof(*slot));
-  snprintf(slot->path, sizeof(slot->path), "%s", path);
-  size_t size = 0;
-  uint8_t *data = read_file(path, &size);
-  jf_image image;
-  if (data != NULL && jf_image_decode_rgba(data, size, &image)) {
-    slot->texture = jf_renderer_create_rgba_texture(renderer, image.width,
-                                                    image.height, image.rgb);
-    slot->width = image.width;
-    slot->height = image.height;
-    jf_image_free(&image);
-  } else {
-    fprintf(stderr, "home: no icon at %s\n", path);
+  for (size_t i = 0; i < icon_count && icons_asked < ICONS_ASKED_AT_ONCE; i++)
+    if (icons[i].ask_large || icons[i].ask_small)
+      ask_for_icon(&icons[i]);
+}
+
+/* NULL for none, for one that would not load, or for one still to come. */
+static const icon *icon_for(const tv_app *app) {
+  icon *slot = icon_slot(app->id);
+  if (slot == NULL)
+    return NULL;
+  if (slot->data != NULL) {
+    if (icon_loads == ICON_LOADS_PER_FRAME) {
+      jf_window_frame_requested = true;
+      return NULL;
+    }
+    icon_loads++;
+    jf_image image;
+    if (jf_image_decode_rgba(slot->data, slot->size, &image)) {
+      slot->texture = jf_renderer_create_rgba_texture(renderer, image.width,
+                                                      image.height, image.rgb);
+      slot->width = image.width;
+      slot->height = image.height;
+      jf_image_free(&image);
+    } else {
+      fprintf(stderr, "home: the icon for %s would not decode\n", slot->app);
+    }
+    free(slot->data);
+    slot->data = NULL;
   }
-  free(data);
   return slot->texture != 0 ? slot : NULL;
 }
 
@@ -216,16 +293,6 @@ static void draw_fitted(loom_context *ctx, const icon *picture, loom_rect area,
       ctx,
       (loom_rect){area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h},
       &clip, picture->texture, uv, tint, 0);
-}
-
-/* An image filling `area`, cropped evenly on the sides that overflow. */
-static void draw_cover(loom_context *ctx, const icon *picture, loom_rect area) {
-  const float fit =
-      maxf(area.w / (float)picture->width, area.h / (float)picture->height);
-  const float u = area.w / (picture->width * fit),
-              v = area.h / (picture->height * fit);
-  const float uv[4] = {(1 - u) / 2, (1 - v) / 2, (1 + u) / 2, (1 + v) / 2};
-  loom_textured(ctx, area, &area, picture->texture, uv, UI_WHITE, 0);
 }
 
 /* ------------------------------------------------------------------- bar
@@ -250,7 +317,7 @@ static void draw_cover(loom_context *ctx, const icon *picture, loom_rect area) {
 #define INPUT_W 352.0f
 #define INPUT_H 198.0f
 /* How far the bar rises to bring the inputs into view. */
-#define INPUTS_RISE 340.0f
+#define INPUTS_RISE 320.0f
 
 /* Hidden for something just opened, whose answer has not come back. */
 static bool hidden_for_launch;
@@ -393,7 +460,6 @@ static nav_id remove_id_of(const char *id) {
   return nav_child(nav_str(id), nav_str("remove"));
 }
 #define EDIT_TILE_ID nav_str("edit")
-#define OPTIONS_TILE_ID nav_str("options")
 
 static nav_id in_ribbon(nav_id local) {
   return nav_child(nav_str("ribbon"), local);
@@ -478,8 +544,9 @@ static void edge_scroll(loom_rect strip, float width, float scroll,
   /* How far into either zone, from 0 at its inner side to 1 at the edge;
    * negative for the left. */
   float depth = 0;
-  if (ui.pointer_present && ui.pointer_y >= strip.y &&
-      ui.pointer_y < strip.y + strip.h) {
+  /* Carrying an app, wherever the pointer strays to. */
+  if (ui.pointer_present && (moving || (ui.pointer_y >= strip.y &&
+                                        ui.pointer_y < strip.y + strip.h))) {
     if (ui.pointer_x < zone)
       depth = -(zone - ui.pointer_x) / zone;
     else if (ui.pointer_x > width - zone)
@@ -506,6 +573,23 @@ static void edge_scroll(loom_rect strip, float width, float scroll,
   jf_window_frame_requested = true;
 }
 
+/* The app being carried, to the place under the pointer. `first_x` is where the
+ * first tile is, and the middle of a tile leans right of its foot. */
+static void carry_to_pointer(float first_x, float step, float tile_h) {
+  int at = layout_find(&layout, focused_app);
+  if (at < 0 || (size_t)at >= layout.shown)
+    return;
+  const float along = (ui.pointer_x - tile_h * TILE_SLANT / 2 - first_x) / step;
+  const int last = (int)layout.shown - 1;
+  const int to = along<0 ? 0 : along>(float) last ? last : (int)along;
+  if (to == at)
+    return;
+  while (at != to && layout_move(&layout, focused_app, to > at ? 1 : -1))
+    at += to > at ? 1 : -1;
+  dragged = pointer_held;
+  jf_window_frame_requested = true;
+}
+
 /* The apps, in the layout's order, then the pencil for SCREEN_EDIT - or in
  * it, the hidden apps greyed out after the shown ones. `bottom` is where the
  * tiles' feet are. */
@@ -516,7 +600,7 @@ static void draw_apps(loom_context *ctx, float bottom) {
   const bool editing = screen == SCREEN_EDIT || screen == SCREEN_CONFIRM;
   const float tile_w = TILE_W * s, tile_h = TILE_H * s;
   const float step = TILE_W * s;
-  const size_t tiles = editing ? layout.count : layout.shown + 2;
+  const size_t tiles = editing ? layout.count : layout.shown + 1;
   const float extent =
       (float)tiles * step + TILE_H * TILE_SLANT * s +
       (editing && layout.count > layout.shown ? HIDDEN_GAP * s : 0);
@@ -529,7 +613,7 @@ static void draw_apps(loom_context *ctx, float bottom) {
                                         LOOM_HORIZONTAL, extent, step, step);
   const loom_rect clip = ctx->viewport;
   const char *chosen = NULL, *to_remove = NULL;
-  bool chose_edit = false, chose_options = false;
+  bool chose_edit = false;
   /* Over the neighbours, so drawn after them. */
   bool arrows = false;
   loom_rect carried = {0};
@@ -554,18 +638,6 @@ static void draw_apps(loom_context *ctx, float bottom) {
                 NULL, "\xe2\x9c\x8e", "Edit", false);
       continue;
     }
-    /* And the launcher's own options, last. */
-    if (!editing && i == layout.shown + 1) {
-      const unsigned flags = nav_item(&ui, OPTIONS_TILE_ID, base, clip);
-      if (flags & NAV_FOCUSED)
-        last_app_focus = in_ribbon(OPTIONS_TILE_ID);
-      chose_options = flags & NAV_ACTIVATED;
-      static const loom_color gear = {34, 36, 42, 255};
-      draw_tile(ctx, base, clip,
-                lift_of(in_ribbon(OPTIONS_TILE_ID), flags & NAV_FOCUSED), gear,
-                NULL, "\xe2\x9a\x99", "Options", false);
-      continue;
-    }
     const layout_slot *slot = &layout.slots[i];
     const tv_app *app = app_by_id(slot->id);
     if (app == NULL)
@@ -588,7 +660,7 @@ static void draw_apps(loom_context *ctx, float bottom) {
     app_colour(app, background);
     const float lift =
         lift_of(in_ribbon(app_id_of(app->id)), focused || badge_focused);
-    draw_tile(ctx, base, clip, lift, background, icon_for(app->icon), NULL,
+    draw_tile(ctx, base, clip, lift, background, icon_for(app), NULL,
               app->title, slot->hidden);
     const loom_rect risen = risen_tile(base, lift);
     if (editing && !slot->hidden && !moving && (focused || badge_focused) &&
@@ -601,20 +673,13 @@ static void draw_apps(loom_context *ctx, float bottom) {
   }
   if (arrows)
     draw_move_arrows(ctx, carried, clip);
-  if (editing && layout.count > layout.shown) {
-    const float hidden_x =
-        strip.x - scroll + (float)layout.shown * step + HIDDEN_GAP * s;
-    loom_label(ctx,
-               (loom_rect){hidden_x, bottom - tile_h - TILE_LIFT * s - 48 * s,
-                           400 * s, 36 * s},
-               &clip, "Hidden", UI_DIM, 24 * s);
-  }
   nav_scroll_end(&ui);
   edge_scroll(strip, width, scroll, maxf(0, extent - strip.w));
+  if (screen == SCREEN_EDIT && moving && pointer_carrying &&
+      ui.pointer_present && focused_app[0] != '\0')
+    carry_to_pointer(strip.x - scroll, step, tile_h);
 
-  if (chose_options) {
-    push(SCREEN_OPTIONS);
-  } else if (chose_edit) {
+  if (chose_edit) {
     push(SCREEN_EDIT);
     moving = false;
     /* The pencil is not there to edit; the app beside it is. */
@@ -638,18 +703,15 @@ static void draw_apps(loom_context *ctx, float bottom) {
   }
 }
 
-/* The inputs, a card each with the last frame the TV kept of it. */
+/* The inputs, a card each. */
 static void draw_inputs(loom_context *ctx, float top) {
   const float s = kit.scale;
   const float width = ctx->viewport.w;
   /* Declared below the screen too: Down focuses one before the bar has risen
    * to show it, and an undeclared focus would fall back to the first app. */
-  loom_label(ctx, (loom_rect){96 * s, top, 600 * s, 40 * s}, NULL, "Inputs",
-             UI_TEXT, 28 * s);
   const float card_w = INPUT_W * s, card_h = INPUT_H * s;
   const float step = card_w + 32 * s;
-  const loom_rect strip = {96 * s, top + 60 * s, width - 192 * s,
-                           card_h + 90 * s};
+  const loom_rect strip = {96 * s, top, width - 192 * s, card_h + 90 * s};
   const float extent = (float)tv.input_count * step - 32 * s;
   const float scroll = nav_scroll_begin(&ui, nav_str("inputs"), strip,
                                         LOOM_HORIZONTAL, extent, step, step);
@@ -667,26 +729,19 @@ static void draw_inputs(loom_context *ctx, float top) {
     if (flags & NAV_ACTIVATED)
       chosen = input;
     loom_fill(ctx, card, &clip, flags & NAV_HOVERED ? UI_HOT : UI_CARD, 8 * s);
-    const icon *preview = icon_for(input->preview);
-    if (preview != NULL) {
-      static const float uv[4] = {0, 0, 1, 1};
-      loom_textured(ctx, card, &clip, preview->texture, uv, UI_WHITE, 8 * s);
-    } else {
-      const loom_color glyph = {UI_DIM[0], UI_DIM[1], UI_DIM[2],
-                                input->connected ? 255 : 110};
-      centred_label(ctx, card, clip, "\xe2\x87\xa5", glyph, 64 * s);
-    }
+    const loom_color glyph = {UI_DIM[0], UI_DIM[1], UI_DIM[2],
+                              input->connected ? 255 : 110};
+    centred_label(ctx, card, clip, "\xe2\x87\xa5", glyph, 64 * s);
     loom_label(ctx,
                (loom_rect){card.x, card.y + card_h + 12 * s, card_w, 32 * s},
                &clip, ui_ellipsize(&kit, input->label, card_w, 22 * s),
                flags & NAV_FOCUSED ? UI_TEXT : UI_DIM, 22 * s);
-    const char *detail = !input->connected          ? "Nothing connected"
-                         : input->device[0] != '\0' ? input->device
-                                                    : NULL;
-    if (detail != NULL)
-      loom_label(
-          ctx, (loom_rect){card.x, card.y + card_h + 46 * s, card_w, 28 * s},
-          &clip, ui_ellipsize(&kit, detail, card_w, 18 * s), UI_DIM, 18 * s);
+    /* What is plugged in, where it says. */
+    if (input->device[0] != '\0')
+      loom_label(ctx,
+                 (loom_rect){card.x, card.y + card_h + 46 * s, card_w, 28 * s},
+                 &clip, ui_ellipsize(&kit, input->device, card_w, 18 * s),
+                 UI_DIM, 18 * s);
   }
   nav_scroll_end(&ui);
   if (chosen != NULL)
@@ -705,20 +760,30 @@ static void draw_bar(loom_context *ctx) {
   const float bottom = height - rise.value * INPUTS_RISE * s;
   /* The top of a risen tile, which the lines of text keep above. */
   const float risen_top = bottom - (TILE_H + TILE_LIFT + 20) * s;
-  if (!tv.apps_loaded) {
+  /* Still on their way. Refused, the line says why and the inputs still work.
+   */
+  if (!tv.apps_loaded && tv_pending() > 0) {
     ui_spinner(&kit, ctx, ctx->viewport.w / 2, bottom - TILE_H * s / 2, 22 * s,
                NULL);
     return;
   }
-  /* Behind the inputs, solid up to the top of the apps: beside them, or past
-   * the last of a few, it shows. Shown as far as the inputs are. */
-  if (screen == SCREEN_HOME && rise.value > 0.01f) {
-    const float apps_top = bottom - TILE_H * s;
-    const loom_color shade = {10, 11, 14, (uint8_t)(255 * rise.value)};
-    loom_fill(ctx, (loom_rect){0, apps_top, ctx->viewport.w, height - apps_top},
-              NULL, shade, 0);
-  }
-  /* Over the bar, and while editing over the X too. */
+  /* Behind the bar, always: one fade, from nothing at the top of the apps to
+   * solid at their foot, and solid from there down, however far the bar has
+   * risen. Two fills, as a fade is only true on a quad that ends with it: the
+   * shader clamps it at the corners before interpolating, which stretches a
+   * longer one. */
+  const float tiles = TILE_H * s;
+  const float apps_top = bottom - tiles;
+  static const loom_color shade = {10, 11, 14, 255};
+  const loom_mask unmasked = ctx->mask;
+  ctx->mask.edge[LOOM_FADE_TOP] = apps_top;
+  ctx->mask.width[LOOM_FADE_TOP] = tiles;
+  loom_fill(ctx, (loom_rect){0, apps_top, ctx->viewport.w, tiles}, NULL, shade,
+            0);
+  ctx->mask = unmasked;
+  loom_fill(ctx, (loom_rect){0, bottom, ctx->viewport.w, height - bottom}, NULL,
+            shade, 0);
+  /* What went wrong: over the bar, and while editing over the X too. */
   const loom_rect line_rect = {
       96 * s,
       risen_top -
@@ -727,15 +792,8 @@ static void draw_bar(loom_context *ctx) {
   const char *line = status[0] != '\0' ? status : tv.error;
   if (line[0] != '\0')
     loom_label(ctx, line_rect, NULL, line, UI_RED, 22 * s);
-  else if (restarting)
-    loom_label(ctx, line_rect, NULL, "Restarting the TV...", UI_TEXT, 22 * s);
-  else if (screen == SCREEN_EDIT)
-    loom_label(ctx, line_rect, NULL,
-               moving ? "Left and right move it; select puts it down"
-                      : "Select an app to move it, or the X over it to hide "
-                        "or remove it. Back saves.",
-               UI_TEXT, 22 * s);
-  draw_apps(ctx, bottom);
+  if (tv.apps_loaded)
+    draw_apps(ctx, bottom);
   if (screen == SCREEN_HOME)
     draw_inputs(ctx, bottom + 40 * s);
 }
@@ -761,18 +819,12 @@ static void draw_confirm(loom_context *ctx) {
     go_back();
     return;
   }
-  const float w = 720 * s, h = 300 * s;
+  const float w = 720 * s, h = 216 * s;
   const loom_rect panel = {(ctx->viewport.w - w) / 2, 140 * s, w, h};
   ui_panel(&kit, ctx, panel);
   const float x = panel.x + 48 * s, inner = w - 96 * s;
   loom_label(ctx, (loom_rect){x, panel.y + 40 * s, inner, 44 * s}, &panel,
              ui_ellipsize(&kit, app->title, inner, 32 * s), UI_TEXT, 32 * s);
-  ui_wrapped(&kit, ctx, (loom_rect){x, panel.y + 96 * s, inner, 70 * s},
-             app->removable
-                 ? "Hide it from the bar, or uninstall it from the TV."
-                 : "It came with the TV and cannot be uninstalled, but it can "
-                   "be hidden from the bar.",
-             21 * s, UI_DIM);
   const float button_w = (inner - 24 * s) / 2;
   const loom_rect hide = {x, panel.y + h - 104 * s, button_w, 64 * s};
   nav_default(&ui);
@@ -800,69 +852,6 @@ static void draw_confirm(loom_context *ctx) {
 
 /* ------------------------------------------------------------------ frame */
 
-/* ---------------------------------------------------------------- options
- *
- * Taking LG's Home's place at every start is a link in Homebrew Channel's
- * boot hooks to the hook the launcher carries (tools/home-boot-hook), which
- * runs home-takeover.sh. In LG's Home's place the launcher runs as root, so
- * it makes and removes the link itself.
- *
- * LG's Home comes back by restarting the TV with the link off: the takeover
- * is all in /tmp. Undoing it in place (home-takeover.sh restore) is for a
- * shell. */
-
-/* The link; "" where there is none, off the TV. */
-static char boot_hook_path[512];
-
-static bool boot_enabled(void) {
-  struct stat link;
-  return boot_hook_path[0] != '\0' && lstat(boot_hook_path, &link) == 0;
-}
-
-static bool set_boot(bool on) {
-  if (unlink(boot_hook_path) != 0 && errno != ENOENT)
-    return false;
-  return !on || symlink(INSTALLED_DIR "/home-boot-hook", boot_hook_path) == 0;
-}
-
-static void draw_options(loom_context *ctx) {
-  const float s = kit.scale;
-  const float w = 760 * s, h = 320 * s;
-  const loom_rect panel = {(ctx->viewport.w - w) / 2, 140 * s, w, h};
-  ui_panel(&kit, ctx, panel);
-  const float x = panel.x + 48 * s, inner = w - 96 * s;
-  const bool every_start = boot_enabled();
-  loom_label(ctx, (loom_rect){x, panel.y + 40 * s, inner, 44 * s}, &panel,
-             "Home", UI_TEXT, 32 * s);
-  ui_wrapped(&kit, ctx, (loom_rect){x, panel.y + 96 * s, inner, 90 * s},
-             every_start
-                 ? "This Home takes LG's Home's place every time the TV "
-                   "starts."
-                 : "This Home has LG's Home's place until the TV restarts. "
-                   "It can take it at every start instead.",
-             21 * s, UI_DIM);
-  const float button_w = (inner - 24 * s) / 2;
-  const loom_rect toggle = {x, panel.y + h - 104 * s, button_w, 64 * s};
-  nav_default(&ui);
-  if (ui_action_button(&kit, ctx, toggle,
-                       every_start ? "At every start: on"
-                                   : "At every start: off",
-                       nav_str("options.boot")) &
-      NAV_ACTIVATED) {
-    if (!set_boot(!every_start))
-      snprintf(status, sizeof(status),
-               "The TV's start-up could not be changed");
-  }
-  if (ui_button(&kit, ctx,
-                (loom_rect){toggle.x + button_w + 24 * s, toggle.y, button_w,
-                            toggle.h},
-                "Restart the TV", nav_str("options.restart")) &
-      NAV_ACTIVATED) {
-    restarting = tv_restart();
-    go_back();
-  }
-}
-
 static void build_ui(loom_context *ctx) {
   const float width = (float)gl_width, height = (float)gl_height;
   kit.scale = minf(width / 1920.0f, height / 1080.0f);
@@ -875,21 +864,12 @@ static void build_ui(loom_context *ctx) {
   ui.animate = animating();
   ui.duration = UI_NAVIGATION_NS;
   nav_begin(&ui, ctx, ui_now_ns());
-  if (covering) {
-    loom_fill(ctx, (loom_rect){0, 0, width, height}, NULL,
-              (loom_color){0, 0, 0, 255}, 0);
-    const icon *wallpaper = icon_for(background_path);
-    if (wallpaper != NULL)
-      draw_cover(ctx, wallpaper, (loom_rect){0, 0, width, height});
-  }
   /* Behind the question, the bar cannot be reached. */
-  nav_set_inert(&ui, screen == SCREEN_CONFIRM || screen == SCREEN_OPTIONS);
+  nav_set_inert(&ui, screen == SCREEN_CONFIRM);
   draw_bar(ctx);
   nav_set_inert(&ui, false);
   if (screen == SCREEN_CONFIRM)
     draw_confirm(ctx);
-  else if (screen == SCREEN_OPTIONS)
-    draw_options(ctx);
   if (nav_end(&ui, UI_WHITE, 4 * kit.scale))
     jf_window_frame_requested = true;
 }
@@ -899,8 +879,6 @@ static void build_ui(loom_context *ctx) {
 /* Set as the launcher comes up, until the first key: the focus starts on the
  * app or input beneath it once the TV says which that is. */
 static bool focus_foreground = true;
-/* Until when a pause brings the launcher back; 0 for not. */
-static uint64_t reshow_until;
 
 static void focus_on_foreground(void) {
   fprintf(stderr, "home: in front is %s\n",
@@ -939,7 +917,7 @@ static void on_key(uint32_t code, bool pressed, bool repeat) {
   /* Where the focus goes is the viewer's now. */
   focus_foreground = false;
   instant = false;
-  reshow_until = 0;
+  pointer_carrying = false;
   if (jf_window_is_back_key(code)) {
     if (screen == SCREEN_EDIT)
       finish_editing();
@@ -990,6 +968,8 @@ static void on_key(uint32_t code, bool pressed, bool repeat) {
     const bool below = inputs_focused();
     if (dir == 0 && !below)
       jf_window_minimize();
+    else if (dir == 0 && !tv.apps_loaded)
+      jf_window_minimize();
     else if (dir == 1 && !below && tv.input_count > 0)
       nav_focus(&ui, last_input_focus != 0
                          ? last_input_focus
@@ -1019,17 +999,39 @@ static void on_event(const jf_event *event) {
     focus_foreground = false;
     instant = false;
     jf_window_frame_requested = true;
-    nav_pointer(&ui, (float)jf_fixed_to_int(event->pointer.x),
-                (float)jf_fixed_to_int(event->pointer.y));
+    /* The focus stays on the app being carried, which comes along. */
+    if (screen == SCREEN_EDIT && moving) {
+      ui.pointer_x = (float)jf_fixed_to_int(event->pointer.x);
+      ui.pointer_y = (float)jf_fixed_to_int(event->pointer.y);
+      ui.pointer_present = true;
+      pointer_carrying = true;
+    } else {
+      nav_pointer(&ui, (float)jf_fixed_to_int(event->pointer.x),
+                  (float)jf_fixed_to_int(event->pointer.y));
+    }
     break;
   case JF_EVENT_POINTER_LEAVE:
     nav_pointer_leave(&ui);
     jf_window_frame_requested = true;
     break;
   case JF_EVENT_POINTER_BUTTON:
-    if (event->button.pressed && event->button.button == 0x110) {
-      nav_click(&ui);
-      jf_window_frame_requested = true;
+    if (event->button.button != 0x110)
+      break;
+    jf_window_frame_requested = true;
+    pointer_held = event->button.pressed;
+    if (event->button.pressed) {
+      dragged = false;
+      /* Put down wherever the pointer is, on a tile or not. */
+      if (screen == SCREEN_EDIT && moving) {
+        moving = false;
+        pointer_carrying = false;
+      } else {
+        nav_click(&ui);
+      }
+    } else if (dragged) {
+      dragged = false;
+      moving = false;
+      pointer_carrying = false;
     }
     break;
   case JF_EVENT_POINTER_AXIS:
@@ -1051,9 +1053,9 @@ static void on_event(const jf_event *event) {
 
 /* -------------------------------------------------------------- lifecycle */
 
-/* Set from the GLib thread when SAM opens the launcher again: the Home key,
- * nothing left in front once an app closes, or the TV coming on. */
-enum { RELAUNCH_NONE, RELAUNCH_OTHER, RELAUNCH_HOME_KEY, RELAUNCH_BOOT };
+/* Set from the GLib thread when SAM opens the launcher again: the Home key, or
+ * anything else. */
+enum { RELAUNCH_NONE, RELAUNCH_OTHER, RELAUNCH_HOME_KEY };
 static atomic_int relaunched;
 
 static void relaunch(int why) {
@@ -1062,33 +1064,12 @@ static void relaunch(int why) {
 }
 
 static void on_relaunch(void) {
-  const jf_relaunch_reason why = jf_luna_relaunch_reason();
-  relaunch(why == JF_RELAUNCH_HOME_KEY ? RELAUNCH_HOME_KEY
-           : why == JF_RELAUNCH_BOOT   ? RELAUNCH_BOOT
-                                       : RELAUNCH_OTHER);
+  relaunch(jf_luna_relaunch_reason() == JF_RELAUNCH_HOME_KEY ? RELAUNCH_HOME_KEY
+                                                             : RELAUNCH_OTHER);
 }
 
-/* The TV coming on opens Home twice: for the start (reason "boot"), then for
- * the last input (sam's last_input_handler, reason "undefined"). LG's Home
- * opens the last input then and stays out of sight; so does the launcher, for
- * the second as for the first. */
-#define WAKE_NS 15000000000ull
-static uint64_t woke_at;
-
-/* SAM brings Home up when the app in front closes, and the input it goes back
- * to comes up over it a moment later, hiding it: SAM says so with a pause.
- * Within this long of such a relaunch, and before any key, the launcher comes
- * back over that input, once. */
-#define RESHOW_NS 3000000000ull
-static atomic_bool paused;
-
-static void on_pause(void) {
-  atomic_store(&paused, true);
-  jf_window_wake();
-}
-
-/* A crash as Home leaves nothing behind: SAM starts it again and no log on
- * the TV says why. This writes the signal, the address and the mappings the
+/* A crash leaves nothing behind: SAM starts it again and no log on the TV says
+ * why. This writes the signal, the address and the mappings the
  * fault and the instruction are in to the log, with nothing a signal handler
  * may not call. */
 static void write_text(const char *text) {
@@ -1183,36 +1164,31 @@ static ui_script script;
 static const char *capture_path;
 static bool was_drawable = true;
 
-static bool app_init(int argc, char **argv) {
+static void ask_everything(void) {
+  tv_refresh();
+  /* Last: what is wrong with Home Chooser explains why the rest was refused. */
+  tv_check_home();
+}
+
+static bool app_init(void) {
   /* Launched by SAM there is no terminal; the tests report on stderr. */
   report_crashes();
 #ifndef HOME_APP_TEST
+  /* The last run's stays, for why it ended: nothing else on the TV says. */
+  rename("/tmp/home.log", "/tmp/home.log.1");
   ui_log_to_file("/tmp/home.log", NULL);
+  const time_t started = time(NULL);
+  fprintf(stderr, "home: started %s", ctime(&started));
   /* Every call and answer: which ones the bus refuses this app is the first
    * thing to read there (docs/home.md). */
   jf_luna_log = true;
   jf_window_log_events = true;
 #endif
-  /* Who this is to the bus and the compositor. SAM starts a system app, which
-   * the takeover makes this, without APPID in the environment, but names it
-   * in the launch payload; with neither, it is the development install. The
-   * name decides everything: the bus gives com.webos.app.home LG's Home's
-   * role, and sam waits for a window of that app before taking its spinner
-   * down. */
-  static char launched_as[128];
-  const char *appid = getenv("APPID");
-  if (appid == NULL && argc > 1 &&
-      jf_luna_json_string(argv[1], "appId", launched_as, sizeof(launched_as))) {
-    appid = launched_as;
-    jf_luna_set_name(appid);
-  }
-  fprintf(stderr, "home: running as %s\n", appid != NULL ? appid : APP_ID);
   jf_window_set_handler(on_event);
   /* Over the app or input in front, as LG's Settings and Search are. */
   jf_window_set_type("_WEBOS_WINDOW_TYPE_OVERLAY");
-  if (!jf_window_init(appid != NULL ? appid : APP_ID, "Home", 0, 0))
+  if (!jf_window_init(APP_ID, "Home", 0, 0))
     return false;
-  jf_luna_set_pause_handler(on_pause);
   if (!jf_luna_register_lifecycle(jf_window_post_quit, on_relaunch))
     fprintf(stderr, "no webOS lifecycle\n");
   renderer = jf_renderer_create(NULL, 0, 0);
@@ -1222,42 +1198,24 @@ static bool app_init(int argc, char **argv) {
   }
   kit.renderer = renderer;
   loom_init(&ctx);
-  /* Kept with the installed app, which a reinstall starts afresh. */
+  /* Kept with the installed app: its folder is the working directory, and
+   * data/ the part of it it can write. A reinstall leaves it; removing the app
+   * does not. */
   const char *path = getenv("HOME_LAYOUT");
 #ifdef JF_WEBOS
   if (path == NULL)
-    path = INSTALLED_DIR "/layout.txt";
+    path = "data/layout.txt";
 #else
   if (path == NULL)
     path = "/tmp/home-layout.txt";
 #endif
   snprintf(layout_path, sizeof(layout_path), "%s", path);
   layout_load(&layout, layout_path);
-  /* Outside the app's folder, so a reinstall keeps it. */
-  const char *background = getenv("HOME_BACKGROUND");
-#ifdef JF_WEBOS
-  if (background == NULL)
-    background = "/media/developer/home-background.png";
-#endif
-  snprintf(background_path, sizeof(background_path), "%s",
-           background != NULL ? background : "");
-  const char *hook = getenv("HOME_BOOT_HOOK");
-#ifdef JF_WEBOS
-  if (hook == NULL)
-    hook = "/var/lib/webosbrew/init.d/60-home-takeover";
-#endif
-  snprintf(boot_hook_path, sizeof(boot_hook_path), "%s",
-           hook != NULL ? hook : "");
-  tv_init(jf_window_wake);
-  tv_refresh();
-  /* Started by the TV coming on, as against opened. */
-  char reason[32] = "";
-  bool boot = false;
-  if (argc > 1 &&
-      ((jf_luna_json_string(argv[1], "reason", reason, sizeof(reason)) &&
-        strcmp(reason, "boot") == 0) ||
-       (jf_luna_json_bool(argv[1], "boot", &boot) && boot)))
-    relaunch(RELAUNCH_BOOT);
+  const char *cache = getenv("HOME_ICON_CACHE");
+  snprintf(icon_cache, sizeof(icon_cache), "%s",
+           cache != NULL ? cache : "data/icons");
+  tv_init(jf_window_wake, on_icon);
+  ask_everything();
   capture_path = getenv("UI_CAPTURE");
   script.keys = getenv("UI_SCRIPT");
   if (script.keys == NULL)
@@ -1270,58 +1228,38 @@ static bool app_step(int *wait_ms) {
    * remote, and otherwise in front on its first screen - whether it was
    * hidden here or something came up over it. */
   const int relaunch = atomic_exchange(&relaunched, RELAUNCH_NONE);
-  const bool waking = relaunch == RELAUNCH_BOOT ||
-                      (relaunch == RELAUNCH_OTHER && woke_at != 0 &&
-                       ui_now_ns() - woke_at < WAKE_NS);
-  if (relaunch == RELAUNCH_HOME_KEY)
-    woke_at = 0;
-  if (waking) {
-    if (relaunch == RELAUNCH_BOOT) {
-      woke_at = ui_now_ns();
-      tv_open_last_input();
-    }
-    reshow_until = 0;
-    covering = false;
-    go_home();
-    if (jf_window_drawable)
-      jf_window_minimize();
-  } else if (relaunch == RELAUNCH_HOME_KEY && jf_window_drawable &&
-             jf_window_focused()) {
-    reshow_until = 0;
+  if (relaunch == RELAUNCH_HOME_KEY && jf_window_drawable &&
+      jf_window_focused()) {
     jf_window_minimize();
   } else if (relaunch != RELAUNCH_NONE) {
     go_home();
-    tv_refresh();
+    /* What went wrong before is not news: the answers say if it still is. */
+    tv.error[0] = '\0';
+    /* Hidden, the window coming up asks, below. */
+    if (jf_window_drawable)
+      ask_everything();
     focus_foreground = true;
     instant = true;
-    reshow_until = relaunch == RELAUNCH_OTHER ? ui_now_ns() + RESHOW_NS : 0;
-    /* SAM opening Home with nothing in front: an app closed, and the
-     * compositor may be bringing the last input up, which is not to be
-     * seen. */
-    covering = relaunch == RELAUNCH_OTHER;
     jf_window_post_raise();
     jf_window_frame_requested = true;
   }
-  /* Back in front from an app: what is installed and plugged in may have
-   * changed while it was. */
-  if (atomic_exchange(&paused, false) && reshow_until != 0 &&
-      ui_now_ns() < reshow_until) {
-    reshow_until = 0;
-    jf_window_post_raise();
-    jf_window_frame_requested = true;
-  }
+  /* Back in front: what is plugged in and in front may have changed. */
   if (jf_window_drawable && !was_drawable) {
-    tv_refresh();
+    ask_everything();
     focus_foreground = true;
     instant = true;
     jf_window_frame_requested = true;
   }
-  /* Put away, it is opened uncovered next time, unless SAM says otherwise. */
-  if (!jf_window_drawable && was_drawable)
-    covering = false;
   was_drawable = jf_window_drawable;
   if (tv_pump()) {
     jf_window_frame_requested = true;
+    find_icons();
+    /* Another app is Home: the owner is asked, in Home Chooser's panel. */
+    if (tv.not_chosen) {
+      tv.not_chosen = false;
+      if (tv_ask_to_be_home(APP_ID))
+        jf_window_minimize();
+    }
     /* What it hid for was refused: back, saying so. */
     if (hidden_for_launch && tv.error[0] != '\0')
       jf_window_post_raise();
@@ -1382,64 +1320,8 @@ static void app_deinit(void) {
 }
 
 #ifndef HOME_APP_TEST
-#ifdef JF_WEBOS
-/* Opened from LG's menu, as the app it is installed as: it is not LG's Home
- * yet, and runs as a developer app without the rights to make itself that.
- * Homebrew Channel's service runs the script as root, which takes the place
- * and opens it; the script says on screen what went wrong, if anything. */
-static atomic_int exec_answer; /* 0 waiting, 1 run, -1 not */
-
-static void on_exec(const char *payload, void *user) {
-  (void)user;
-  bool ran = false;
-  atomic_store(&exec_answer,
-               payload != NULL &&
-                       jf_luna_json_bool(payload, "returnValue", &ran) && ran
-                   ? 1
-                   : -1);
-}
-
-static int take_lg_homes_place(void) {
-  if (!jf_luna_call("luna://org.webosbrew.hbchannel.service/exec",
-                    "{\"command\":\"setsid sh " INSTALLED_DIR
-                    "/home-takeover.sh take open </dev/null "
-                    ">/tmp/home-takeover.log 2>&1 &\"}",
-                    on_exec, NULL))
-    atomic_store(&exec_answer, -1);
-  for (int i = 0; i < 100 && atomic_load(&exec_answer) == 0; i++)
-    usleep(100000);
-  if (atomic_load(&exec_answer) == 1)
-    return 0;
-  fprintf(stderr, "home: Homebrew Channel did not run the takeover\n");
-  atomic_store(&exec_answer, 0);
-  jf_luna_call("luna://com.webos.notification/createToast",
-               "{\"sourceId\":\"" APP_ID
-               "\",\"message\":\"Taking LG's Home's place needs Homebrew "
-               "Channel\"}",
-               on_exec, NULL);
-  for (int i = 0; i < 30 && atomic_load(&exec_answer) == 0; i++)
-    usleep(100000);
-  return 1;
-}
-
-/* Started as LG's Home: SAM names it so in the launch payload. */
-static bool started_as_lg_home(int argc, char **argv) {
-  char id[128] = "";
-  const char *env = getenv("APPID");
-  if (env != NULL)
-    snprintf(id, sizeof(id), "%s", env);
-  if (argc > 1)
-    jf_luna_json_string(argv[1], "appId", id, sizeof(id));
-  return strcmp(id, LG_HOME_ID) == 0;
-}
-#endif
-
-int main(int argc, char **argv) {
-#ifdef JF_WEBOS
-  if (!started_as_lg_home(argc, argv))
-    return take_lg_homes_place();
-#endif
-  if (!app_init(argc, argv))
+int main(void) {
+  if (!app_init())
     return 1;
   while (jf_window_poll()) {
     int wait_ms;
